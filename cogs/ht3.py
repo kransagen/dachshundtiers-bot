@@ -39,16 +39,17 @@ class HT3(commands.Cog):
         if target_channel is None:
             return await interaction.response.send_message("Kanál nenalezen!", ephemeral=True)
 
-        embed = (
-            discord.Embed(title="💸 Žádost o TierTest", color=0x00FF00)
-            .set_description(
+        embed = discord.Embed(
+            title="💸 Žádost o TierTest",
+            description=(
                 "**Pouze pro HT3+**\n"
                 "• Otevírání troll ticketů bude potrestáno!\n"
                 "• Po failed tiertestu se dá znova retestovat za 7 dní.\n"
                 "• Eval dostanete, když porazíte LT3 testera nebo váš tester "
                 "usoudí, že máte HT3 skill.\n"
                 "• Bez evalu není možné otevřít HT3+ ticket!"
-            )
+            ),
+            color=0x00FF00,
         )
 
         view = HT3PanelView()

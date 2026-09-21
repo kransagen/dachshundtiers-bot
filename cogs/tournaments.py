@@ -116,18 +116,16 @@ async def end_tournament_signup(guild: discord.Guild, kit_key: str) -> None:
         )
         mentions = " ".join(f"<@{p}>" for p in group_players)
 
-        embed = (
-            discord.Embed(
-                title=f"🏆 Skupina {group_index} — {tdata['kit']} ({tdata['tier']})",
-                color=0x2ECC71,
-                timestamp=discord.utils.utcnow(),
-            )
-            .set_description(
+        embed = discord.Embed(
+            title=f"🏆 Skupina {group_index} — {tdata['kit']} ({tdata['tier']})",
+            description=(
                 f"**Tier:** {tdata['tier']}\n"
                 f"**Hráči:**\n{players_list}\n\n"
                 f"**Zápasy (1v1):**\n{matches_text}\n"
                 f"*Tester zapíše výsledky po dokončení zápasů pomocí* `/turnajresult`."
-            )
+            ),
+            color=0x2ECC71,
+            timestamp=discord.utils.utcnow(),
         )
 
         try:
@@ -218,21 +216,19 @@ class Tournaments(commands.Cog):
         deadline_ms = time.time() * 1000 + hodiny * 3600 * 1000
         unix_time = int(deadline_ms / 1000)
 
-        embed = (
-            discord.Embed(
-                title=f"🏆 {kit.upper()} TURNAJ — {tier}",
-                color=0xF1C40F,
-                timestamp=discord.utils.utcnow(),
-            )
-            .set_description(
+        embed = discord.Embed(
+            title=f"🏆 {kit.upper()} TURNAJ — {tier}",
+            description=(
                 "Klikni na tlačítko ✅ pro přihlášení do turnaje!\n\n"
                 f"**Kit:** {kit}\n"
                 f"**Tier:** {tier}\n"
                 f"**Skupin:** {skupiny}\n"
                 f"**Deadline:** <t:{unix_time}:F> (<t:{unix_time}:R>)"
-            )
-            .set_footer(text=f"Vytvořil: {interaction.user.name}")
+            ),
+            color=0xF1C40F,
+            timestamp=discord.utils.utcnow(),
         )
+        embed.set_footer(text=f"Vytvořil: {interaction.user.name}")
 
         view = TournamentSignupView(kit_key)
         message = await signup_channel.send(
@@ -296,17 +292,13 @@ class Tournaments(commands.Cog):
                 ephemeral=True,
             )
 
-        embed = (
-            discord.Embed(
-                title=f"🏆 {kit.upper()} TURNAJ",
-                color=0x2ECC71,
-                timestamp=discord.utils.utcnow(),
-            )
-            .set_description(
-                f"**Získává:**\n> <@{hrac.id}> — {z_tieru} ➔ **{na_tier}**"
-            )
-            .set_footer(text=f"Zapisovatel: {interaction.user.name}")
+        embed = discord.Embed(
+            title=f"🏆 {kit.upper()} TURNAJ",
+            description=f"**Získává:**\n> <@{hrac.id}> — {z_tieru} ➔ **{na_tier}**",
+            color=0x2ECC71,
+            timestamp=discord.utils.utcnow(),
         )
+        embed.set_footer(text=f"Zapisovatel: {interaction.user.name}")
 
         await target_channel.send(content="@everyone", embed=embed)
         await interaction.response.send_message(

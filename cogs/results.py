@@ -313,44 +313,47 @@ class Results(commands.Cog):
     # ------------------------------------------------------------------
     # /testersstats
     # ------------------------------------------------------------------
-    @app_commands.command(name="testersstats", description="View the tester leaderboard table")
+    @app_commands.command(name="testersstats", description="Zobrazí tabulku testerů.")
+    @app_commands.describe(period="Filtruj podle měsíce nebo celkově")
     @app_commands.choices(
         period=[
-            app_commands.Choice(name="Current Month", value="current"),
-            app_commands.Choice(name="All Time", value="all"),
+            app_commands.Choice(name="Tento měsíc", value="current"),
+            app_commands.Choice(name="Všechny časy", value="all"),
         ]
     )
     async def testersstats(self, interaction: discord.Interaction, period: str) -> None:
         stats_db = load_data("testers_stats.json", {})
         current_month = month_key()
 
-        leaderboard = []
+        entries: list = []
         for tester_id, data in stats_db.items():
             if period == "all":
                 score = data.get("total", 0)
             else:
                 score = data.get("monthly", {}).get(current_month, 0)
             if score > 0:
-                leaderboard.append((tester_id, score))
+                entries.append((tester_id, score))
 
-        leaderboard.sort(key=lambda item: item[1], reverse=True)
+        entries.sort(key=lambda item: item[1], reverse=True)
+        top10 = entries[:10]
+
+        if top10:
+            description = "\n".join(
+                f"**{i + 1}.** <@{tester_id}>: {score} testů"
+                for i, (tester_id, score) in enumerate(top10)
+            )
+        else:
+            description = "Žádné testy pro toto období."
 
         embed = discord.Embed(
-            title=f"🏆 Tabulka Testerů – {'Všechny časy' if period == 'all' else 'Tento měsíc'}",
-            color=0xF59E0B,
+            title=(
+                "🏆 TOP testeři všechny časy"
+                if period == "all"
+                else "🏆 TOP testeři tento měsíc"
+            ),
+            color=0x9B59B6,
+            description=description,
         )
-
-        if not leaderboard:
-            embed.description = "Žádné testy pro toto období."
-        else:
-            table = "```\nPozice | Tester           | Počet testů\n---------------------------------------\n"
-            for index, (tester_id, score) in enumerate(leaderboard, 1):
-                user = self.bot.get_user(int(tester_id))
-                name = (user.name if user else tester_id).ljust(16)
-                table += f"{str(index).ljust(6)} | {name} | {score}\n"
-            table += "```"
-            embed.description = table
-
         await interaction.response.send_message(embed=embed)
 
     # ------------------------------------------------------------------

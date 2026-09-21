@@ -158,7 +158,13 @@ class Queues(commands.Cog):
         now = time.time() * 1000
         cooldowns = load_data("cooldowns.json", {})
         if user_id in cooldowns and (now - cooldowns[user_id]) < PLAYER_COOLDOWN_MS:
-            return await interaction.response.send_message("❌ Máš cooldown na testy!", ephemeral=True)
+            remaining = PLAYER_COOLDOWN_MS - (now - cooldowns[user_id])
+            days = int(remaining // (24 * 60 * 60 * 1000))
+            hours = int((remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000))
+            return await interaction.response.send_message(
+                f"❌ Máš cooldown na testy! Zkus to znovu za **{days}d {hours}h**.",
+                ephemeral=True,
+            )
 
         queue = load_data("queue.json")
         if any(
@@ -183,26 +189,37 @@ class Queues(commands.Cog):
         await update_panel(interaction.channel, kit_key)
         await interaction.response.send_message(f"✅ Byl jsi přidán do fronty **{kit.strip()}**.")
 
-    @queue.command(name="list", description="Show the current active queues")
+    @queue.command(name="list", description="Zobrazí aktuální fronty a aktivní testery.")
     async def queue_list(self, interaction: discord.Interaction) -> None:
         queue = load_data("queue.json")
         active_queues = load_data("active_queues.json", {})
 
-        embed = discord.Embed(title="📋 Přehled front", color=0xF59E0B)
         description = ""
-
-        for i, p in enumerate(queue, 1):
-            description += (
-                f"**{i}.** <@{p.get('id')}> (`{p.get('ign')}`) - Kit: **{p.get('kit')}**\n"
-            )
+        if not queue:
+            description = "*(Nikdo momentálně nečeká)*\n"
+        else:
+            for i, p in enumerate(queue, 1):
+                ign = p.get("ign")
+                ign_part = f" (`{ign}`)" if ign else ""
+                description += (
+                    f"**{i}.** <@{p.get('id')}>{ign_part} - Kit: **{p.get('kit')}**\n"
+                )
 
         description += "\n**Aktivní fronty a testeři:**\n"
-        for kit_key, data in active_queues.items():
-            testers = ", ".join(f"<@{t}>" for t in data.get("testers", []))
-            testers = testers or f"<@{data.get('opener')}>"
-            description += f"• **{data.get('name')}** | Testeri: {testers}\n"
+        if not active_queues:
+            description += "*(Žádné otevřené fronty)*"
+        else:
+            for kit_key, data in active_queues.items():
+                testers = ", ".join(f"<@{t}>" for t in data.get("testers", []))
+                testers = testers or f"<@{data.get('opener')}>"
+                description += f"• **{data.get('name')}** | Testeri: {testers}\n"
 
-        embed.description = description or "Žádné aktivní zápisy."
+        embed = discord.Embed(
+            title="📋 Přehled front",
+            description=description,
+            color=0xF59E0B,
+            timestamp=discord.utils.utcnow(),
+        )
         await interaction.response.send_message(embed=embed)
 
     @queue.command(name="joinastester", description="Register yourself as a globally active tester")
@@ -297,14 +314,18 @@ class Queues(commands.Cog):
         player = queue.pop(0)
         save_data("queue.json", queue)
 
+        ign = player.get("ign")
+        ign_part = f" (`{ign}`)" if ign else ""
         embed = (
             discord.Embed(
-                title=f"⚔️ Player Pulled for {player.get('kit')}!",
+                title=f"⚔️ Hráč pullnut pro {player.get('kit')}!",
+                description="Hráč byl úspěšně odebrán z aktivní fronty.",
                 color=0x5865F2,
+                timestamp=discord.utils.utcnow(),
             )
             .add_field(
                 name="👤 Hráč",
-                value=f"<@{player['id']}> (`{player.get('ign')}`)",
+                value=f"<@{player['id']}>{ign_part}",
                 inline=True,
             )
             .add_field(
@@ -312,9 +333,15 @@ class Queues(commands.Cog):
                 value=f"<@{interaction.user.id}>",
                 inline=True,
             )
+            .add_field(
+                name="🎮 Fronta / Kit",
+                value=f"`{player.get('kit')}`",
+                inline=True,
+            )
         )
         await interaction.response.send_message(
-            content=f"<@{player['id']}> jsi na řadě!", embed=embed
+            content=f"<@{player['id']}> jsi na řadě pro **{player.get('kit')}**!",
+            embed=embed,
         )
         await update_panel(interaction.channel, str(player.get("kit", "")).lower())
 

@@ -42,15 +42,12 @@ class HT3(commands.Cog):
         embed = (
             discord.Embed(title="💸 Žádost o TierTest", color=0x00FF00)
             .set_description(
-                "**Pouze pro HT3+**\n\n"
-                "• Otevírání troll ticketů bude potrestáno banem!\n\n"
-                "• Po failed tiertestu se dá znova retestovat za 14 dní.(10 dní pro Boostery)\n"
-                "• Eval dostanete, když porazíte LT3 testera nebo váš HT3+ usoudí, "
-                "že máte HT3 skill.\n"
-                "• Bez evalu není možné otevřít HT3+ ticket!\n\n"
-                "Pokud máte na MCTIERS rank HT3+, tak si můžete po podání důkazu rank "
-                "přidělit zde bez testu. (Přes ticket na supportu "
-                "https://discord.gg/wXn4DpP5RB)"
+                "**Pouze pro HT3+**\n"
+                "• Otevírání troll ticketů bude potrestáno!\n"
+                "• Po failed tiertestu se dá znova retestovat za 7 dní.\n"
+                "• Eval dostanete, když porazíte LT3 testera nebo váš tester "
+                "usoudí, že máte HT3 skill.\n"
+                "• Bez evalu není možné otevřít HT3+ ticket!"
             )
         )
 
@@ -65,7 +62,7 @@ class HT3(commands.Cog):
         self.bot.add_view(view, message_id=message.id)
 
         await interaction.response.send_message(
-            "Panel byl úspěšně odoslán!", ephemeral=True
+            "Panel byl úspěšně odeslán!", ephemeral=True
         )
 
     # ------------------------------------------------------------------
@@ -78,10 +75,24 @@ class HT3(commands.Cog):
         target_id = str(target.id)
         now = time.time() * 1000
 
+        queue_cooldowns = load_data("cooldowns.json", {})
         ht3_cooldowns = load_data("ht3_cooldowns.json", {})
         user_cd = ht3_cooldowns.get(target_id, {})
 
-        text = f"**Cooldowny pro {target.name}**\n\n**HT3+ Ticket Cooldowny:**\n"
+        text = f"**Cooldowny pro {target.name}**\n\n"
+
+        # Waitlist (queue) cooldown – 4 dny mezi testy
+        queue_expiry = queue_cooldowns.get(target_id)
+        if queue_expiry and queue_expiry > now:
+            remaining = queue_expiry - now
+            days = remaining // (24 * 60 * 60 * 1000)
+            hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
+            minutes = (remaining % (60 * 60 * 1000)) // (60 * 1000)
+            text += f"**Waitlist cooldown:** ⏳ Ještě {days}d {hours}h {minutes}m\n\n"
+        else:
+            text += "**Waitlist cooldown:** žádný\n\n"
+
+        text += "**HT3+ Ticket Cooldowny:**\n"
         has_cooldown = False
 
         for kit, expire_time in user_cd.items():

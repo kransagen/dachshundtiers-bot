@@ -7,7 +7,15 @@ from config import TESTER_ROLE_FRAGMENT
 from storage import data_path, load_data, save_data
 
 # Výchozí sada kitů (použije se, dokud neexistuje data/kits.json)
-DEFAULT_KITS = ["AnchorPvP", "NetheriteSword", "IronAxe", "GoldSMP", "UHCMace", "RandomPot"]
+DEFAULT_KITS = [
+    "AnchorPvP",
+    "NetheriteSword",
+    "IronAxe",
+    "GoldSMP",
+    "UHCMace",
+    "RandomPot",
+    "ShieldlessSMP",
+]
 
 
 def get_kits():

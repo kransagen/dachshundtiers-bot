@@ -6,25 +6,22 @@ from storage import load_data
 
 
 def create_queue_embed(kit_name: str, current_queue, testers_list) -> discord.Embed:
-    """Vytvoří embed odpovídající původnímu botovi (živý panel fronty)."""
+    """Vytvoří embed odpovídající nasazenému originálu (živý panel fronty)."""
     description = (
         "⏱️ Fronta se aktualizuje automaticky.\n"
         "Použij tlačítka níže pro přidání nebo odebrání.\n\n"
-        "**Fronta:**\n"
+        "**Fronta**:\n"
     )
 
     if not current_queue:
-        description += "*Fronta je prázdná.*\n"
+        description += "*Fronta je prázdná. Buď první!*"
     else:
         for i, player in enumerate(current_queue, 1):
             description += f"{i}. <@{player.get('id')}>\n"
 
-    description += "\n**Aktivní Testeři:**\n"
-    if not testers_list:
-        description += "*Žádný aktivní tester*"
-    else:
-        for i, tester_id in enumerate(testers_list, 1):
-            description += f"{i}. <@{tester_id}>\n"
+    description += "\n**Aktivní Testeři**:\n"
+    for i, tester_id in enumerate(testers_list, 1):
+        description += f"{i}. <@{tester_id}>\n"
 
     return discord.Embed(
         title=f"📝 {kit_name} Waitlist",

@@ -10,8 +10,9 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 ### 🎯 Fronty na tier testy
 | Příkaz | Popis |
 |---|---|
-| `/openq kit` | Otevře frontu pro kit – vytvoří živý panel (embed + tlačítka) a pošle `@everyone`. |
-| `/closeq kit` | Zavře frontu (jen pokud v ní nejsou další testeri). |
+| `/openq kit` | Otevře frontu pro kit – vyčistí určený kanál kitu a pošle tam živý panel (embed + tlačítka) se `@everyone`. |
+| `/closeq kit` | Zavře frontu (jen pokud v ní nejsou další testeri). Panel v kanálu kitu se upraví na CLOSED a odstraní tlačítka; vyčistí čekající hráče daného kitu. |
+| `/addqchannel kit [kanal]` *(admin)* | Nastaví určený kanál panelu fronty pro (nový) kit. Bez `kanal` se použije kanál, kde příkaz běží. |
 | `/queue join ign kit` | Přidá se do otevřené fronty (kontrola 4denního cooldownu). |
 | `/queue joinastester` | Zaregistruje testera jako globálně aktivního. |
 | `/queue joinasqueue kit` | Tester se přidá do už otevřené fronty jako další tester. |
@@ -20,9 +21,15 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 | `/queue pull` | Automaticky vytáhne prvního hráče z fronty. |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
 
-Tlačítka na panelu: **Join Queue** (otevře modál pro Minecraft IGN), **Leave Queue**,
-**Pull Player ⚔️** (výběr roomky, hráč dostane práva a ping). Panel se aktualizuje
-automaticky (sleduje příchody/odchody).
+Tlačítka na panelu: **Join Queue** (otevře modál pro Minecraft IGN; potvrzení
+vidí jen přihlášený hráč), **Leave Queue**, **Pull Player ⚔️** (výběr roomky,
+hráč dostane práva a ping). Panel se aktualizuje automaticky (sleduje
+příchody/odchody).
+
+> `/openq` **vždy** pošle panel do určeného kanálu daného kitu (ne do kanálu,
+> kde byl příkaz zadán) a celý kanál předtím vyčistí. Kanál se určí podle
+> priority: `/addqchannel` (runtime, `data/queue_channels.json`) → env
+> `QUEUE_CHANNELS_JSON` → výchozí kanály z původního bota.
 
 ### 📝 Výsledky tier testů
 | Příkaz | Popis |
@@ -39,6 +46,9 @@ automaticky (sleduje příchody/odchody).
 - odebere hráče z fronty a práva z roomky,
 - uloží tier + historii do `players.json` (modes/history),
 - započítá statistiky testerovi (celkem, kity, tiery, měsíční, hodiny),
+- **pošle výsledek do určeného výsledkového kanálu podle tieru** – HT3 a výš
+  (HT3/LT2/HT2/LT1/HT1) jdou do `RESULT_CHANNEL_UPPER`, LT3 a níž do
+  `RESULT_CHANNEL_LOWER`. Tester dostane jen soukromé potvrzení,
 - **volitelně** synchronizuje `players.json` na GitHub (ekvivalent původní Octokit integrace).
 
 ### 💸 HT3+ tickety
@@ -49,6 +59,10 @@ automaticky (sleduje příchody/odchody).
 
 Výběr kitu → kontrola 7denního cooldownu → modál (IGN + cílový tier) →
 vytvoření ticket roomky → tlačítko **🔒 Close Ticket** (nastaví cooldown a za 3 s smaže roomku).
+
+Kategorie ticket roomky je **nastavitelná pro každý kit** (`HT3_TICKET_CATEGORIES_JSON`),
+např. `{"randompot":"...","ironaxe":"..."}`. Priorita: kit → tier
+(HT3/LT2/HT2/LT1/HT1) → výchozí `HT3_TICKET_CATEGORY_ID`.
 
 ### 🏆 Turnaje
 | Příkaz | Popis |
@@ -73,16 +87,21 @@ Přidaný/odebraný kit se hned promítne do:
   aktualizuje, pokud už byl odeslán),
 - autocomplete kitu u `/createturnaj`, `/turnajresult` a `/result`.
 
-> `/openq` a `/queue ...` berou název kitu jako volný text – nový kit se tam dá
-> používat bez jakékoli registrace. Seznam kitů ovlivňuje hlavně HT3+ tickety
-> a turnaje.
+**Typický postup pro nový kit:**
+1. `/addkit kit:NázevKitu` – zaregistruje kit (HT3+ panel, autocomplete, turnaje)
+2. `/addqchannel kit:NázevKitu` v kanálu, kam má chodit panel fronty
+3. `/openq kit:NázevKitu` – panel se objeví na určeném místě
+
+> `/openq` a `/queue ...` berou název kitu jako volný text. Naopak `kity`
+> bez zadaného kanálu (přes `/addqchannel` nebo env) nejdou pomocí `/openq`
+> otevřít – bot odpoví `❌ Neznámý kit`.
 
 ## Struktura projektu
 
 ```
 bot.py                # jádro bota (vstup: python bot.py)
 main.py               # vstupní bod pro hosting (startup file = main.py)
-config.py             # konfigurace (.env)
+config.py             # konfigurace (.env) + runtime kanály front (/addqchannel)
 storage.py            # načítání/ukládání JSON databáze (./data)
 panel.py              # živý waitlist panel
 views.py              # tlačítka, select menu, modály
@@ -92,7 +111,7 @@ cogs/
   results.py          # výsledky + statistiky + GitHub sync
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje
-  kits.py             # správa kitů (/addkit, /removekit, /kits)
+  kits.py             # správa kitů (/addkit, /removekit, /kits, /addqchannel)
 data/                 # JSON databáze (vytvoří se za běhu)
 ```
 
@@ -120,18 +139,32 @@ python main.py
   *Manage Channels*, *Manage Roles* (permice) a *Send Messages*.
 - Role testera stačí, aby **obsahovala** „tester“ v názvu (case-insensitive).
 
-## Úprava ID kanálů
+## Konfigurace kanálů a kategorií
 
 Výchozí kanály/kategorie odpovídají původnímu botovi. Můžeš je změnit
 v `.env` (viz `.env.example`):
-- `HT3_PANEL_CHANNEL_ID` – kanál, kam `/sendht3` pošle panel
-- `HT3_TICKET_CATEGORY_ID` – kategorie pro HT3+ ticket roomky
-- `TOURNAMENT_RESULT_CHANNEL_ID` – kanál pro `/turnajresult`
+
+| Proměnná | Význam |
+|---|---|
+| `HT3_PANEL_CHANNEL_ID` | Kanál, kam `/sendht3` pošle panel „Žádost o TierTest“. |
+| `HT3_TICKET_CATEGORY_ID` | Výchozí kategorie pro HT3+ ticket roomky. |
+| `HT3_TICKET_CATEGORIES_JSON` | Mapa „kit/tier → kategorie“ pro HT3+ tickety, např. `{"randompot":"...","ironaxe":"..."}`. |
+| `RESULT_CHANNEL_LOWER` | Výsledkový kanál pro LT3 a níž (`/result`). |
+| `RESULT_CHANNEL_UPPER` | Výsledkový kanál pro HT3 a výš (`/result`). |
+| `QUEUE_CHANNELS_JSON` | Mapa „kit → určený kanál panelu fronty“, např. `{"randompot":"..."}`. |
+| `TOURNAMENT_RESULT_CHANNEL_ID` | Kanál pro `/turnajresult`. |
+| `GUILD_ID` | Registrace příkazů jen na tomto serveru (rychlejší vývoj). |
+| `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |
+| `GITHUB_*` | Volitelná synchronizace `players.json` na GitHub. |
+
+> Kanál panelu fronty pro kit se dá nastavit i za běhu přes `/addqchannel`
+> (ukládá se do `data/queue_channels.json` a má přednost před env i defaulty).
 
 ## Data
 
 Všechny databáze jsou JSON soubory ve složce `data/` (stejný formát jako
 v originále):
-`queue.json`, `active_queues.json`, `queue_messages.json`, `testers.json`,
-`players.json`, `cooldowns.json`, `testers_stats.json`, `ht3_cooldowns.json`,
-`tournaments.json`, `pulled_players.json`, `kits.json`.
+`queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`
+(spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
+`testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
+`pulled_players.json`, `kits.json`.

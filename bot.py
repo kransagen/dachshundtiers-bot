@@ -47,6 +47,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.ht3",
             "cogs.tournaments",
             "cogs.kits",
+            "cogs.roles",
             "cogs.info",
         ]
         for extension in extensions:

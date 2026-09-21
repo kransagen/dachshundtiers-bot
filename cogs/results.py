@@ -292,6 +292,19 @@ class Results(commands.Cog):
                         "Nelze upravit role hráče %s: %s", target_id, err
                     )
 
+        # 5c) Automatická role kitu+tieru (data/kit_roles.json) – po uložení
+        #     výsledku dostane hráč roli nového tieru, staré tiery kitu se
+        #     odeberou. Poznámka se připojí k potvrzení.
+        role_note = ""
+        try:
+            from cogs.roles import auto_grant_kit_role
+
+            role_note = await auto_grant_kit_role(
+                interaction.guild, target_id, kit_key, tier_up
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Chyba při automatickém udělování role pro %s", target_id)
+
         # 6) Embed s výsledkem
         avatar_url = f"https://minotar.net/armor/bust/{ign_clean}/100.png"
         embed = (
@@ -336,6 +349,8 @@ class Results(commands.Cog):
                 f"\n🎉 Nový kit **{kit_clean}** byl automaticky zaregistrován "
                 "do data/kits.json (autocomplete, HT3+ panel, turnaje)."
             )
+        if role_note:
+            saved_msg += role_note
 
         if result_channel is not None:
             try:

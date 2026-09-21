@@ -16,4 +16,5 @@ venv/
 # (players, testers_stats, cooldowny...). Soubory, které vznikají za běhu
 # a nepatří do gitu, jsou níže.
 data/ht3_panel_message.json
+data/kit_roles.json
 data/.gitkeep

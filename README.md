@@ -41,6 +41,9 @@ příchody/odchody).
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |
 | `/removetest user amount` *(admin)* | Odečtení testů (upraví i aktuální měsíc, nikdy pod nulu). |
 | `/removeplayertiers ign` *(admin)* | Smazání hráče z `players.json`. |
+| `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit – po `/result` ji hráč dostane automaticky. |
+| `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
+| `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
@@ -50,6 +53,9 @@ příchody/odchody).
 - **automaticky zaregistruje nový kit** – když kit v `/result` není v
   `data/kits.json`, přidá se (jako přes `/addkit`) a hned se objeví
   v autocomplete, HT3+ panelu a u turnajů (potvrzení toto přizná hláškou),
+- **automaticky dá hráči roli tieru kitu** – podle mapy `data/kit_roles.json`
+  (nastaví se `/setkitrole`): roli nového tieru přidá a ostatní tier role
+  stejného kitu odebere; na nemapovaný tier/tier upozorní v potvrzení,
 - **volitelně `add_role` / `remove_role`** – přidá/odebere hráči roli
   (např. roli nového kitu/tieru), aplikuje se tiše jako v originále,
 - **pošle výsledek do určeného výsledkového kanálu podle tieru** – HT3 a výš
@@ -175,4 +181,6 @@ v originále):
 `queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
-`pulled_players.json`, `kits.json`.
+`pulled_players.json`, `kits.json`. Server-specific mapování rolí je
+v `data/kit_roles.json` (spravuje `/setkitrole`; **necommituje se** – obsahuje
+ID rolí daného serveru).

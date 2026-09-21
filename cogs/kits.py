@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from config import set_queue_channel_id
 from storage import load_data
-from utils import add_kit, get_kits, remove_kit
+from utils import add_kit, get_kits, has_tester_role, remove_kit
 from views import HT3PanelView
 
 HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
@@ -95,7 +95,6 @@ class Kits(commands.Cog):
         name="addqchannel",
         description="Nastaví kanál panelu fronty pro kit (kam chodí /openq)",
     )
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
         kit="Název kitu (např. UHCMace)",
         kanal="Kanál pro panel fronty (volitelné; default: tento kanál)",
@@ -106,6 +105,10 @@ class Kits(commands.Cog):
         kit: str,
         kanal: discord.TextChannel = None,
     ) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Jen testeři můžou nastavit kanál fronty.", ephemeral=True
+            )
         kit_name = kit.strip()
         kit_key = kit_name.lower()
         if not kit_key:

@@ -151,6 +151,8 @@ class Results(commands.Cog):
         tier="New achieved tier",
         score="Score of the match (e.g. 5-2)",
         outcome="Tester outcome",
+        add_role="Role, kterou hráči přidat (nepovinné)",
+        remove_role="Role, kterou hráči odebrat (nepovinné)",
     )
     @app_commands.choices(
         outcome=[
@@ -168,6 +170,8 @@ class Results(commands.Cog):
         tier: str,
         score: str,
         outcome: str,
+        add_role: discord.Role = None,
+        remove_role: discord.Role = None,
     ) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
@@ -267,6 +271,26 @@ class Results(commands.Cog):
             db_player["modes"][kit_clean] = tier_up
             db_player["history"][kit_clean].append({"date": current_date, "tier": tier_up})
         save_data("players.json", players)
+
+        # 5b) Volitelné role (add_role / remove_role) – jako v originále
+        #     (aplikuje se tiše, nezobrazuje se v embedu výsledku)
+        if add_role is not None or remove_role is not None:
+            member = interaction.guild.get_member(int(target_id))
+            if member is None:
+                try:
+                    member = await interaction.guild.fetch_member(int(target_id))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+            if member is not None:
+                try:
+                    if add_role is not None:
+                        await member.add_roles(add_role)
+                    if remove_role is not None:
+                        await member.remove_roles(remove_role)
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    log.warning(
+                        "Nelze upravit role hráče %s: %s", target_id, err
+                    )
 
         # 6) Embed s výsledkem
         avatar_url = f"https://minotar.net/armor/bust/{ign_clean}/100.png"

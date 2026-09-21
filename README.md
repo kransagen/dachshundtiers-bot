@@ -35,7 +35,7 @@ příchody/odchody).
 ### 📝 Výsledky tier testů
 | Příkaz | Popis |
 |---|---|
-| `/result hrac ign kit tier score outcome` | Zápis výsledku testu (nový kit se automaticky zaregistruje). |
+| `/result hrac ign kit tier score outcome [add_role] [remove_role]` | Zápis výsledku testu (nový kit se automaticky zaregistruje, volitelně přidá/odebere roli). |
 | `/testerstats tester` | Portfolio testera (celkem testů, oblíbený kit, tier, průměrný čas). |
 | `/testersstats current\|all` | Žebříček testerů (tento měsíc / všechny časy). |
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |
@@ -50,6 +50,8 @@ příchody/odchody).
 - **automaticky zaregistruje nový kit** – když kit v `/result` není v
   `data/kits.json`, přidá se (jako přes `/addkit`) a hned se objeví
   v autocomplete, HT3+ panelu a u turnajů (potvrzení toto přizná hláškou),
+- **volitelně `add_role` / `remove_role`** – přidá/odebere hráči roli
+  (např. roli nového kitu/tieru), aplikuje se tiše jako v originále,
 - **pošle výsledek do určeného výsledkového kanálu podle tieru** – HT3 a výš
   (HT3/LT2/HT2/LT1/HT1) jdou do `RESULT_CHANNEL_UPPER`, LT3 a níž do
   `RESULT_CHANNEL_LOWER`. Tester dostane jen soukromé potvrzení,

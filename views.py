@@ -5,6 +5,7 @@ joinmodal, ht3_select_kit, ht3_modal, close_ht3, signup_turnaj).
 """
 
 import asyncio
+import logging
 import time
 
 import discord
@@ -13,6 +14,8 @@ from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, get_ht3_ticket_category
 from panel import update_panel
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, has_tester_role
+
+log = logging.getLogger("dachshundtiers")
 
 
 # ---------------------------------------------------------------------------
@@ -173,11 +176,6 @@ class QueueView(discord.ui.View):
             return
 
         channel_id = int(interaction.data["values"][0])
-        target_channel = interaction.guild.get_channel(channel_id)
-        if target_channel is None:
-            return await interaction.response.send_message(
-                "❌ Kanál se nepodařilo najít.", ephemeral=True
-            )
 
         queue = load_data("queue.json")
         index = next(
@@ -193,39 +191,123 @@ class QueueView(discord.ui.View):
 
         active_queues = load_data("active_queues.json", {})
         kit_name = active_queues.get(kit_key, {}).get("name", self.kit)
+        await grant_pull_access(interaction, player, channel_id, kit_name)
 
-        member = interaction.guild.get_member(int(player["id"]))
-        if member is None:
-            try:
-                member = await interaction.guild.fetch_member(int(player["id"]))
-            except (discord.NotFound, discord.HTTPException):
-                member = None
 
+# ---------------------------------------------------------------------------
+# Sdílená logika pullnutí hráče do roomky (tlačítko i /queue pull)
+# ---------------------------------------------------------------------------
+async def grant_pull_access(
+    interaction: discord.Interaction,
+    player: dict,
+    channel_id: int,
+    kit_name: str,
+) -> None:
+    """Udělí hráči přístup do roomky, pošle uvítací zprávu a zaloguje pulled player.
+
+    Pokud se práva udělit nepodaří (např. hráč není na serveru), hláška to řekne
+    narovinu, ale vytažení z fronty tím není ztraceno.
+    """
+    guild = interaction.guild
+    channel = guild.get_channel(channel_id)
+    if channel is None:
         try:
-            if member is not None:
-                await target_channel.set_permissions(
-                    member, view_channel=True, send_messages=True, connect=True, speak=True
-                )
+            channel = await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            channel = None
 
-            # Zaznamenání vytaženého hráče (kvůli odebrání práv po /result)
-            pulled = load_data("pulled_players.json", {})
-            pulled[player["id"]] = str(channel_id)
-            save_data("pulled_players.json", pulled)
+    if channel is None:
+        return await interaction.response.send_message(
+            "❌ Roomka se nepodařila najít. Zkus to znovu.", ephemeral=True
+        )
 
-            await target_channel.send(
+    member = guild.get_member(int(player["id"]))
+    if member is None:
+        try:
+            member = await guild.fetch_member(int(player["id"]))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+
+    granted = False
+    if member is not None:
+        try:
+            await channel.set_permissions(
+                member, view_channel=True, send_messages=True, connect=True, speak=True
+            )
+            granted = True
+        except (discord.Forbidden, discord.HTTPException) as err:
+            log.warning(
+                "Nelze udělit práva do kanálu %s pro %s: %s",
+                channel_id,
+                player["id"],
+                err,
+            )
+
+    # Záznam vytaženého hráče (kvůli odebrání práv po /result)
+    pulled = load_data("pulled_players.json", {})
+    pulled[player["id"]] = str(channel_id)
+    save_data("pulled_players.json", pulled)
+
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.send(
                 content=f"👋 <@{player['id']}> jsi na řadě! Tady proběhne tvůj test na kit **{kit_name}**."
             )
-            await update_panel(interaction.guild, kit_key)
+        except (discord.Forbidden, discord.HTTPException) as err:
+            log.warning("Nelze poslat uvítací zprávu do %s: %s", channel_id, err)
 
-            await interaction.response.send_message(
-                f"✅ Hráč <@{player['id']}> byl úspěšně přesunut do <#{channel_id}> a dostal práva.",
-                ephemeral=True,
-            )
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound) as err:
-            await interaction.response.send_message(
-                "❌ Nepodařilo se upravit práva v kanálu. Zkontroluj oprávnění bota.",
-                ephemeral=True,
-            )
+    await update_panel(guild, str(player.get("kit", "")).lower())
+
+    if granted:
+        message = (
+            f"✅ Hráč <@{player['id']}> byl přesunut do <#{channel_id}> a dostal práva."
+        )
+    else:
+        message = (
+            f"⚠️ Hráč <@{player['id']}> byl vytažen z fronty, ale práva se nepovedlo "
+            "udělit (není hráč stále na serveru?). Do roomky přidám hráče hned, "
+            "jakmile server opět uvidí."
+        )
+    await interaction.response.send_message(message, ephemeral=True)
+
+
+class PullChannelSelectView(discord.ui.View):
+    """Select roomky pro /queue pull – stejný tok jako pull tlačítko na panelu."""
+
+    def __init__(self, player: dict, kit_name: str):
+        super().__init__(timeout=120)
+        self.player = player
+        self.kit_name = kit_name
+        kit_key = str(player.get("kit", "")).lower()
+        select = discord.ui.ChannelSelect(
+            custom_id=f"pullcmdchannel_{kit_key}",
+            placeholder="Vyber roomku pro testování...",
+            channel_types=[discord.ChannelType.text, discord.ChannelType.voice],
+            min_values=1,
+            max_values=1,
+        )
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction) -> None:
+        if not interaction.data.get("values"):
+            return
+
+        # Hráče z fronty vyřadíme až teď, po výběru roomky (jako u tlačítka –
+        # kdyby tester roomku nevybral, hráč zůstane ve frontě).
+        queue = load_data("queue.json")
+        new_queue = [
+            p for p in queue if p.get("id") != self.player["id"]
+        ]
+        if len(new_queue) != len(queue):
+            save_data("queue.json", new_queue)
+
+        await grant_pull_access(
+            interaction,
+            self.player,
+            int(interaction.data["values"][0]),
+            self.kit_name,
+        )
 
 
 # ---------------------------------------------------------------------------

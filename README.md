@@ -18,7 +18,7 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 | `/queue joinasqueue kit` | Tester se přidá do už otevřené fronty jako další tester. |
 | `/queue leaveq kit` | Tester opustí frontu (při odchodu otevíratele převezme frontu další tester). |
 | `/queue list` | Přehled všech front a aktivních testerů. |
-| `/queue pull` | Automaticky vytáhne prvního hráče z fronty. |
+| `/queue pull` | Vytáhne prvního hráče z fronty a nechá testera vybrat roomku – hráč do ní dostane přístup (jako pull tlačítko). |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
 | `/mktesterroom [hrac] [kategorie]` | Vytvoří soukromou tester roomku (text kanál) pro pullnutí hráče; zavírá se tlačítkem v roomce. |
 

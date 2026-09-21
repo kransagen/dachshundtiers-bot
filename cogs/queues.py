@@ -18,7 +18,7 @@ from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID, get_queue_channe
 from panel import create_queue_embed, update_panel
 from storage import load_data, save_data
 from utils import has_tester_role
-from views import QueueView, TesterRoomView
+from views import PullChannelSelectView, QueueView, TesterRoomView
 
 
 class Queues(commands.Cog):
@@ -369,39 +369,25 @@ class Queues(commands.Cog):
         if not queue:
             return await interaction.response.send_message("Fronta je prázdná.", ephemeral=True)
 
-        player = queue.pop(0)
-        save_data("queue.json", queue)
-
+        # Vezmeme prvního hráče, ale z fronty ho vyřadíme až po výběru roomky
+        player = queue[0]
         ign = player.get("ign")
         ign_part = f" (`{ign}`)" if ign else ""
-        embed = (
-            discord.Embed(
-                title=f"⚔️ Hráč pullnut pro {player.get('kit')}!",
-                description="Hráč byl úspěšně odebrán z aktivní fronty.",
-                color=0x5865F2,
-                timestamp=discord.utils.utcnow(),
-            )
-            .add_field(
-                name="👤 Hráč",
-                value=f"<@{player['id']}>{ign_part}",
-                inline=True,
-            )
-            .add_field(
-                name="🛡️ Tester",
-                value=f"<@{interaction.user.id}>",
-                inline=True,
-            )
-            .add_field(
-                name="🎮 Fronta / Kit",
-                value=f"`{player.get('kit')}`",
-                inline=True,
-            )
-        )
+        kit_key = str(player.get("kit", "")).lower()
+        active_queues = load_data("active_queues.json", {})
+        kit_name = active_queues.get(kit_key, {}).get("name") or player.get("kit", "?")
+
+        # Stejný tok jako pull tlačítko na panelu: tester vybere roomku,
+        # hráč do ní dostane přístup a pošle se uvítací zpráva.
+        view = PullChannelSelectView(player, kit_name)
         await interaction.response.send_message(
-            content=f"<@{player['id']}> jsi na řadě pro **{player.get('kit')}**!",
-            embed=embed,
+            content=(
+                f"⚔️ <@{player['id']}>{ign_part} je vytažen z fronty pro "
+                f"**{kit_name}**. Vyber roomku, do které ho přidat:"
+            ),
+            view=view,
+            ephemeral=True,
         )
-        await update_panel(interaction.guild, str(player.get("kit", "")).lower())
 
     # ------------------------------------------------------------------
     # /removeq

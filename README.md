@@ -5,6 +5,24 @@ tickety a turnaje). Původně napsaný v JavaScriptu (discord.js) v repozitáři
 [`kransagen/DACHSHUNDTIERSQBOT`](https://github.com/kransagen/DACHSHUNDTIERSQBOT) –
 tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 
+## Co je nového (aktuální verze)
+
+- **`/result`** – okamžitá odpověď (defer, jako v originále), **auto-registrace
+  nového kitu** (kit se přidá do `kits.json` rovnou ze zápisu výsledku) a
+  **automatické rozdávání rolí** (`/setkitrole`): hráč dostane roli nového
+  tieru, ostatní tiery stejného kitu se odeberou. Volitelně i ruční
+  `add_role` / `remove_role`.
+- **`/queue pull`** – vytáhne prvního hráče a **přidá ho do roomky** (výběr
+  roomky + práva + uvítací zpráva); stejný tok jako pull tlačítko na panelu.
+- **`/mktesterroom`** – soukromá text roomka pro pullování hráčů, zavírá se
+  tlačítkem v roomce.
+- **`/verze`** – diagnostika: commit běžícího bota, stav `/result` a počet
+  slash příkazů (rozliší „staré nasazení" od „cache Discordu").
+- **`/setkitrole` / `/unsetkitrole` / `/kitrole`** – mapa „kit → role tieru"
+  v `data/kit_roles.json` (necommituje se).
+- **Opraven bug „Synchronizováno 0"** – `tree.copy_global_to(guild=...)` před
+  `sync(guild=...)`, takže slash příkazy na serveru nikdy nezmizí.
+
 ## Funkce
 
 ### 🎯 Fronty na tier testy
@@ -35,7 +53,7 @@ příchody/odchody).
 ### 📝 Výsledky tier testů
 | Příkaz | Popis |
 |---|---|
-| `/result hrac ign kit tier score outcome [add_role] [remove_role]` | Zápis výsledku testu (nový kit se automaticky zaregistruje, volitelně přidá/odebere roli). |
+| `/result hrac ign kit tier score outcome [add_role] [remove_role]` | Zápis výsledku testu (nový kit se automaticky zaregistruje; automaticky rozdá roli tieru dle `/setkitrole`; volitelně i ruční role). |
 | `/testerstats tester` | Portfolio testera (celkem testů, oblíbený kit, tier, průměrný čas). |
 | `/testersstats current\|all` | Žebříček testerů (tento měsíc / všechny časy). |
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |
@@ -101,12 +119,15 @@ Přidaný/odebraný kit se hned promítne do:
 - autocomplete kitu u `/createturnaj`, `/turnajresult` a `/result`.
 
 **Typický postup pro nový kit:**
-1. `/addkit kit:NázevKitu` – zaregistruje kit (HT3+ panel, autocomplete, turnaje)
-2. `/addqchannel kit:NázevKitu` v kanálu, kam má chodit panel fronty
-3. `/openq kit:NázevKitu` – panel se objeví na určeném místě
+1. `/addkit kit:NázevKitu` – zaregistruje kit (HT3+ panel, autocomplete,
+   turnaje) – nebo stačí `/result`, který nový kit zaregistruje **automaticky**,
+2. `/addqchannel kit:NázevKitu` v kanálu, kam má chodit panel fronty,
+3. `/openq kit:NázevKitu` – panel se objeví na určeném místě,
+4. vytvoř si role tierů (Server Settings → Roles, např. `NázevKitu S`) a
+   namapuj je přes `/setkitrole` – `/result` je pak hráčům dává sám.
 
-> `/openq` a `/queue ...` berou název kitu jako volný text. Naopak `kity`
-> bez zadaného kanálu (přes `/addqchannel` nebo env) nejdou pomocí `/openq`
+> `/openq` a `/queue ...` berou název kitu jako volný text. Naopak kit **bez
+> určeného kanálu** (přes `/addqchannel` nebo env) nejde pomocí `/openq`
 > otevřít – bot odpoví `❌ Neznámý kit`.
 
 ## Struktura projektu
@@ -121,7 +142,9 @@ views.py              # tlačítka, select menu, modály
 utils.py              # pomocné funkce
 cogs/
   queues.py           # fronty
-  results.py          # výsledky + statistiky + GitHub sync
+  results.py          # výsledky + statistiky + GitHub sync + auto role
+  roles.py            # /setkitrole, /unsetkitrole, /kitrole + auto-grant rolí
+  info.py             # /verze (diagnostika běžící verze)
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje
   kits.py             # správa kitů (/addkit, /removekit, /kits, /addqchannel)

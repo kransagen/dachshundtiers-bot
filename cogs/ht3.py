@@ -65,7 +65,7 @@ class HT3(commands.Cog):
         self.bot.add_view(view, message_id=message.id)
 
         await interaction.response.send_message(
-            "Panel byl úspěšně odeslán!", ephemeral=True
+            "Panel byl úspěšně odoslán!", ephemeral=True
         )
 
     # ------------------------------------------------------------------

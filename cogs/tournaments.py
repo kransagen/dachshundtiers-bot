@@ -101,16 +101,14 @@ async def end_tournament_signup(guild: discord.Guild, kit_key: str) -> None:
             overwrites=overwrites,
         )
 
-        # Zápasy 1v1
-        matches_lines = []
+        # Zápasy 1v1 (každý zápas na vlastní řádek s koncem řádku jako v originále)
+        matches_text = ""
         for j in range(0, len(group_players), 2):
             if j + 1 < len(group_players):
-                matches_lines.append(
-                    f"<@{group_players[j]}> vs <@{group_players[j + 1]}>"
-                )
+                matches_text += f"<@{group_players[j]}> vs <@{group_players[j + 1]}>\n"
             else:
-                matches_lines.append(
-                    f"<@{group_players[j]}> — *čeká na soupeře (lichý počet)*"
+                matches_text += (
+                    f"<@{group_players[j]}> — *čeká na soupeře (lichý počet)*\n"
                 )
 
         players_list = "\n".join(
@@ -122,11 +120,12 @@ async def end_tournament_signup(guild: discord.Guild, kit_key: str) -> None:
             discord.Embed(
                 title=f"🏆 Skupina {group_index} — {tdata['kit']} ({tdata['tier']})",
                 color=0x2ECC71,
+                timestamp=discord.utils.utcnow(),
             )
             .set_description(
                 f"**Tier:** {tdata['tier']}\n"
                 f"**Hráči:**\n{players_list}\n\n"
-                f"**Zápasy (1v1):**\n{chr(10).join(matches_lines)}\n\n"
+                f"**Zápasy (1v1):**\n{matches_text}\n"
                 f"*Tester zapíše výsledky po dokončení zápasů pomocí* `/turnajresult`."
             )
         )
@@ -223,6 +222,7 @@ class Tournaments(commands.Cog):
             discord.Embed(
                 title=f"🏆 {kit.upper()} TURNAJ — {tier}",
                 color=0xF1C40F,
+                timestamp=discord.utils.utcnow(),
             )
             .set_description(
                 "Klikni na tlačítko ✅ pro přihlášení do turnaje!\n\n"
@@ -300,6 +300,7 @@ class Tournaments(commands.Cog):
             discord.Embed(
                 title=f"🏆 {kit.upper()} TURNAJ",
                 color=0x2ECC71,
+                timestamp=discord.utils.utcnow(),
             )
             .set_description(
                 f"**Získává:**\n> <@{hrac.id}> — {z_tieru} ➔ **{na_tier}**"

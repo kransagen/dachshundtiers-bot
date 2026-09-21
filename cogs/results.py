@@ -293,7 +293,11 @@ class Results(commands.Cog):
         avg_hour = round(sum(hourly) / len(hourly)) if hourly else 0
 
         embed = (
-            discord.Embed(title=f"⚔️ Portfolio Testera – {target.name}", color=0x3B82F6)
+            discord.Embed(
+                title=f"⚔️ Portfolio Testera – {target.name}",
+                color=0x3B82F6,
+                timestamp=discord.utils.utcnow(),
+            )
             .add_field(name="📈 Celkem testů", value=f"`{tdata.get('total', 0)}`", inline=True)
             .add_field(
                 name="📅 Naposledy testoval",

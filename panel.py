@@ -30,6 +30,7 @@ def create_queue_embed(kit_name: str, current_queue, testers_list) -> discord.Em
         title=f"📝 {kit_name} Waitlist",
         description=description,
         color=0x5865F2,
+        timestamp=discord.utils.utcnow(),
     )
 
 

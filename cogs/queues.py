@@ -133,6 +133,7 @@ class Queues(commands.Cog):
                 f"**Naposledy zavřeno**\n<t:{closing_ts}:R>"
             ),
             color=0xEF4444,
+            timestamp=discord.utils.utcnow(),
         )
 
         await interaction.response.send_message(embed=embed, view=QueueView(kit, disabled_join=True))
@@ -283,9 +284,10 @@ class Queues(commands.Cog):
 
     @queue.command(name="pull", description="Automatically pull the first player")
     async def queue_pull(self, interaction: discord.Interaction) -> None:
-        if not has_tester_role(interaction.user):
+        testers = load_data("testers.json")
+        if str(interaction.user.id) not in testers:
             return await interaction.response.send_message(
-                "❌ Chybí oprávnění.", ephemeral=True
+                "❌ Zadej nejdřív `/queue joinastester`", ephemeral=True
             )
 
         queue = load_data("queue.json")
@@ -295,10 +297,21 @@ class Queues(commands.Cog):
         player = queue.pop(0)
         save_data("queue.json", queue)
 
-        embed = discord.Embed(
-            title="⚔️ Player Pulled!",
-            color=0x5865F2,
-            description=f"Hráč <@{player['id']}> byl vytažen na testování testerem <@{interaction.user.id}>.",
+        embed = (
+            discord.Embed(
+                title=f"⚔️ Player Pulled for {player.get('kit')}!",
+                color=0x5865F2,
+            )
+            .add_field(
+                name="👤 Hráč",
+                value=f"<@{player['id']}> (`{player.get('ign')}`)",
+                inline=True,
+            )
+            .add_field(
+                name="🛡️ Tester",
+                value=f"<@{interaction.user.id}>",
+                inline=True,
+            )
         )
         await interaction.response.send_message(
             content=f"<@{player['id']}> jsi na řadě!", embed=embed

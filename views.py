@@ -88,7 +88,9 @@ class QueueView(discord.ui.View):
 
         self.add_item(join)
         self.add_item(leave)
-        self.add_item(pull)
+        # U zavřené fronty se Pull nezobrazuje (stejně jako v originále)
+        if not disabled_join:
+            self.add_item(pull)
 
     # ---- Join (otevře modál pro IGN) ----
     async def on_join(self, interaction: discord.Interaction) -> None:

@@ -2,7 +2,7 @@
 
 import discord
 
-from config import QUEUE_CHANNELS
+from config import get_queue_channel_id
 from storage import load_data
 
 
@@ -50,7 +50,7 @@ async def update_panel(guild, kit_key: str) -> None:
     if not message_id:
         return
 
-    channel_id = QUEUE_CHANNELS.get(kit_key)
+    channel_id = get_queue_channel_id(kit_key)
     if not channel_id:
         return
     channel = guild.get_channel(channel_id)

@@ -108,6 +108,33 @@ _DEFAULT_QUEUE_CHANNELS = {
 }
 QUEUE_CHANNELS: dict[str, int] = _dict_env("QUEUE_CHANNELS_JSON", _DEFAULT_QUEUE_CHANNELS)
 
+# Runtime kanály panelů fronty (spravuje /addqchannel; mají přednost).
+QUEUE_CHANNELS_FILE = "queue_channels.json"
+
+
+def get_queue_channel_id(kit_key: str):
+    """ID kanálu panelu fronty pro kit: runtime JSON > env/defaulty (nebo None)."""
+    from storage import load_data
+
+    extra = load_data(QUEUE_CHANNELS_FILE, {})
+    lowered = str(kit_key).lower()
+    for key in (str(kit_key), lowered):
+        if key in extra:
+            try:
+                return int(extra[key])
+            except (TypeError, ValueError):
+                pass
+    return QUEUE_CHANNELS.get(lowered)
+
+
+def set_queue_channel_id(kit_key: str, channel_id: int) -> None:
+    """Uloží/změní kanál panelu fronty pro kit (používá /addqchannel)."""
+    from storage import load_data, save_data
+
+    extra = load_data(QUEUE_CHANNELS_FILE, {})
+    extra[str(kit_key).lower()] = int(channel_id)
+    save_data(QUEUE_CHANNELS_FILE, extra)
+
 # --- Role testera ---------------------------------------------------------
 # Stačí, aby název role OBSAHOVAL tento řetězec (case-insensitive).
 TESTER_ROLE_FRAGMENT: str = os.getenv("TESTER_ROLE_FRAGMENT", "tester")

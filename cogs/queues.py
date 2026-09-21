@@ -13,7 +13,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import PLAYER_COOLDOWN_MS, QUEUE_CHANNELS
+from config import PLAYER_COOLDOWN_MS, get_queue_channel_id
 from panel import create_queue_embed, update_panel
 from storage import load_data, save_data
 from utils import has_tester_role
@@ -52,7 +52,7 @@ class Queues(commands.Cog):
                 ephemeral=True,
             )
 
-        channel_id = QUEUE_CHANNELS.get(kit_key)
+        channel_id = get_queue_channel_id(kit_key)
         if not channel_id:
             return await interaction.response.send_message(
                 f"❌ Neznámý kit: {kit}", ephemeral=True
@@ -162,7 +162,7 @@ class Queues(commands.Cog):
         old = queue_messages.pop(kit_key, None)
         old_id = old.get("message_id") if isinstance(old, dict) else old
 
-        channel_id = QUEUE_CHANNELS.get(kit_key)
+        channel_id = get_queue_channel_id(kit_key)
         kit_channel = None
         if channel_id:
             kit_channel = interaction.guild.get_channel(channel_id)

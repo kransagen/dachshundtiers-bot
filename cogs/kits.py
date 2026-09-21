@@ -9,6 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from config import set_queue_channel_id
 from storage import load_data
 from utils import add_kit, get_kits, remove_kit
 from views import HT3PanelView
@@ -85,6 +86,48 @@ class Kits(commands.Cog):
         else:
             message += "\n💡 Pro aktualizaci HT3+ panelu spusť nové `/sendht3`."
 
+        await interaction.response.send_message(message)
+
+    # ------------------------------------------------------------------
+    # /addqchannel
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="addqchannel",
+        description="Nastaví kanál panelu fronty pro kit (kam chodí /openq)",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.describe(
+        kit="Název kitu (např. UHCMace)",
+        kanal="Kanál pro panel fronty (volitelné; default: tento kanál)",
+    )
+    async def addqchannel(
+        self,
+        interaction: discord.Interaction,
+        kit: str,
+        kanal: discord.TextChannel = None,
+    ) -> None:
+        kit_name = kit.strip()
+        kit_key = kit_name.lower()
+        if not kit_key:
+            return await interaction.response.send_message(
+                "❌ Zadej platný název kitu.", ephemeral=True
+            )
+
+        channel = kanal or interaction.channel
+        if channel is None:
+            return await interaction.response.send_message(
+                "❌ Zadej kanál pro panel (nebo spusť příkaz v textovém kanálu).",
+                ephemeral=True,
+            )
+
+        set_queue_channel_id(kit_key, channel.id)
+
+        message = f"✅ Panel fronty pro kit **{kit_name}** bude chodit do <#{channel.id}>."
+        if not any(existing.lower() == kit_key for existing in get_kits()):
+            message += (
+                "\n💡 Kit zatím není v seznamu – přidej ho ještě přes `/addkit`, "
+                "ať se objeví v HT3+ panelu a u autocomplete."
+            )
         await interaction.response.send_message(message)
 
     # ------------------------------------------------------------------

@@ -56,7 +56,8 @@ class JoinModal(discord.ui.Modal):
 
         await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
-            f"✅ Byl jsi úspěšně přidán do fronty **{self.kit}** s jménem `{ign}`."
+            f"✅ Byl jsi úspěšně přidán do fronty **{self.kit}** s jménem `{ign}`.",
+            ephemeral=True,
         )
 
 

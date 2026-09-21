@@ -358,10 +358,11 @@ class Queues(commands.Cog):
 
     @queue.command(name="pull", description="Automatically pull the first player")
     async def queue_pull(self, interaction: discord.Interaction) -> None:
-        testers = load_data("testers.json")
-        if str(interaction.user.id) not in testers:
+        # Stejná kontrola jako pull tlačítko na panelu (views.py) – jen role
+        # Tester. Globální "joinastester" registrace není vyžadována.
+        if not has_tester_role(interaction.user):
             return await interaction.response.send_message(
-                "❌ Zadej nejdřív `/queue joinastester`", ephemeral=True
+                "❌ Na tohle musíš být Tester!", ephemeral=True
             )
 
         queue = load_data("queue.json")

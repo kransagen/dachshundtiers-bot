@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Env soubory (nikdy necommitovat tokeny)
+.env
+
+# OS
+.DS_Store
+
+# Poznámka k datům:
+# JSON databáze v ./data se commitují stejně jako v původním repozitáři
+# (players, testers_stats, cooldowny...). Soubory, které vznikají za běhu
+# a nepatří do gitu, jsou níže.
+data/ht3_panel_message.json
+data/.gitkeep

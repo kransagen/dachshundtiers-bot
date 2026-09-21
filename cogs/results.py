@@ -215,34 +215,51 @@ class Results(commands.Cog):
             save_data("queue.json", new_queue)
             await update_panel(interaction.guild, kit_key)
 
-        # 3) Odebrání práv z roomky (pokud byl hráč vytažen)
+        # 3) Odebrání práv z tester roomek – po výsledku hráč nesmí zůstat
+        #    v žádné roomce. Pokrývá pull tlačítko / /queue pull (záznam ve
+        #    pulled_players.json) i přednastavený přístup přes `/mktesterroom
+        #    hrac:` – vždy odstraníme hráčův osobní overwrite ve VŠECH
+        #    kanálech serveru.
         pulled_players = load_data("pulled_players.json", {})
-        room_id = pulled_players.pop(target_id, None)
-        if room_id:
+        if target_id in pulled_players:
+            del pulled_players[target_id]
             save_data("pulled_players.json", pulled_players)
-            try:
-                room = interaction.guild.get_channel(int(room_id))
-                if room is None:
-                    room = await interaction.guild.fetch_channel(int(room_id))
-                member = interaction.guild.get_member(int(target_id))
-                if member is None:
-                    try:
-                        member = await interaction.guild.fetch_member(int(target_id))
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        member = None
-                if room is not None and member is not None:
-                    await room.set_permissions(member, overwrite=None)
-            except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-                pass
 
-        # Odebrání práv i v aktuální roomce (jako v původním botovi)
-        if interaction.channel is not None:
+        member = interaction.guild.get_member(int(target_id))
+        if member is None:
             try:
-                await interaction.channel.set_permissions(
-                    interaction.guild.get_member(int(target_id)) or hrac, overwrite=None
+                member = await interaction.guild.fetch_member(int(target_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                member = None
+
+        if member is not None:
+            removed_count = 0
+            for ch in interaction.guild.channels:
+                try:
+                    has_member_ow = any(
+                        isinstance(t, discord.Member) and t.id == member.id
+                        for t in ch.permission_overwrites
+                    )
+                except (AttributeError, TypeError):
+                    continue
+                if not has_member_ow:
+                    continue
+                try:
+                    await ch.set_permissions(member, overwrite=None)
+                    removed_count += 1
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    log.warning(
+                        "Nelze odebrat práva hráče %s v kanálu %s: %s",
+                        target_id,
+                        ch.id,
+                        err,
+                    )
+            if removed_count:
+                log.info(
+                    "Po /result odebrána práva hráče %s v %d kanálu(ech)",
+                    target_id,
+                    removed_count,
                 )
-            except (discord.Forbidden, discord.HTTPException):
-                pass
 
         # 4) Statistiky testera
         month = month_key()

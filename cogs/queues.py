@@ -489,6 +489,10 @@ class Queues(commands.Cog):
         room_msg = f"🔒 Tester roomka – vytvořil <@{interaction.user.id}>"
         if player_named:
             room_msg += f"\n👤 Hráč s přístupem: <@{hrac.id}>"
+            # Zaznamenání přednastaveného hráče – /result mu pak práva odebere
+            pulled = load_data("pulled_players.json", {})
+            pulled[str(hrac.id)] = str(channel.id)
+            save_data("pulled_players.json", pulled)
         room_msg += (
             "\nHráč získá přístup po pullnutí (tlačítko Pull Player ⚔️) a po"
             " `/result` mu bude odebrán. Roomku smažeš tlačítkem níže."

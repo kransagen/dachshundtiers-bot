@@ -80,7 +80,8 @@ Přidaný/odebraný kit se hned promítne do:
 ## Struktura projektu
 
 ```
-bot.py                # vstupní bod, registrace příkazů/view, retry gateway
+bot.py                # jádro bota (vstup: python bot.py)
+main.py               # vstupní bod pro hosting (startup file = main.py)
 config.py             # konfigurace (.env)
 storage.py            # načítání/ukládání JSON databáze (./data)
 panel.py              # živý waitlist panel
@@ -105,8 +106,10 @@ pip install -r requirements.txt
 cp .env.example .env   # doplň DISCORD_TOKEN
 # nebo: export DISCORD_TOKEN=...
 
-# 3. Spuštění
+# 3. Spuštění lokálně
 python bot.py
+# nebo (hosting obvykle spouští main.py)
+python main.py
 ```
 
 > `.env` je automaticky načten přes `python-dotenv` (viz `config.py`).

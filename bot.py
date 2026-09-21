@@ -127,7 +127,8 @@ async def main() -> None:
     await bot.start(DISCORD_TOKEN)
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Spustí bota s retry při přechodných chybách gateway."""
     if not DISCORD_TOKEN:
         raise SystemExit(
             "❌ Chybí DISCORD_TOKEN. Nastav proměnnou prostředí (viz .env.example)."
@@ -151,3 +152,7 @@ if __name__ == "__main__":
         ) as err:
             log.warning("Přechodná chyba gateway (%s). Retry za 5 s...", err)
             time.sleep(5)
+
+
+if __name__ == "__main__":
+    run()

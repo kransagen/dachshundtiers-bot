@@ -71,24 +71,25 @@ def get_result_channel_id(tier: str) -> int:
 # Výchozí kategorie pro všechny HT3+ tickety.
 HT3_TICKET_CATEGORY_ID: int = _int_env("HT3_TICKET_CATEGORY_ID", 1521515658448470066)
 
-# Volitelné: víc kategorií pro HT3+ tickety nastavitelných přes env.
-# Klíč je buď TIER (HT3, LT2, HT2, LT1, HT1) nebo kit (randompot, anchorpvp, ...).
-# Při vytvoření ticketu se použije kategorie podle tieru, jinak podle kitu,
-# jinak HT3_TICKET_CATEGORY_ID. Příklad:
-#   HT3_TICKET_CATEGORIES_JSON={"HT3":"1521515658448470066","LT2":"123456789012345678"}
+# Volitelné: kategorie HT3+ ticketů nastavitelné přes env.
+# Pro KAŽDÝ kit můžeš mít vlastní kategorii – klíč je jméno kitu
+# (randompot, anchorpvp, ironaxe, ...). Volitelně lze přidat i tier
+# (HT3, LT2, HT2, LT1, HT1) jako záchytnou kategorii. Příklad:
+#   HT3_TICKET_CATEGORIES_JSON={"randompot":"1521515658448470066","ironaxe":"123456789012345678"}
+# Priorita shody: kit -> tier -> HT3_TICKET_CATEGORY_ID.
 HT3_TICKET_CATEGORIES: dict[str, int] = _dict_env("HT3_TICKET_CATEGORIES_JSON", {})
 
 
 def get_ht3_ticket_category(tier: str, kit: str) -> int:
-    """Vrátí ID kategorie pro HT3+ ticket (podle tieru, pak kitu, pak default)."""
-    tier_key = tier.strip().upper()
-    for key in (tier_key, tier_key.lower()):
-        if key in HT3_TICKET_CATEGORIES:
-            return HT3_TICKET_CATEGORIES[key]
+    """Vrátí ID kategorie pro HT3+ ticket (kit, pak tier, pak default)."""
     kit_key = kit.strip().lower()
-    for key in (kit_key, kit_key.upper()):
-        if key in HT3_TICKET_CATEGORIES:
-            return HT3_TICKET_CATEGORIES[key]
+    for key, value in HT3_TICKET_CATEGORIES.items():
+        if str(key).lower() == kit_key:
+            return value
+    tier_key = tier.strip().upper()
+    for key, value in HT3_TICKET_CATEGORIES.items():
+        if str(key).lower() == tier_key.lower():
+            return value
     return HT3_TICKET_CATEGORY_ID
 
 

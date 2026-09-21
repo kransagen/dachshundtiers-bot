@@ -11,6 +11,7 @@
 import asyncio
 import base64
 import json
+import logging
 import time
 
 import discord
@@ -22,6 +23,8 @@ from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, ge
 from panel import update_panel
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, add_kit, get_kits, has_tester_role, month_key, now_ms, today_cz
+
+log = logging.getLogger("dachshundtiers")
 
 
 async def kit_autocomplete(
@@ -126,6 +129,17 @@ class Results(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def cog_app_command_error(
+        self, interaction: discord.Interaction, error: discord.app_commands.AppCommandError
+    ) -> None:
+        """Zachytí neošetřené chyby příkazů – pošle hlášku a zaloguje traceback."""
+        log.exception("Chyba v příkazu %s: %s", interaction.command, error)
+        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
     # ------------------------------------------------------------------
     # /result
     # ------------------------------------------------------------------
@@ -157,6 +171,10 @@ class Results(commands.Cog):
     ) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
+
+        # Défer hned napřed – stejně jako originál (index.ts: deferReply),
+        # abychom se vešli do 3s okna Discord i přes fetch roomky / kanálu.
+        await interaction.response.defer(ephemeral=True)
 
         target_id = str(hrac.id)
         ign_clean = ign.strip()
@@ -298,16 +316,17 @@ class Results(commands.Cog):
         if result_channel is not None:
             try:
                 await result_channel.send(content=content, embed=embed)
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     f"{saved_msg} Odesláno do <#{result_channel_id}>.",
                     ephemeral=True,
                 )
-            except (discord.Forbidden, discord.HTTPException):
-                await interaction.response.send_message(
+            except (discord.Forbidden, discord.HTTPException) as err:
+                log.warning("Nelze poslat do výsledkového kanálu %s: %s", result_channel_id, err)
+                await interaction.followup.send(
                     saved_msg, embed=embed, ephemeral=True
                 )
         else:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"{saved_msg} (Výsledkový kanál <#{result_channel_id}> nebyl nalezen.)",
                 embed=embed,
                 ephemeral=True,

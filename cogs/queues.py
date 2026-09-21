@@ -13,19 +13,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import PLAYER_COOLDOWN_MS
+from config import PLAYER_COOLDOWN_MS, QUEUE_CHANNELS
 from panel import create_queue_embed, update_panel
 from storage import load_data, save_data
 from utils import has_tester_role
 from views import QueueView
-
-
-async def _delete_message(channel, message_id) -> None:
-    try:
-        message = await channel.fetch_message(int(message_id))
-        await message.delete()
-    except (discord.NotFound, discord.HTTPException):
-        pass
 
 
 class Queues(commands.Cog):
@@ -42,6 +34,10 @@ class Queues(commands.Cog):
             return await interaction.response.send_message(
                 "❌ Only testers can open queues.", ephemeral=True
             )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
 
         kit_key = kit.lower()
         active_queues = load_data("active_queues.json", {})
@@ -56,12 +52,30 @@ class Queues(commands.Cog):
                 ephemeral=True,
             )
 
-        # Smaž případný starý panel pro tento kit
-        queue_messages = load_data("queue_messages.json", {})
-        old = queue_messages.get(kit_key)
-        old_id = old.get("message_id") if isinstance(old, dict) else old
-        if old_id:
-            await _delete_message(interaction.channel, old_id)
+        channel_id = QUEUE_CHANNELS.get(kit_key)
+        if not channel_id:
+            return await interaction.response.send_message(
+                f"❌ Neznámý kit: {kit}", ephemeral=True
+            )
+
+        # Panel vždy jde do určeného kanálu daného kitu, ne do kanálu příkazu
+        kit_channel = interaction.guild.get_channel(channel_id)
+        if kit_channel is None:
+            try:
+                kit_channel = await interaction.guild.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                kit_channel = None
+        if kit_channel is None:
+            return await interaction.response.send_message(
+                "❌ Nepodařilo se najít kanál pro tento kit.", ephemeral=True
+            )
+
+        # Purge všech zpráv v kanálu kitu před novým panelem (jako v originále)
+        try:
+            async for message in kit_channel.history(limit=100):
+                await message.delete()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
         active_queues[kit_key] = {
             "name": kit,
@@ -76,14 +90,18 @@ class Queues(commands.Cog):
         embed = create_queue_embed(kit, filtered, active_queues[kit_key]["testers"])
 
         view = QueueView(kit)
-        await interaction.response.send_message("📢 @everyone", embed=embed, view=view)
-        message = await interaction.original_response()
+        message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
 
+        queue_messages = load_data("queue_messages.json", {})
         queue_messages[kit_key] = {"message_id": str(message.id), "kit": kit}
         save_data("queue_messages.json", queue_messages)
 
         # Zaregistrování persistentní view pro restart bota
         self.bot.add_view(view, message_id=message.id)
+
+        await interaction.response.send_message(
+            f"✅ Fronta pro **{kit}** byla otevřena v <#{channel_id}>!", ephemeral=True
+        )
 
     # ------------------------------------------------------------------
     # /closeq
@@ -94,6 +112,10 @@ class Queues(commands.Cog):
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Only testers can close queues.", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
             )
 
         kit_key = kit.lower()
@@ -118,12 +140,11 @@ class Queues(commands.Cog):
         del active_queues[kit_key]
         save_data("active_queues.json", active_queues)
 
-        queue_messages = load_data("queue_messages.json", {})
-        old = queue_messages.pop(kit_key, None)
-        old_id = old.get("message_id") if isinstance(old, dict) else old
-        if old_id:
-            await _delete_message(interaction.channel, old_id)
-        save_data("queue_messages.json", queue_messages)
+        # Vyčištění všech čekajících hráčů pro tento kit (jako v originále)
+        queue = load_data("queue.json")
+        remaining = [p for p in queue if str(p.get("kit", "")).lower() != kit_key]
+        if len(remaining) != len(queue):
+            save_data("queue.json", remaining)
 
         closing_ts = int(time.time())
         embed = discord.Embed(
@@ -136,7 +157,42 @@ class Queues(commands.Cog):
             timestamp=discord.utils.utcnow(),
         )
 
-        await interaction.response.send_message(embed=embed, view=QueueView(kit, disabled_join=True))
+        # Panel se upraví přímo v určeném kanálu kitu (bez tlačítek)
+        queue_messages = load_data("queue_messages.json", {})
+        old = queue_messages.pop(kit_key, None)
+        old_id = old.get("message_id") if isinstance(old, dict) else old
+
+        channel_id = QUEUE_CHANNELS.get(kit_key)
+        kit_channel = None
+        if channel_id:
+            kit_channel = interaction.guild.get_channel(channel_id)
+            if kit_channel is None:
+                try:
+                    kit_channel = await interaction.guild.fetch_channel(channel_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    kit_channel = None
+
+        if kit_channel is not None and old_id:
+            try:
+                panel_msg = await kit_channel.fetch_message(int(old_id))
+                await panel_msg.edit(embed=embed, view=None)
+            except (discord.NotFound, discord.HTTPException):
+                try:
+                    await kit_channel.send(embed=embed)
+                except discord.HTTPException:
+                    pass
+        elif kit_channel is not None:
+            try:
+                await kit_channel.send(embed=embed)
+            except discord.HTTPException:
+                pass
+
+        save_data("queue_messages.json", queue_messages)
+
+        await interaction.response.send_message(
+            f"Queue pro **{kit}** has been closed and all players have been removed.",
+            ephemeral=True,
+        )
 
     # ------------------------------------------------------------------
     # /queue (skupina subpříkazů)
@@ -186,7 +242,7 @@ class Queues(commands.Cog):
         )
         save_data("queue.json", queue)
 
-        await update_panel(interaction.channel, kit_key)
+        await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(f"✅ Byl jsi přidán do fronty **{kit.strip()}**.")
 
     @queue.command(name="list", description="Zobrazí aktuální fronty a aktivní testery.")
@@ -259,7 +315,7 @@ class Queues(commands.Cog):
         active_queues[kit_key]["testers"].append(user_id)
         save_data("active_queues.json", active_queues)
 
-        await update_panel(interaction.channel, kit_key)
+        await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
             f"⚔️ <@{user_id}> se přidal jako další aktivní tester pro frontu "
             f"**{active_queues[kit_key]['name']}**."
@@ -293,7 +349,7 @@ class Queues(commands.Cog):
 
         save_data("active_queues.json", active_queues)
 
-        await update_panel(interaction.channel, kit_key)
+        await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
             f"👋 <@{user_id}> opustil frontu **{active_queues[kit_key]['name']}**. "
             "Ostatní testeři mohou pokračovat."
@@ -343,7 +399,7 @@ class Queues(commands.Cog):
             content=f"<@{player['id']}> jsi na řadě pro **{player.get('kit')}**!",
             embed=embed,
         )
-        await update_panel(interaction.channel, str(player.get("kit", "")).lower())
+        await update_panel(interaction.guild, str(player.get("kit", "")).lower())
 
     # ------------------------------------------------------------------
     # /removeq
@@ -368,7 +424,7 @@ class Queues(commands.Cog):
         await interaction.response.send_message(
             f"🧹 Hráč <@{user_id}> byl vyhozen z fronty pro kit **{entry.get('kit')}**."
         )
-        await update_panel(interaction.channel, str(entry.get("kit", "")).lower())
+        await update_panel(interaction.guild, str(entry.get("kit", "")).lower())
 
 
 async def setup(bot: commands.Bot) -> None:

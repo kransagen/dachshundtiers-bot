@@ -9,7 +9,7 @@ import time
 
 import discord
 
-from config import HT3_COOLDOWN_MS, HT3_TICKET_CATEGORY_ID, PLAYER_COOLDOWN_MS
+from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, get_ht3_ticket_category
 from panel import update_panel
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, has_tester_role
@@ -54,8 +54,7 @@ class JoinModal(discord.ui.Modal):
         )
         save_data("queue.json", queue)
 
-        await update_panel(interaction.channel, kit_key)
-
+        await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
             f"✅ Byl jsi úspěšně přidán do fronty **{self.kit}** s jménem `{ign}`."
         )
@@ -133,7 +132,7 @@ class QueueView(discord.ui.View):
             )
 
         save_data("queue.json", new_queue)
-        await update_panel(interaction.channel, kit_key)
+        await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
             f"✅ Úspěšně jsi opustil frontu pro kit **{self.kit}**.", ephemeral=True
         )
@@ -215,7 +214,7 @@ class QueueView(discord.ui.View):
             await target_channel.send(
                 content=f"👋 <@{player['id']}> jsi na řadě! Tady proběhne tvůj test na kit **{kit_name}**."
             )
-            await update_panel(interaction.channel, kit_key)
+            await update_panel(interaction.guild, kit_key)
 
             await interaction.response.send_message(
                 f"✅ Hráč <@{player['id']}> byl úspěšně přesunut do <#{channel_id}> a dostal práva.",
@@ -288,9 +287,25 @@ class HT3Modal(discord.ui.Modal):
 
         await interaction.response.defer(ephemeral=True)
 
+        if interaction.guild is None:
+            return await interaction.followup.send("❌ Pouze na serveru.", ephemeral=True)
+
         guild = interaction.guild
         everyone = guild.default_role
-        category = guild.get_channel(HT3_TICKET_CATEGORY_ID)
+
+        # Kategorie podle tieru, pak podle kitu, jinak výchozí (configurable)
+        category_id = get_ht3_ticket_category(target_tier, kit)
+        category = guild.get_channel(category_id)
+        if category is None:
+            try:
+                category = await guild.fetch_channel(category_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                category = None
+        if category is None:
+            return await interaction.followup.send(
+                f"❌ Kategorie pro ticket (ID `{category_id}`) nebyla nalezena!",
+                ephemeral=True,
+            )
 
         channel = await guild.create_text_channel(
             name=f"{ign}-{target_tier}-{kit}".lower(),

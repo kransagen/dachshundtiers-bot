@@ -178,7 +178,7 @@ class Results(commands.Cog):
         ]
         if len(new_queue) != len(queue):
             save_data("queue.json", new_queue)
-            await update_panel(interaction.channel, kit_key)
+            await update_panel(interaction.guild, kit_key)
 
         # 3) Odebrání práv z roomky (pokud byl hráč vytažen)
         pulled_players = load_data("pulled_players.json", {})

@@ -2,6 +2,7 @@
 
 import discord
 
+from config import QUEUE_CHANNELS
 from storage import load_data
 
 
@@ -31,20 +32,33 @@ def create_queue_embed(kit_name: str, current_queue, testers_list) -> discord.Em
     )
 
 
-async def update_panel(channel, kit_key: str) -> None:
-    """Aktualizuje embed živého panelu pro daný kit (podle uložené zprávy)."""
+async def update_panel(guild, kit_key: str) -> None:
+    """Aktualizuje embed živého panelu pro daný kit.
+
+    Panel se hledá v určeném kanálu kitu (QUEUE_CHANNELS), ne v kanálu příkazu.
+    """
     queue_messages = load_data("queue_messages.json", {})
     active_queues = load_data("active_queues.json", {})
     entry = queue_messages.get(kit_key)
     active = active_queues.get(kit_key)
 
-    if not entry or not active:
+    if not entry or not active or guild is None:
         return
 
     # zpětná kompatibilita: entry může být jen ID zprávy (string), nebo slovník
     message_id = entry.get("message_id") if isinstance(entry, dict) else entry
     if not message_id:
         return
+
+    channel_id = QUEUE_CHANNELS.get(kit_key)
+    if not channel_id:
+        return
+    channel = guild.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await guild.fetch_channel(channel_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
 
     try:
         message = await channel.fetch_message(int(message_id))

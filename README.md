@@ -90,6 +90,14 @@ příchody/odchody).
 Výběr kitu → kontrola 7denního cooldownu → modál (IGN + cílový tier) →
 vytvoření ticket roomky → tlačítko **🔒 Close Ticket** (nastaví cooldown a za 3 s smaže roomku).
 
+**Automatická kontrola limitu tieru:** při odeslání modálu bot najde hráče podle IGN
+v `players.json`, vezme jeho aktuální tier pro daný kit a spočítá „další tier“
+(následník v žebříčku **LT5 < HT5 < LT4 < HT4 < LT3 < HT3 < LT2 < HT2 < LT1 < HT1**).
+Ticket na lepší tier, než je hráčův limit, je **zablokovaný** s vysvětlením
+(např. hráč na LT3 může jít max. na HT3 – ticket na HT1 se nevytvoří).
+Retest na aktuálním tieru projde. Když hráč nemá zaznamenaný tier, ticket projde
+bez kontroly (s poznámkou). Aktuální tier z databáze je vidět i v embedu ticketu.
+
 Kategorie ticket roomky je **nastavitelná pro každý kit** (`HT3_TICKET_CATEGORIES_JSON`),
 např. `{"randompot":"...","ironaxe":"..."}`. Priorita: kit → tier
 (HT3/LT2/HT2/LT1/HT1) → výchozí `HT3_TICKET_CATEGORY_ID`.

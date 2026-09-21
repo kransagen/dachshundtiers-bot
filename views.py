@@ -10,7 +10,7 @@ import time
 
 import discord
 
-from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, get_ht3_ticket_category
+from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, TIERS_UPPER, get_ht3_ticket_category
 from panel import update_panel
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, has_tester_role
@@ -311,8 +311,45 @@ class PullChannelSelectView(discord.ui.View):
 
 
 # ---------------------------------------------------------------------------
-# HT3+ tickety: select menu + modál + tlačítko Close Ticket
+# HT3+ tickety: kontrola tieru (limit hráče) + select menu + modál + Close
 # ---------------------------------------------------------------------------
+# HT3+ ticket žebříček (nejhorší → nejlepší, potvrzeno provozovatelem):
+#   LT5 < HT5 < LT4 < HT4 < LT3 < HT3 < LT2 < HT2 < LT1 < HT1
+# (LT5 je nejmenší, HT1 je největší.)
+HT3_TIER_LADDER = [
+    "LT5", "HT5", "LT4", "HT4", "LT3", "HT3", "LT2", "HT2", "LT1", "HT1",
+]
+
+
+def _next_ticket_tier(current: str) -> str | None:
+    """O stupeň lepší tier (přímý následník v žebříčku) – limit hráče.
+
+    Příklad: LT3 → HT3, HT3 → LT2, LT2 → HT2, HT1 → HT1 (vrchol).
+    Vrací None, pokud tier nelze přečíst (R-tiery / neznámý formát).
+    """
+    t = (current or "").strip().upper()
+    if t not in HT3_TIER_LADDER:
+        return None  # R-tiery / neznámý formát – nekontrolujeme
+    idx = HT3_TIER_LADDER.index(t)
+    if idx == len(HT3_TIER_LADDER) - 1:
+        return t  # HT1 = vrchol žebříčku
+    return HT3_TIER_LADDER[idx + 1]
+
+
+def _find_player_tier(ign: str, kit: str) -> str | None:
+    """Najde hráče v players.json a vrátí jeho aktuální tier pro daný kit."""
+    try:
+        players = load_data("players.json", []) or []
+    except Exception:
+        return None
+    for p in players:
+        if str(p.get("username", "")).strip().lower() == ign.strip().lower():
+            modes = p.get("modes") or {}
+            tier = modes.get(kit)
+            return str(tier).strip().upper() if tier else None
+    return None
+
+
 class HT3PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -365,13 +402,37 @@ class HT3Modal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         ign = (self.ign_input.value or "").strip()
-        target_tier = (self.tier_input.value or "").strip()
+        target_tier = (self.tier_input.value or "").strip().upper()
         kit = self.kit
 
         await interaction.response.defer(ephemeral=True)
 
         if interaction.guild is None:
             return await interaction.followup.send("❌ Pouze na serveru.", ephemeral=True)
+
+        # Tvarově povolené tiery pro HT3+ ticket (stejně jako label v modálu)
+        if target_tier not in TIERS_UPPER:
+            return await interaction.followup.send(
+                "❌ Neplatný tier! Povolené tiery pro HT3+ ticket jsou: "
+                "**HT3, LT2, HT2, LT1, HT1**.",
+                ephemeral=True,
+            )
+
+        # Kontrola limitu: ticket nesmí být na lepší tier, než hráč může.
+        # Hráč je hledaný podle IGN v players.json (stejná data, co posílá /result).
+        current_tier = _find_player_tier(ign, kit)
+        limit_tier = _next_ticket_tier(current_tier) if current_tier else None
+        if current_tier and limit_tier and target_tier in HT3_TIER_LADDER:
+            limit_idx = HT3_TIER_LADDER.index(limit_tier)
+            typed_idx = HT3_TIER_LADDER.index(target_tier)
+            if typed_idx > limit_idx:
+                return await interaction.followup.send(
+                    f"❌ **Ticket na `{target_tier}` přesahuje tvůj limit!**\n"
+                    f"Tvůj aktuální tier v kitu **{kit}** je `{current_tier}` – "
+                    f"maximálně můžeš jít na **{limit_tier}**. Uprav ticket prosím "
+                    f"na `{limit_tier}` (nebo retest na `{current_tier}`).",
+                    ephemeral=True,
+                )
 
         guild = interaction.guild
         everyone = guild.default_role
@@ -406,6 +467,11 @@ class HT3Modal(discord.ui.Modal):
             .add_field(name="IGN", value=ign, inline=False)
             .add_field(name="Tvůj současný tier / Požadovaný", value=target_tier, inline=False)
             .add_field(name="GAMEMODE", value=kit, inline=False)
+            .add_field(
+                name="Tvůj aktuální tier (databáze)",
+                value=current_tier or "—",
+                inline=False,
+            )
         )
 
         close_btn = discord.ui.Button(
@@ -418,8 +484,14 @@ class HT3Modal(discord.ui.Modal):
         ticket_view.add_item(close_btn)
 
         await channel.send(content=f"<@{interaction.user.id}>", embed=embed, view=ticket_view)
+        note = ""
+        if current_tier and limit_tier and target_tier != limit_tier:
+            note = (
+                f"\n💡 Tvůj aktuální tier je `{current_tier}` – "
+                f"garantovaný další tier je `{limit_tier}`."
+            )
         await interaction.followup.send(
-            f"Ticket byl vytvořen: <#{channel.id}>", ephemeral=True
+            f"Ticket byl vytvořen: <#{channel.id}>{note}", ephemeral=True
         )
 
     async def on_close(self, interaction: discord.Interaction) -> None:

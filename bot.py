@@ -58,9 +58,14 @@ class DachshundTiersBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("Bot %s (ID: %s) je online!", self.user, self.user.id)
 
-        # Registrace slash příkazů (globálně, nebo jen v GUILD_ID)
+        # Registrace slash příkazů (globálně, nebo jen v GUILD_ID).
+        # POZOR: pro sync do guildy je nejdřív nutné zkopírovat globální příkazy
+        # přes tree.copy_global_to(guild=...). Bez toho discord.py pošle prázdný
+        # seznam (PUT []) a smaže slash příkazy daného servru ("Synchronizováno 0").
         target = discord.Object(id=GUILD_ID) if GUILD_ID else None
         try:
+            if target is not None:
+                self.tree.copy_global_to(guild=target)
             synced = await self.tree.sync(guild=target)
             log.info("Synchronizováno %d slash příkazů", len(synced))
         except Exception as err:  # noqa: BLE001

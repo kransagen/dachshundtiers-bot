@@ -404,3 +404,39 @@ class TournamentSignupView(discord.ui.View):
         await interaction.response.send_message(
             "Byl jsi úspěšně přihlášen do turnaje! ✅", ephemeral=True
         )
+
+
+# ---------------------------------------------------------------------------
+# Tester roomka: tlačítko 🔒 Zavřít místnost (smaže kanál)
+# ---------------------------------------------------------------------------
+class TesterRoomView(discord.ui.View):
+    """Tlačítko pro zavření tester roomky (vytvořené přes /mktesterroom)."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        btn = discord.ui.Button(
+            style=discord.ButtonStyle.danger,
+            label="🔒 Zavřít místnost",
+            custom_id="close_testerroom",
+        )
+        btn.callback = self.on_close
+        self.add_item(btn)
+
+    async def on_close(self, interaction: discord.Interaction) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Jen tester může zavřít místnost.", ephemeral=True
+            )
+
+        await interaction.response.send_message("🔒 Místnost se zavírá...")
+
+        channel = interaction.channel
+
+        async def _delete_later() -> None:
+            await asyncio.sleep(3)
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+        asyncio.create_task(_delete_later())

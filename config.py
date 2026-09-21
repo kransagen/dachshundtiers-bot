@@ -62,6 +62,11 @@ RESULT_CHANNEL_LOWER: int = _int_env("RESULT_CHANNEL_LOWER", 1505130409632206888
 RESULT_CHANNEL_UPPER: int = _int_env("RESULT_CHANNEL_UPPER", 1505130493283405884)
 TIERS_UPPER = {"HT3", "LT2", "HT2", "LT1", "HT1"}
 
+# --- Tester roomky (/mktesterroom) -------------------------------------------
+# Volitelná kategorie, do které se vytvářejí tester roomky. 0 = bez kategorie
+# (roomka vznikne nahoře na serveru).
+TESTER_ROOM_CATEGORY_ID: int = _int_env("TESTER_ROOM_CATEGORY_ID", 0)
+
 
 def get_result_channel_id(tier: str) -> int:
     """Vrátí ID výsledkového kanálu podle tieru (HT3+ → UPPER, jinak LOWER)."""

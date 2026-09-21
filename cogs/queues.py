@@ -7,17 +7,18 @@ Port původních funkcí z DACHSHUNDTIERSQBOT (JS):
 - /removeq
 """
 
+import re
 import time
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import PLAYER_COOLDOWN_MS, get_queue_channel_id
+from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID, get_queue_channel_id
 from panel import create_queue_embed, update_panel
 from storage import load_data, save_data
 from utils import has_tester_role
-from views import QueueView
+from views import QueueView, TesterRoomView
 
 
 class Queues(commands.Cog):
@@ -425,6 +426,97 @@ class Queues(commands.Cog):
             f"🧹 Hráč <@{user_id}> byl vyhozen z fronty pro kit **{entry.get('kit')}**."
         )
         await update_panel(interaction.guild, str(entry.get("kit", "")).lower())
+
+    # ------------------------------------------------------------------
+    # /mktesterroom – vytvoří soukromou tester roomku (text kanál)
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="mktesterroom",
+        description="Vytvoří soukromou tester roomku pro pullnutí hráče",
+    )
+    @app_commands.describe(
+        hrac="Hráč, kterému rovnou nastavit přístup (volitelné)",
+        kategorie="Kategorie roomky (volitelné; default z env TESTER_ROOM_CATEGORY_ID)",
+    )
+    async def mktesterroom(
+        self,
+        interaction: discord.Interaction,
+        hrac: discord.Member = None,
+        kategorie: discord.CategoryChannel = None,
+    ) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Jen testeři můžou vytvářet tester roomky.", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+
+        guild = interaction.guild
+        everyone = guild.default_role
+
+        # Kategorie: předaná parametrem, jinak z env, jinak žádná
+        category = kategorie
+        category_id = TESTER_ROOM_CATEGORY_ID
+        if category is None and category_id:
+            category = guild.get_channel(category_id)
+            if category is None:
+                try:
+                    category = await guild.fetch_channel(category_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    category = None
+            if not isinstance(category, discord.CategoryChannel):
+                category = None
+
+        base_name = hrac.display_name if hrac else interaction.user.display_name
+        room_name = re.sub(r"[^a-z0-9]+", "-", base_name.lower()).strip("-")[:32]
+        room_name = room_name or "tester-room"
+
+        overwrites = {
+            everyone: discord.PermissionOverwrite(view_channel=False),
+            interaction.user: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True
+            ),
+        }
+        player_named = hrac is not None and hrac.id != interaction.user.id
+        if player_named:
+            overwrites[hrac] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True
+            )
+
+        try:
+            channel = await guild.create_text_channel(
+                name=room_name,
+                category=category,
+                overwrites=overwrites,
+                reason="Tester roomka (/mktesterroom)",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return await interaction.response.send_message(
+                "❌ Nepodařilo se vytvořit roomku. Zkontroluj oprávnění bota "
+                "(Manage Channels).",
+                ephemeral=True,
+            )
+
+        room_msg = f"🔒 Tester roomka – vytvořil <@{interaction.user.id}>"
+        if player_named:
+            room_msg += f"\n👤 Hráč s přístupem: <@{hrac.id}>"
+        room_msg += (
+            "\nHráč získá přístup po pullnutí (tlačítko Pull Player ⚔️) a po"
+            " `/result` mu bude odebrán. Roomku smažeš tlačítkem níže."
+        )
+        try:
+            await channel.send(content=room_msg, view=TesterRoomView())
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        reply = f"✅ Tester roomka vytvořena: <#{channel.id}>"
+        reply += (
+            f" – <@{hrac.id}> má přístup." if player_named
+            else " – přístup získá hráč po pullnutí."
+        )
+        await interaction.response.send_message(reply, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

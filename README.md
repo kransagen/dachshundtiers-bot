@@ -20,6 +20,7 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 | `/queue list` | Přehled všech front a aktivních testerů. |
 | `/queue pull` | Automaticky vytáhne prvního hráče z fronty. |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
+| `/mktesterroom [hrac] [kategorie]` | Vytvoří soukromou tester roomku (text kanál) pro pullnutí hráče; zavírá se tlačítkem v roomce. |
 
 Tlačítka na panelu: **Join Queue** (otevře modál pro Minecraft IGN; potvrzení
 vidí jen přihlášený hráč), **Leave Queue**, **Pull Player ⚔️** (výběr roomky,
@@ -152,6 +153,7 @@ v `.env` (viz `.env.example`):
 | `RESULT_CHANNEL_LOWER` | Výsledkový kanál pro LT3 a níž (`/result`). |
 | `RESULT_CHANNEL_UPPER` | Výsledkový kanál pro HT3 a výš (`/result`). |
 | `QUEUE_CHANNELS_JSON` | Mapa „kit → určený kanál panelu fronty“, např. `{"randompot":"..."}`. |
+| `TESTER_ROOM_CATEGORY_ID` | Kategorie pro tester roomky (`/mktesterroom`); `0` = bez kategorie. |
 | `TOURNAMENT_RESULT_CHANNEL_ID` | Kanál pro `/turnajresult`. |
 | `GUILD_ID` | Registrace příkazů jen na tomto serveru (rychlejší vývoj). |
 | `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |

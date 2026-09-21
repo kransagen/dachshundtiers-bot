@@ -18,7 +18,7 @@ import requests
 from discord import app_commands
 from discord.ext import commands
 
-from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN
+from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, get_result_channel_id
 from panel import update_panel
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, has_tester_role, month_key, now_ms, today_cz
@@ -259,11 +259,43 @@ class Results(commands.Cog):
             .set_footer(text=current_date)
         )
 
-        await interaction.response.send_message(
-            f"📢 **Nový výsledek pro {kit_clean}!**", embed=embed
+        # 7) Odeslání výsledku do určeného kanálu podle tieru (jako v originále)
+        result_channel_id = get_result_channel_id(tier_up)
+        result_channel = self.bot.get_channel(result_channel_id)
+        if result_channel is None and interaction.guild is not None:
+            try:
+                result_channel = await interaction.guild.fetch_channel(result_channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                result_channel = None
+
+        content = (
+            f"📢 **Nový výsledek pro {kit_clean}!** | "
+            f"Hráč: <@{target_id}> | Tester: <@{interaction.user.id}>"
+        )
+        saved_msg = (
+            f"✅ Výsledek uložen na GitHubu pro hráče **{ign_clean}** — "
+            f"mód **{kit_clean}**, tier **{tier_up}**."
         )
 
-        # 7) Volitelný GitHub sync
+        if result_channel is not None:
+            try:
+                await result_channel.send(content=content, embed=embed)
+                await interaction.response.send_message(
+                    f"{saved_msg} Odesláno do <#{result_channel_id}>.",
+                    ephemeral=True,
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                await interaction.response.send_message(
+                    saved_msg, embed=embed, ephemeral=True
+                )
+        else:
+            await interaction.response.send_message(
+                f"{saved_msg} (Výsledkový kanál <#{result_channel_id}> nebyl nalezen.)",
+                embed=embed,
+                ephemeral=True,
+            )
+
+        # 8) Volitelný GitHub sync
         if GITHUB_TOKEN:
             asyncio.create_task(
                 _sync_players_github_async(interaction, ign_clean, kit_clean, tier_up, current_date)

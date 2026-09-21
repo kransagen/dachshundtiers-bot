@@ -57,6 +57,16 @@ HT3_COOLDOWN_MS: int = 7 * 24 * 60 * 60 * 1000     # 7 dní mezi HT3+ tickety na
 HT3_PANEL_CHANNEL_ID: int = _int_env("HT3_PANEL_CHANNEL_ID", 1511738760377925833)
 TOURNAMENT_RESULT_CHANNEL_ID: int = _int_env("TOURNAMENT_RESULT_CHANNEL_ID", 1505130493283405884)
 
+# --- Výsledkové kanály rozdělené podle tieru (= originál) -------------------
+RESULT_CHANNEL_LOWER: int = _int_env("RESULT_CHANNEL_LOWER", 1505130409632206888)
+RESULT_CHANNEL_UPPER: int = _int_env("RESULT_CHANNEL_UPPER", 1505130493283405884)
+TIERS_UPPER = {"HT3", "LT2", "HT2", "LT1", "HT1"}
+
+
+def get_result_channel_id(tier: str) -> int:
+    """Vrátí ID výsledkového kanálu podle tieru (HT3+ → UPPER, jinak LOWER)."""
+    return RESULT_CHANNEL_UPPER if tier.strip().upper() in TIERS_UPPER else RESULT_CHANNEL_LOWER
+
 # --- HT3+ ticket kategorie -------------------------------------------------
 # Výchozí kategorie pro všechny HT3+ tickety.
 HT3_TICKET_CATEGORY_ID: int = _int_env("HT3_TICKET_CATEGORY_ID", 1521515658448470066)

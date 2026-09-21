@@ -21,7 +21,7 @@ from discord.ext import commands
 from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, get_result_channel_id
 from panel import update_panel
 from storage import load_data, save_data
-from utils import DEFAULT_KITS, get_kits, has_tester_role, month_key, now_ms, today_cz
+from utils import DEFAULT_KITS, add_kit, get_kits, has_tester_role, month_key, now_ms, today_cz
 
 
 async def kit_autocomplete(
@@ -164,6 +164,19 @@ class Results(commands.Cog):
         kit_key = kit_clean.lower()
         tier_up = tier.strip().upper()
 
+        # 0) Auto-registrace nového kitu (jako /addkit) – aby se hned objevil
+        #    v autocomplete /result, HT3+ panelu a u turnajů.
+        new_kit_added = False
+        if not any(existing.lower() == kit_key for existing in get_kits()):
+            new_kit_added = add_kit(kit_clean)
+            if new_kit_added:
+                try:
+                    from cogs.kits import _refresh_ht3_panel
+
+                    await _refresh_ht3_panel(self.bot)
+                except Exception:  # noqa: BLE001
+                    pass
+
         # 1) Cooldown hráče (4 dny)
         cooldowns = load_data("cooldowns.json", {})
         cooldowns[target_id] = now_ms()
@@ -276,6 +289,11 @@ class Results(commands.Cog):
             f"✅ Výsledek uložen na GitHubu pro hráče **{ign_clean}** — "
             f"mód **{kit_clean}**, tier **{tier_up}**."
         )
+        if new_kit_added:
+            saved_msg += (
+                f"\n🎉 Nový kit **{kit_clean}** byl automaticky zaregistrován "
+                "do data/kits.json (autocomplete, HT3+ panel, turnaje)."
+            )
 
         if result_channel is not None:
             try:

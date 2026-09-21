@@ -18,10 +18,20 @@ from discord.ext import commands
 
 from config import TOURNAMENT_RESULT_CHANNEL_ID
 from storage import load_data, save_data
+from utils import DEFAULT_KITS, get_kits
 from views import TournamentSignupView
 
-TOURNAMENT_KITS = ["AnchorPvP", "NetheriteSword", "IronAxe", "GoldSMP", "UHCMace", "RandomPot"]
 TOURNAMENT_TIERS = ["LT3", "HT3", "LT2", "HT2", "LT1", "HT1"]
+
+
+async def kit_autocomplete(
+    interaction: discord.Interaction, current: str
+):
+    """Autocomplete názvů kitů pro turnajové příkazy (z data/kits.json)."""
+    kits = get_kits() or list(DEFAULT_KITS)
+    if current:
+        kits = [k for k in kits if current.lower() in k.lower()]
+    return [app_commands.Choice(name=k, value=k) for k in kits[:25]]
 
 
 async def end_tournament_signup(guild: discord.Guild, kit_key: str) -> None:
@@ -158,9 +168,9 @@ class Tournaments(commands.Cog):
         tier="Vyber cílový tier",
     )
     @app_commands.choices(
-        kit=[app_commands.Choice(name=k, value=k) for k in TOURNAMENT_KITS],
-        tier=[app_commands.Choice(name=t, value=t) for t in TOURNAMENT_TIERS],
+        tier=[app_commands.Choice(name=t, value=t) for t in TOURNAMENT_TIERS]
     )
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def createturnaj(
         self,
         interaction: discord.Interaction,
@@ -172,6 +182,12 @@ class Tournaments(commands.Cog):
     ) -> None:
         kit_key = kit.lower()
         tournaments = load_data("tournaments.json", {})
+
+        if not get_kits():
+            return await interaction.response.send_message(
+                "❌ Žádné kity nejsou registrované. Přidej je přes `/addkit`.",
+                ephemeral=True,
+            )
 
         if kit_key in tournaments:
             return await interaction.response.send_message(
@@ -256,6 +272,7 @@ class Tournaments(commands.Cog):
         z_tieru="Současný tier hráče",
         na_tier="Nový tier hráče",
     )
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def turnajresult(
         self,
         interaction: discord.Interaction,

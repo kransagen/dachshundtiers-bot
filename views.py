@@ -12,9 +12,7 @@ import discord
 from config import HT3_COOLDOWN_MS, HT3_TICKET_CATEGORY_ID, PLAYER_COOLDOWN_MS
 from panel import update_panel
 from storage import load_data, save_data
-from utils import has_tester_role
-
-QUEUE_KITS = ["NetheriteSword", "GoldSMP", "RandomPot", "IronAxe", "UHCMace", "AnchorPvP"]
+from utils import DEFAULT_KITS, get_kits, has_tester_role
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +232,13 @@ class QueueView(discord.ui.View):
 class HT3PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+        kits = get_kits() or list(DEFAULT_KITS)
         select = discord.ui.Select(
             custom_id="ht3_select_kit",
             placeholder="Vyber kit pro HT3+ ticket...",
             min_values=1,
             max_values=1,
-            options=[discord.SelectOption(label=kit, value=kit) for kit in QUEUE_KITS],
+            options=[discord.SelectOption(label=kit, value=kit) for kit in kits],
         )
         select.callback = self.on_select
         self.add_item(select)

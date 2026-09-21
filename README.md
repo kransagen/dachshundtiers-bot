@@ -61,6 +61,22 @@ Po uplynutí deadlinu se přihlašování automaticky ukončí, hráči se zamí
 rozdělí do skupin, vytvoří se skupinové roomky (viditelné jen dané skupině)
 a vylosují se 1v1 zápasy.
 
+### 🗂️ Správa kitů
+| Příkaz | Popis |
+|---|---|
+| `/addkit kit` *(admin)* | Přidá nový kit do seznamu (`data/kits.json`). |
+| `/removekit kit` *(admin)* | Odebere kit ze seznamu. |
+| `/kits` | Vypíše všechny registrované kity. |
+
+Přidaný/odebraný kit se hned promítne do:
+- HT3+ panelu („Žádost o TierTest“ – select menu s kity, panel se automaticky
+  aktualizuje, pokud už byl odeslán),
+- autocomplete kitu u `/createturnaj`, `/turnajresult` a `/result`.
+
+> `/openq` a `/queue ...` berou název kitu jako volný text – nový kit se tam dá
+> používat bez jakékoli registrace. Seznam kitů ovlivňuje hlavně HT3+ tickety
+> a turnaje.
+
 ## Struktura projektu
 
 ```
@@ -75,6 +91,7 @@ cogs/
   results.py          # výsledky + statistiky + GitHub sync
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje
+  kits.py             # správa kitů (/addkit, /removekit, /kits)
 data/                 # JSON databáze (vytvoří se za běhu)
 ```
 
@@ -114,4 +131,4 @@ Všechny databáze jsou JSON soubory ve složce `data/` (stejný formát jako
 v originále):
 `queue.json`, `active_queues.json`, `queue_messages.json`, `testers.json`,
 `players.json`, `cooldowns.json`, `testers_stats.json`, `ht3_cooldowns.json`,
-`tournaments.json`, `pulled_players.json`.
+`tournaments.json`, `pulled_players.json`, `kits.json`.

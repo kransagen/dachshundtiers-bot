@@ -58,7 +58,10 @@ class HT3(commands.Cog):
         message = await target_channel.send(embed=embed, view=view)
 
         # Uložení zprávy panelu pro re-registraci persistentní view po restartu
-        save_data(HT3_PANEL_MESSAGE_FILE, {"message_id": str(message.id)})
+        save_data(
+            HT3_PANEL_MESSAGE_FILE,
+            {"message_id": str(message.id), "channel_id": str(target_channel.id)},
+        )
         self.bot.add_view(view, message_id=message.id)
 
         await interaction.response.send_message(

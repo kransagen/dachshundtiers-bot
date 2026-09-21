@@ -47,6 +47,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.ht3",
             "cogs.tournaments",
             "cogs.kits",
+            "cogs.info",
         ]
         for extension in extensions:
             try:
@@ -57,6 +58,12 @@ class DachshundTiersBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("Bot %s (ID: %s) je online!", self.user, self.user.id)
+        try:
+            from cogs.info import git_commit
+
+            log.info("Commit běžícího bota: %s", git_commit())
+        except Exception:  # noqa: BLE001
+            pass
 
         # Registrace slash příkazů (globálně, nebo jen v GUILD_ID).
         # POZOR: pro sync do guildy je nejdřív nutné zkopírovat globální příkazy

@@ -87,6 +87,7 @@ a vylosují se 1v1 zápasy.
 | `/addkit kit` *(admin)* | Přidá nový kit do seznamu (`data/kits.json`). |
 | `/removekit kit` *(admin)* | Odebere kit ze seznamu. |
 | `/kits` | Vypíše všechny registrované kity. |
+| `/verze` | Diagnostika – commit běžícího bota a stav `/result add_role/remove_role`. |
 
 Přidaný/odebraný kit se hned promítne do:
 - HT3+ panelu („Žádost o TierTest“ – select menu s kity, panel se automaticky

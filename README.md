@@ -63,6 +63,7 @@ příchody/odchody).
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit – po `/result` ji hráč dostane automaticky. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
+| `/checkweb` | Projede všechny hráče s tier rolí (z `kit_roles.json` + role typu LT3/HT1…) a zkontroluje, jestli jsou registrovaní na webu (`players.json`). Neregistrované vypíše včetně role. |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
@@ -162,7 +163,7 @@ utils.py              # pomocné funkce
 cogs/
   queues.py           # fronty
   results.py          # výsledky + statistiky + GitHub sync + auto role
-  roles.py            # /setkitrole, /unsetkitrole, /kitrole + auto-grant rolí
+  roles.py            # /setkitrole, /unsetkitrole, /kitrole, /checkweb + auto-grant rolí
   info.py             # /verze (diagnostika běžící verze)
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje

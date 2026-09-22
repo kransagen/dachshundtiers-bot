@@ -18,6 +18,7 @@ tier role stejného kitu.
 """
 
 import logging
+import re
 
 import discord
 from discord import app_commands
@@ -29,6 +30,10 @@ from utils import has_tester_role, kit_autocomplete
 log = logging.getLogger("dachshundtiers")
 
 KIT_ROLES_FILE = "kit_roles.json"
+
+# Role, které vypadají jako tier role (i kdyby nebyly v kit_roles.json):
+# LT3, HT1, RLT5, RHT2, „UHCMace HT3", „HT3 (UHCMace)" …
+_TIER_ROLE_RE = re.compile(r"(?i)(?:^|\W)(?:R?LT|R?HT)[1-5](?:\W|$)")
 
 
 async def auto_grant_kit_role(
@@ -213,6 +218,110 @@ class Roles(commands.Cog):
             color=0xF59E0B,
         )
         await interaction.response.send_message(embed=embed)
+
+    # ------------------------------------------------------------------
+    # /checkweb – projede hráče s tier rolemi a zkontroluje registraci na webu
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="checkweb",
+        description="Projede hráče s tier rolemi a zkontroluje, jestli jsou registrovaní na webu",
+    )
+    async def checkweb(self, interaction: discord.Interaction) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro testery.", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+
+        # 1) Tier role = role namapované v kit_roles.json + role se jménem
+        #    jako tier (LT3, HT1, RLT5, „UHCMace HT3" …).
+        roles_map = load_data(KIT_ROLES_FILE, {})
+        mapped_ids = {
+            str(rid)
+            for kit_map in roles_map.values()
+            for rid in (kit_map or {}).values()
+            if rid
+        }
+        tier_roles = [
+            r
+            for r in guild.roles
+            if str(r.id) in mapped_ids or _TIER_ROLE_RE.search(r.name)
+        ]
+
+        # 2) Členové serveru (zkusíme načíst plný seznam, jinak cache)
+        members = list(guild.members)
+        try:
+            fetched = await guild.fetch_members().flatten()
+            if fetched:
+                members = fetched
+        except Exception:  # noqa: BLE001 – bez members intentu fallback na cache
+            pass
+
+        players_with_tier_role = [
+            m
+            for m in members
+            if not m.bot and any(r in m.roles for r in tier_roles)
+        ]
+
+        # 3) Webová data = players.json (posílá se na GitHub / na web)
+        players = load_data("players.json") or []
+        web_names = {str(p.get("username", "")).strip().lower() for p in players}
+
+        missing = []
+        registered = 0
+        for m in players_with_tier_role:
+            candidates = {m.nick, m.display_name, m.name}
+            if any(
+                (c or "").strip().lower() in web_names
+                for c in candidates
+                if c and c.strip()
+            ):
+                registered += 1
+            else:
+                missing.append(m)
+
+        total = len(players_with_tier_role)
+        embed = discord.Embed(
+            title="🔎 Registrace na webu (players.json)",
+            description=(
+                f"Hráčů s tier rolí: **{total}**\n"
+                f"✅ Na webu: **{registered}**\n"
+                f"❌ Chybí na webu: **{len(missing)}**"
+            ),
+            color=0x10B981 if not missing else 0xEF4444,
+        )
+        if missing:
+            lines = []
+            for m in missing[:25]:
+                roles_str = ", ".join(
+                    r.name for r in m.roles if r in tier_roles
+                )
+                lines.append(f"• {m.mention} — `{m.display_name}` ({roles_str})")
+            if len(missing) > 25:
+                lines.append(f"…a dalších {len(missing) - 25}")
+            embed.add_field(
+                name="❌ Neregistrovaní na webu",
+                value="\n".join(lines),
+                inline=False,
+            )
+            embed.set_footer(
+                text="Tip: chybějícího hráče zaregistruješ přes /result. "
+                "Hráč se hledá podle nicku/IGN na serveru."
+            )
+        else:
+            embed.add_field(
+                name="🎉",
+                value="Všichni hráči s tier rolí jsou zaregistrovaní na webu!",
+                inline=False,
+            )
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

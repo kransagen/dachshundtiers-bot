@@ -66,7 +66,9 @@ příchody/odchody).
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
-- odebere hráče z fronty a práva z roomky,
+- odebere hráče z fronty a práva z roomky (i z voice roomky – hráč se
+  přesune do AFK kanálu nebo se odpojí; práva nestačí, voice hráče samy
+  nevyhodí),
 - uloží tier + historii do `players.json` (modes/history),
 - započítá statistiky testerovi (celkem, kity, tiery, měsíční, hodiny),
 - **automaticky zaregistruje nový kit** – když kit v `/result` není v

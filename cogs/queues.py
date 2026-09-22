@@ -7,6 +7,7 @@ Port původních funkcí z DACHSHUNDTIERSQBOT (JS):
 - /removeq
 """
 
+import logging
 import re
 import time
 
@@ -19,6 +20,8 @@ from panel import create_queue_embed, update_panel
 from storage import load_data, save_data
 from utils import has_tester_role, kit_autocomplete
 from views import PullChannelSelectView, QueueView, TesterRoomView
+
+log = logging.getLogger("dachshundtiers")
 
 
 def _move_to_queue_end(queue: list, stored_player, player_id: str):
@@ -600,6 +603,22 @@ class Queues(commands.Cog):
                         pass
             del pulled[player_id]
             save_data("pulled_players.json", pulled)
+
+        # 1b) Voice: skipnutý hráč nesmí zůstat připojený ve voice roomce
+        #     (odebrání práv ho z voice kanálu samo neodpojí).
+        try:
+            vs = hrac.voice
+        except (AttributeError, TypeError):
+            vs = None
+        if vs is not None and vs.channel is not None:
+            try:
+                await hrac.move_to(interaction.guild.afk_channel)
+            except (discord.Forbidden, discord.HTTPException) as err:
+                log.warning(
+                    "Nelze odpojit hráče %s z voice roomky po /skip: %s",
+                    player_id,
+                    err,
+                )
 
         # 2) Fronta: přesuň hráče na konec
         queue = load_data("queue.json")

@@ -291,6 +291,23 @@ class Results(commands.Cog):
                     removed_count,
                 )
 
+            # Voice roomky: odebrání práv z voice kanálu hráče automaticky
+            # NEodpojí – kdo je zrovna připojený, zůstane viset v roomce.
+            # Po výsledku ho proto přesuneme do AFK kanálu (nebo odpojíme).
+            try:
+                vs = member.voice
+            except (AttributeError, TypeError):
+                vs = None
+            if vs is not None and vs.channel is not None:
+                try:
+                    await member.move_to(interaction.guild.afk_channel)
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    log.warning(
+                        "Nelze odpojit hráče %s z voice roomky po /result: %s",
+                        target_id,
+                        err,
+                    )
+
         # 4) Statistiky testera
         month = month_key()
         current_date = today_cz()

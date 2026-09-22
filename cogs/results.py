@@ -43,6 +43,30 @@ RESULT_TIERS = {"LT5", "HT5", "LT4", "HT4", "LT3", "LT3E"}
 # do players.json a navíc status evalu (data/evals.json) – viz set_eval.
 EVAL_TIER = "LT3E"
 
+# Autocomplete tieru pro /result: (zobrazované jméno, přenášená hodnota).
+# „LT3 + eval" se přenáší jako LT3E (= EVAL_TIER), ať zůstane normalizace
+# v /result stejná (tier.strip().upper()).
+TIER_OPTIONS = [
+    ("LT5", "LT5"),
+    ("HT5", "HT5"),
+    ("LT4", "LT4"),
+    ("HT4", "HT4"),
+    ("LT3", "LT3"),
+    ("LT3 + eval", EVAL_TIER),
+]
+
+
+async def tier_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice]:
+    """Autocomplete tierů /result (LT5 .. LT3 + eval), filtruje podle psaní."""
+    text = (current or "").lower()
+    out = []
+    for name, value in TIER_OPTIONS:
+        if not text or text in name.lower() or text in value.lower():
+            out.append(app_commands.Choice(name=name, value=value))
+    return out
+
 
 def _log_tester_stat(stats_db, tester_id: str, kit: str, tier: str, month: str) -> None:
     """Zaloguje statistiky testera (total, kits, tiers, monthly, hourlyLogs)."""
@@ -165,17 +189,9 @@ class Results(commands.Cog):
         outcome=[
             app_commands.Choice(name="Tester Won", value="Won"),
             app_commands.Choice(name="Tester Lost", value="Lost"),
-        ],
-        tier=[
-            app_commands.Choice(name="LT5", value="LT5"),
-            app_commands.Choice(name="HT5", value="HT5"),
-            app_commands.Choice(name="LT4", value="LT4"),
-            app_commands.Choice(name="HT4", value="HT4"),
-            app_commands.Choice(name="LT3", value="LT3"),
-            app_commands.Choice(name="LT3 + eval", value="LT3E"),
-        ],
+        ]
     )
-    @app_commands.autocomplete(kit=kit_autocomplete)
+    @app_commands.autocomplete(kit=kit_autocomplete, tier=tier_autocomplete)
     async def result(
         self,
         interaction: discord.Interaction,

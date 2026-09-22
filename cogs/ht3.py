@@ -15,6 +15,7 @@ from discord.ext import commands
 
 from config import HT3_COOLDOWN_MS, HT3_PANEL_CHANNEL_ID
 from storage import load_data, save_data
+from utils import has_tester_role
 from views import HT3PanelView
 
 HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
@@ -64,6 +65,58 @@ class HT3(commands.Cog):
 
         await interaction.response.send_message(
             "Panel byl úspěšně odeslán!", ephemeral=True
+        )
+
+    # ------------------------------------------------------------------
+    # /add – přidá hráče do aktuálního HT ticketu / tester roomky
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="add",
+        description="Přidá hráče do aktuálního HT ticketu (přístup + sledování)",
+    )
+    @app_commands.describe(hrac="Hráč, kterého přidat do ticketu")
+    async def add(self, interaction: discord.Interaction, hrac: discord.Member) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            return await interaction.response.send_message(
+                "❌ /add funguje jen v textovém kanálu (ticketu).", ephemeral=True
+            )
+
+        try:
+            await channel.set_permissions(hrac, view_channel=True, send_messages=True)
+        except (discord.Forbidden, discord.HTTPException):
+            return await interaction.response.send_message(
+                "❌ Bot nemůže měnit práva kanálu – zkontroluj oprávnění "
+                "(Manage Channels).",
+                ephemeral=True,
+            )
+
+        # Záznam, aby /result hráči práva po testu odebral i v tomhle kanálu
+        pulled = load_data("pulled_players.json", {})
+        pulled[str(hrac.id)] = {
+            "channel": str(channel.id),
+            "player": {
+                "id": str(hrac.id),
+                "username": hrac.display_name,
+                "ign": hrac.display_name,
+                "kit": "",
+                "joinedAt": 0,
+            },
+        }
+        save_data("pulled_players.json", pulled)
+
+        await interaction.response.send_message(
+            f"✅ Hráč **{hrac.display_name}** (<@{hrac.id}>) byl přidán do "
+            f"ticketu <#{channel.id}>. Po `/result` mu bude přístup odebrán."
         )
 
     # ------------------------------------------------------------------

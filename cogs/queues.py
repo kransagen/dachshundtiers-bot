@@ -21,6 +21,28 @@ from utils import has_tester_role, kit_autocomplete
 from views import PullChannelSelectView, QueueView, TesterRoomView
 
 
+def _move_to_queue_end(queue: list, stored_player, player_id: str):
+    """Přesune hráče na konec fronty (ostatní jdou před něj).
+
+    Vrací ``(new_queue, kit_key, moved)``. Pokud hráč ve frontě není,
+    použije se uložený záznam z pullnutí (``stored_player``).
+    """
+    kit_key = ""
+    entry_to_move = stored_player if (stored_player and stored_player.get("kit")) else None
+    new_queue = []
+    moved = False
+    for p in queue:
+        if str(p.get("id", "")) == player_id and not moved:
+            entry_to_move = p
+            moved = True
+            continue
+        new_queue.append(p)
+    if entry_to_move and entry_to_move.get("kit"):
+        new_queue.append(entry_to_move)
+        kit_key = str(entry_to_move["kit"]).lower()
+    return new_queue, kit_key, moved
+
+
 class Queues(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -494,9 +516,20 @@ class Queues(commands.Cog):
         room_msg = f"🔒 Tester roomka – vytvořil <@{interaction.user.id}>"
         if player_named:
             room_msg += f"\n👤 Hráč s přístupem: <@{hrac.id}>"
-            # Zaznamenání přednastaveného hráče – /result mu pak práva odebere
+            # Zaznamenání přednastaveného hráče – /result mu pak práva odebere,
+            # /skip si odsud přečte záznam. (kit zatím neznáme – zjistí se
+            # z fronty, když hráče přepulluje pull tlačítko.)
             pulled = load_data("pulled_players.json", {})
-            pulled[str(hrac.id)] = str(channel.id)
+            pulled[str(hrac.id)] = {
+                "channel": str(channel.id),
+                "player": {
+                    "id": str(hrac.id),
+                    "username": hrac.display_name,
+                    "ign": hrac.display_name,
+                    "kit": "",
+                    "joinedAt": 0,
+                },
+            }
             save_data("pulled_players.json", pulled)
         room_msg += (
             "\nHráč získá přístup po pullnutí (tlačítko Pull Player ⚔️) a po"
@@ -513,6 +546,95 @@ class Queues(commands.Cog):
             else " – přístup získá hráč po pullnutí."
         )
         await interaction.response.send_message(reply, ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # /skip – přeskočí AFK hráče vytáhnutého z fronty
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="skip",
+        description="Skipne AFK hráče (pullnutého z fronty) – vrátí ho na konec fronty",
+    )
+    @app_commands.describe(hrac="AFK hráč, kterého přeskočit")
+    async def skip(self, interaction: discord.Interaction, hrac: discord.Member) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+
+        player_id = str(hrac.id)
+        kit_key = ""
+        stored_player = None
+        was_pulled = False
+        access_revoked = False
+
+        # 1) Pullnutý hráč? → odeber mu přístup do roomky
+        pulled = load_data("pulled_players.json", {})
+        entry = pulled.get(player_id)
+        if entry is not None:
+            was_pulled = True
+            channel_id_raw = None
+            if isinstance(entry, dict):
+                channel_id_raw = entry.get("channel")
+                stored_player = entry.get("player")
+                if isinstance(stored_player, dict):
+                    kit_key = str(stored_player.get("kit", "")).lower()
+            else:
+                # starší formát záznamu (string = channel id)
+                channel_id_raw = entry
+            if channel_id_raw:
+                channel = interaction.guild.get_channel(int(channel_id_raw))
+                if channel is None:
+                    try:
+                        channel = await interaction.guild.fetch_channel(int(channel_id_raw))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        channel = None
+                if channel is not None:
+                    try:
+                        await channel.set_permissions(hrac, overwrite=None)
+                        access_revoked = True
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+            del pulled[player_id]
+            save_data("pulled_players.json", pulled)
+
+        # 2) Fronta: přesuň hráče na konec
+        queue = load_data("queue.json")
+        new_queue, kit_key, moved = _move_to_queue_end(queue, stored_player, player_id)
+        requeued = False
+        if len(new_queue) != len(queue):
+            save_data("queue.json", new_queue)
+            if kit_key:
+                await update_panel(interaction.guild, kit_key)
+            requeued = True
+
+        if not requeued and not moved and not was_pulled:
+            return await interaction.response.send_message(
+                f"❌ Hráč **{hrac.display_name}** není pullnutý ani ve frontě.",
+                ephemeral=True,
+            )
+
+        # 3) Kdo bude další na řadě?
+        next_player = next(
+            (p for p in new_queue if str(p.get("kit", "")).lower() == kit_key), None
+        )
+
+        parts = [f"⏭️ **{hrac.display_name}** byl přeskočen (AFK)."]
+        if access_revoked:
+            parts.append("• Přístup do roomky mu byl odebrán.")
+        if requeued:
+            parts.append("• Vrácen na konec fronty – ostatní jdou před ním.")
+        if next_player:
+            nick = next_player.get("ign") or next_player.get("username") or "?"
+            parts.append(
+                f"➡️ Další na řadě: **{nick}** (<@{next_player.get('id')}>)"
+            )
+        else:
+            parts.append("📭 Fronta pro tento kit je prázdná.")
+        await interaction.response.send_message("\n".join(parts), ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

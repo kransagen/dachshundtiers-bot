@@ -38,6 +38,7 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 | `/queue list` | Přehled všech front a aktivních testerů. |
 | `/queue pull` | Vytáhne prvního hráče z fronty a nechá testera vybrat roomku – hráč do ní dostane přístup (jako pull tlačítko). |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
+| `/skip hrac` | Skipne AFK hráče (pullnutého z fronty) – odebere mu přístup do roomky a vrátí ho na konec fronty (jde před něj každý další). |
 | `/mktesterroom [hrac] [kategorie]` | Vytvoří soukromou tester roomku (text kanál) pro pullnutí hráče; zavírá se tlačítkem v roomce. |
 
 Tlačítka na panelu: **Join Queue** (otevře modál pro Minecraft IGN; potvrzení
@@ -86,6 +87,7 @@ příchody/odchody).
 |---|---|
 | `/sendht3` | Pošle panel „Žádost o TierTest“ s výběrem kitu do určeného kanálu. |
 | `/cooldown hrac` | Zobrazí HT3+ cooldowny hráče. |
+| `/add hrac` | Přidá hráče do aktuálního HT ticketu / roomky (přístup do kanálu; po `/result` odebrán). |
 
 Výběr kitu → kontrola 7denního cooldownu → modál (IGN + cílový tier) →
 vytvoření ticket roomky → tlačítko **🔒 Close Ticket** (nastaví cooldown a za 3 s smaže roomku).

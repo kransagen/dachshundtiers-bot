@@ -243,9 +243,19 @@ async def grant_pull_access(
                 err,
             )
 
-    # Záznam vytaženého hráče (kvůli odebrání práv po /result)
+    # Záznam vytaženého hráče (kvůli odebrání práv po /result a kvůli /skip) –
+    # nový formát uloží i info o hráči (kit/ign), aby šel vrátit na konec fronty.
     pulled = load_data("pulled_players.json", {})
-    pulled[player["id"]] = str(channel_id)
+    pulled[str(player["id"])] = {
+        "channel": str(channel_id),
+        "player": {
+            "id": str(player.get("id", "")),
+            "username": player.get("username", ""),
+            "ign": player.get("ign", ""),
+            "kit": str(player.get("kit", "")),
+            "joinedAt": player.get("joinedAt", 0),
+        },
+    }
     save_data("pulled_players.json", pulled)
 
     if isinstance(channel, discord.TextChannel):

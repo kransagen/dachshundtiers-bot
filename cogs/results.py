@@ -30,10 +30,18 @@ from utils import (
     kit_autocomplete,
     month_key,
     now_ms,
+    set_eval,
     today_cz,
 )
 
 log = logging.getLogger("dachshundtiers")
+
+# Povolené tiery v /result (HT3 a výš se řeší přes HT3+ tickety):
+#   LT5, HT5, LT4, HT4, LT3, LT3 + eval
+RESULT_TIERS = {"LT5", "HT5", "LT4", "HT4", "LT3", "LT3E"}
+# Volba „LT3 + eval" (v kódu LT3E): hráč dostane tier LT3 (stejná role)
+# do players.json a navíc status evalu (data/evals.json) – viz set_eval.
+EVAL_TIER = "LT3E"
 
 
 def _log_tester_stat(stats_db, tester_id: str, kit: str, tier: str, month: str) -> None:
@@ -157,7 +165,15 @@ class Results(commands.Cog):
         outcome=[
             app_commands.Choice(name="Tester Won", value="Won"),
             app_commands.Choice(name="Tester Lost", value="Lost"),
-        ]
+        ],
+        tier=[
+            app_commands.Choice(name="LT5", value="LT5"),
+            app_commands.Choice(name="HT5", value="HT5"),
+            app_commands.Choice(name="LT4", value="LT4"),
+            app_commands.Choice(name="HT4", value="HT4"),
+            app_commands.Choice(name="LT3", value="LT3"),
+            app_commands.Choice(name="LT3 + eval", value="LT3E"),
+        ],
     )
     @app_commands.autocomplete(kit=kit_autocomplete)
     async def result(
@@ -184,6 +200,21 @@ class Results(commands.Cog):
         kit_clean = kit.strip()
         kit_key = kit_clean.lower()
         tier_up = tier.strip().upper()
+
+        # 0a) Validace tieru: v /result jdou zadat jen tiery do LT3 + eval
+        #     (HT3 a výš se teď řeší výhradně přes HT3+ tickety).
+        if tier_up not in RESULT_TIERS:
+            return await interaction.followup.send(
+                "❌ Neplatný tier! V `/result` lze zadat pouze: "
+                "**LT5, HT5, LT4, HT4, LT3, LT3 + eval**.",
+                ephemeral=True,
+            )
+
+        # 0b) „LT3 + eval" (LT3E) = tier LT3 (stejná role) + eval status.
+        #     Do players.json / webu / role jde „LT3", eval se uloží zvlášť.
+        is_eval = tier_up == EVAL_TIER
+        stored_tier = "LT3" if is_eval else tier_up  # players.json + web + role
+        display_tier = "LT3 + eval" if is_eval else tier_up  # embed / texty
 
         # 0) Auto-registrace nového kitu (jako /addkit) – aby se hned objevil
         #    v autocomplete /result, HT3+ panelu a u turnajů.
@@ -264,7 +295,7 @@ class Results(commands.Cog):
         month = month_key()
         current_date = today_cz()
         stats_db = load_data("testers_stats.json", {})
-        _log_tester_stat(stats_db, str(interaction.user.id), kit_clean, tier_up, month)
+        _log_tester_stat(stats_db, str(interaction.user.id), kit_clean, display_tier, month)
 
         # 5) players.json
         players = load_data("players.json")
@@ -275,8 +306,8 @@ class Results(commands.Cog):
 
         if db_player is None:
             db_player = {"username": ign_clean, "modes": {}, "history": {}}
-            db_player["modes"][kit_clean] = tier_up
-            db_player["history"][kit_clean] = [{"date": current_date, "tier": tier_up}]
+            db_player["modes"][kit_clean] = stored_tier
+            db_player["history"][kit_clean] = [{"date": current_date, "tier": stored_tier}]
             players.append(db_player)
         else:
             db_player.setdefault("modes", {})
@@ -284,9 +315,18 @@ class Results(commands.Cog):
             db_player["history"].setdefault(kit_clean, [])
             if db_player["modes"].get(kit_clean):
                 previous_tier = db_player["modes"][kit_clean].upper()
-            db_player["modes"][kit_clean] = tier_up
-            db_player["history"][kit_clean].append({"date": current_date, "tier": tier_up})
+            db_player["modes"][kit_clean] = stored_tier
+            db_player["history"][kit_clean].append({"date": current_date, "tier": stored_tier})
         save_data("players.json", players)
+
+        # 5a) „LT3 + eval" → status evalu (data/evals.json). Tier/role zůstávají
+        #     LT3 – hráč ale nově může otevírat HT3+ tickety.
+        eval_note = ""
+        if is_eval and set_eval(ign_clean, kit_clean):
+            eval_note = (
+                f"\n🎖️ **{ign_clean}** dostal **LT3 + eval** pro **{kit_clean}** – "
+                "může otevírat HT3+ tickety."
+            )
 
         # 5b) Volitelné role (add_role / remove_role) – jako v originále
         #     (aplikuje se tiše, nezobrazuje se v embedu výsledku)
@@ -316,7 +356,7 @@ class Results(commands.Cog):
             from cogs.roles import auto_grant_kit_role
 
             role_note = await auto_grant_kit_role(
-                interaction.guild, target_id, kit_key, tier_up
+                interaction.guild, target_id, kit_key, stored_tier
             )
         except Exception:  # noqa: BLE001
             log.exception("Chyba při automatickém udělování role pro %s", target_id)
@@ -339,12 +379,12 @@ class Results(commands.Cog):
                 inline=False,
             )
             .add_field(name="📉 Předchozí tier", value=f"`{previous_tier}`", inline=True)
-            .add_field(name="📈 Nový tier", value=f"**{tier_up}**", inline=True)
+            .add_field(name="📈 Nový tier", value=f"**{display_tier}**", inline=True)
             .set_footer(text=current_date)
         )
 
         # 7) Odeslání výsledku do určeného kanálu podle tieru (jako v originále)
-        result_channel_id = get_result_channel_id(tier_up)
+        result_channel_id = get_result_channel_id(stored_tier)
         result_channel = self.bot.get_channel(result_channel_id)
         if result_channel is None and interaction.guild is not None:
             try:
@@ -358,13 +398,15 @@ class Results(commands.Cog):
         )
         saved_msg = (
             f"✅ Výsledek uložen na GitHubu pro hráče **{ign_clean}** — "
-            f"mód **{kit_clean}**, tier **{tier_up}**."
+            f"mód **{kit_clean}**, tier **{display_tier}**."
         )
         if new_kit_added:
             saved_msg += (
                 f"\n🎉 Nový kit **{kit_clean}** byl automaticky zaregistrován "
                 "do data/kits.json (autocomplete, HT3+ panel, turnaje)."
             )
+        if eval_note:
+            saved_msg += eval_note
         if role_note:
             saved_msg += role_note
 
@@ -390,7 +432,7 @@ class Results(commands.Cog):
         # 8) Volitelný GitHub sync
         if GITHUB_TOKEN:
             asyncio.create_task(
-                _sync_players_github_async(interaction, ign_clean, kit_clean, tier_up, current_date)
+                _sync_players_github_async(interaction, ign_clean, kit_clean, stored_tier, current_date)
             )
 
     # ------------------------------------------------------------------

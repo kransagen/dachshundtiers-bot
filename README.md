@@ -54,7 +54,7 @@ příchody/odchody).
 ### 📝 Výsledky tier testů
 | Příkaz | Popis |
 |---|---|
-| `/result hrac ign kit tier score outcome [add_role] [remove_role]` | Zápis výsledku testu (nový kit se automaticky zaregistruje; automaticky rozdá roli tieru dle `/setkitrole`; volitelně i ruční role). |
+| `/result hrac ign kit tier score outcome [add_role] [remove_role]` | Zápis výsledku testu. Tier jde zadat jen **LT5 / HT5 / LT4 / HT4 / LT3 / LT3 + eval**. Volba **LT3 + eval** uloží tier LT3 (stejná role) a přidá hráči **eval status** (data/evals.json) – pak může otevírat HT3+ tickety. Nový kit se automaticky zaregistruje; automaticky rozdá roli tieru dle `/setkitrole`; volitelně i ruční role. |
 | `/testerstats tester` | Portfolio testera (celkem testů, oblíbený kit, tier, průměrný čas). |
 | `/testersstats current\|all` | Žebříček testerů (tento měsíc / všechny časy). |
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |

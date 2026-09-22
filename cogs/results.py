@@ -22,19 +22,18 @@ from discord.ext import commands
 from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, get_result_channel_id
 from panel import update_panel
 from storage import load_data, save_data
-from utils import DEFAULT_KITS, add_kit, get_kits, has_tester_role, month_key, now_ms, today_cz
+from utils import (
+    DEFAULT_KITS,
+    add_kit,
+    get_kits,
+    has_tester_role,
+    kit_autocomplete,
+    month_key,
+    now_ms,
+    today_cz,
+)
 
 log = logging.getLogger("dachshundtiers")
-
-
-async def kit_autocomplete(
-    interaction: discord.Interaction, current: str
-):
-    """Autocomplete názvů kitů pro /result (z data/kits.json)."""
-    kits = get_kits() or list(DEFAULT_KITS)
-    if current:
-        kits = [k for k in kits if current.lower() in k.lower()]
-    return [app_commands.Choice(name=k, value=k) for k in kits[:25]]
 
 
 def _log_tester_stat(stats_db, tester_id: str, kit: str, tier: str, month: str) -> None:

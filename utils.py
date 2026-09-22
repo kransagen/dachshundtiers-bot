@@ -3,6 +3,9 @@
 import os
 from datetime import datetime
 
+import discord
+from discord import app_commands
+
 from config import TESTER_ROLE_FRAGMENT
 from storage import data_path, load_data, save_data
 
@@ -24,6 +27,16 @@ def get_kits():
         return list(DEFAULT_KITS)
     raw = load_data("kits.json", [])
     return [k for k in raw if isinstance(k, str) and k.strip()] or []
+
+
+async def kit_autocomplete(
+    interaction: discord.Interaction, current: str
+):
+    """Autocomplete názvů kitů pro všechny commandy s parametrem `kit`."""
+    kits = get_kits() or list(DEFAULT_KITS)
+    if current:
+        kits = [k for k in kits if current.lower() in k.lower()]
+    return [app_commands.Choice(name=k, value=k) for k in kits[:25]]
 
 
 def add_kit(kit: str) -> bool:

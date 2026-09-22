@@ -24,7 +24,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from storage import load_data, save_data
-from utils import has_tester_role
+from utils import has_tester_role, kit_autocomplete
 
 log = logging.getLogger("dachshundtiers")
 
@@ -112,6 +112,7 @@ class Roles(commands.Cog):
         tier="Tier (např. S, A, B)",
         role="Role, kterou hráč dostane za tento tier",
     )
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def setkitrole(
         self,
         interaction: discord.Interaction,
@@ -149,6 +150,7 @@ class Roles(commands.Cog):
         kit="Název kitu (např. MolePVP)",
         tier="Tier (např. S, A, B)",
     )
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def unsetkitrole(
         self,
         interaction: discord.Interaction,

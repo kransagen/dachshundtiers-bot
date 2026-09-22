@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from config import set_queue_channel_id
 from storage import load_data
-from utils import add_kit, get_kits, has_tester_role, remove_kit
+from utils import add_kit, get_kits, has_tester_role, kit_autocomplete, remove_kit
 from views import HT3PanelView
 
 HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
@@ -47,6 +47,7 @@ class Kits(commands.Cog):
     @app_commands.command(name="addkit", description="Přidá nový kit do seznamu (HT3+ panel, turnaje)")
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(kit="Název nového kitu (např. UHCMace)")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def addkit(self, interaction: discord.Interaction, kit: str) -> None:
         kit = kit.strip()
         if not kit:
@@ -73,6 +74,7 @@ class Kits(commands.Cog):
     @app_commands.command(name="removekit", description="Odebere kit ze seznamu (HT3+ panel, turnaje)")
     @app_commands.default_permissions(administrator=True)
     @app_commands.describe(kit="Název kitu k odebrání")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def removekit(self, interaction: discord.Interaction, kit: str) -> None:
         kit = kit.strip()
         if not remove_kit(kit):
@@ -99,6 +101,7 @@ class Kits(commands.Cog):
         kit="Název kitu (např. UHCMace)",
         kanal="Kanál pro panel fronty (volitelné; default: tento kanál)",
     )
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def addqchannel(
         self,
         interaction: discord.Interaction,

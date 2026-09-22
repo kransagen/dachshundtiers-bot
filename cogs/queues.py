@@ -17,7 +17,7 @@ from discord.ext import commands
 from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID, get_queue_channel_id
 from panel import create_queue_embed, update_panel
 from storage import load_data, save_data
-from utils import has_tester_role
+from utils import has_tester_role, kit_autocomplete
 from views import PullChannelSelectView, QueueView, TesterRoomView
 
 
@@ -30,6 +30,7 @@ class Queues(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(name="openq", description="Open a specific kit queue")
     @app_commands.describe(kit="Name of the kit/queue")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def openq(self, interaction: discord.Interaction, kit: str) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message(
@@ -109,6 +110,7 @@ class Queues(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(name="closeq", description="Close a specific kit queue")
     @app_commands.describe(kit="Name of the kit/queue")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def closeq(self, interaction: discord.Interaction, kit: str) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message(
@@ -202,6 +204,7 @@ class Queues(commands.Cog):
 
     @queue.command(name="join", description="Join the queue for a test")
     @app_commands.describe(ign="Your Minecraft IGN", kit="Kit you want to test")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def queue_join(self, interaction: discord.Interaction, ign: str, kit: str) -> None:
         kit_key = kit.lower()
         active_queues = load_data("active_queues.json", {})
@@ -296,6 +299,7 @@ class Queues(commands.Cog):
 
     @queue.command(name="joinasqueue", description="Join an already opened queue as an additional tester")
     @app_commands.describe(kit="Name of the active kit")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def queue_joinasqueue(self, interaction: discord.Interaction, kit: str) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
@@ -324,6 +328,7 @@ class Queues(commands.Cog):
 
     @queue.command(name="leaveq", description="Leave an active queue you are currently testing in")
     @app_commands.describe(kit="Name of the kit")
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def queue_leaveq(self, interaction: discord.Interaction, kit: str) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)

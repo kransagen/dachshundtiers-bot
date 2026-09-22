@@ -63,7 +63,7 @@ příchody/odchody).
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit – po `/result` ji hráč dostane automaticky. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
-| `/checkweb` | Projede všechny hráče s tier rolí (z `kit_roles.json` + role typu LT3/HT1…) a zkontroluje, jestli jsou registrovaní na webu (`players.json`). Neregistrované vypíše včetně role. |
+| `/checkweb` *(všichni)* | Projede všechny hráče s tier rolí (z `kit_roles.json` + role typu LT3/HT1…) a zkontroluje, jestli jsou registrovaní na webu (`players.json`). Neregistrované vypíše včetně role. Příkaz může použít kdokoli. |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),

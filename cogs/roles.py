@@ -227,10 +227,6 @@ class Roles(commands.Cog):
         description="Projede hráče s tier rolemi a zkontroluje, jestli jsou registrovaní na webu",
     )
     async def checkweb(self, interaction: discord.Interaction) -> None:
-        if not has_tester_role(interaction.user):
-            return await interaction.response.send_message(
-                "❌ Pouze pro testery.", ephemeral=True
-            )
         if interaction.guild is None:
             return await interaction.response.send_message(
                 "❌ Pouze na serveru.", ephemeral=True

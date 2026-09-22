@@ -88,17 +88,24 @@ příchody/odchody).
 | `/sendht3` | Pošle panel „Žádost o TierTest“ s výběrem kitu do určeného kanálu. |
 | `/cooldown hrac` | Zobrazí HT3+ cooldowny hráče. |
 | `/add hrac` | Přidá hráče do aktuálního HT ticketu / roomky (přístup do kanálu; po `/result` odebrán). |
+| `/seteval ign kit` *(tester)* | Nastaví hráči status „LT3 + eval“ pro kit – může otevírat HT3+ tickety (role zůstává LT3). |
+| `/uneval ign kit` *(tester)* | Odebere hráči „LT3 + eval“ pro kit – HT3+ tickety otevírat nemůže. |
 
 Výběr kitu → kontrola 7denního cooldownu → modál (IGN + cílový tier) →
 vytvoření ticket roomky → tlačítko **🔒 Close Ticket** (nastaví cooldown a za 3 s smaže roomku).
 
 **Automatická kontrola limitu tieru:** při odeslání modálu bot najde hráče podle IGN
 v `players.json`, vezme jeho aktuální tier pro daný kit a spočítá „další tier“
-(následník v žebříčku **LT5 < HT5 < LT4 < HT4 < LT3 < HT3 < LT2 < HT2 < LT1 < HT1**).
+(následník v žebříčku **LT5 < HT5 < LT4 < HT4 < LT3 < LT3+eval < HT3 < LT2 < HT2 < LT1 < HT1**).
 Ticket na lepší tier, než je hráčův limit, je **zablokovaný** s vysvětlením
-(např. hráč na LT3 může jít max. na HT3 – ticket na HT1 se nevytvoří).
-Retest na aktuálním tieru projde. Když hráč nemá zaznamenaný tier, ticket projde
-bez kontroly (s poznámkou). Aktuální tier z databáze je vidět i v embedu ticketu.
+(např. hráč s evalu („LT3+eval“) může jít max. na HT3 – ticket na HT1 se nevytvoří).
+Retest na aktuálním tieru projde. Aktuální tier z databáze je vidět i v embedu ticketu.
+
+**Brána „Bez evalu“:** HT3+ ticket otevřou jen hráči, kteří mají pro daný kit status
+**LT3 + eval** (přes `/seteval`, uložený v `data/evals.json`) nebo jsou už tierem
+**HT3 a výš**. Hráčům bez evalu (včetně čistě LT3) se ticket rovnou zablokuje
+s vysvětlením – i když nemají v databázi žádný tier. Eval = status „mezi LT3 a HT3“:
+role zůstává stejná jako LT3, ale hráč smí otevírat HT3+ tickety.
 
 Kategorie ticket roomky je **nastavitelná pro každý kit** (`HT3_TICKET_CATEGORIES_JSON`),
 např. `{"randompot":"...","ironaxe":"..."}`. Priorita: kit → tier

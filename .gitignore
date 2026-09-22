@@ -17,4 +17,5 @@ venv/
 # a nepatří do gitu, jsou níže.
 data/ht3_panel_message.json
 data/kit_roles.json
+data/evals.json
 data/.gitkeep

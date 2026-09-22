@@ -86,3 +86,54 @@ def month_key() -> str:
 def now_ms() -> int:
     """Aktuální čas v milisekundách (jako Date.now() v JS)."""
     return int(datetime.now().timestamp() * 1000)
+
+
+# --- „LT3 + eval" ---------------------------------------------------------
+# Status mezi LT3 a HT3: hráč má pořád roli LT3, ale může otevírat HT3+
+# tickety. Uchovává se v ``data/evals.json`` (host-local, NIKDY necommitovat):
+#
+#     {"uhcmace": {"hrac_ign": 1769550000000, ...}, ...}
+#
+EVALS_FILE = "evals.json"
+
+
+def _eval_ign(ign: str) -> str:
+    return (ign or "").strip().lower()
+
+
+def get_evals() -> dict:
+    raw = load_data(EVALS_FILE, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def has_eval(ign: str, kit: str) -> bool:
+    """Má hráč (IGN) „LT3 + eval" pro daný kit?"""
+    kit_key = (kit or "").strip().lower()
+    bucket = get_evals().get(kit_key, {})
+    return isinstance(bucket, dict) and _eval_ign(ign) in bucket
+
+
+def set_eval(ign: str, kit: str) -> bool:
+    """Nastaví hráči eval pro kit. Vrátí False při neplatném vstupu."""
+    kit_key = (kit or "").strip().lower()
+    key = _eval_ign(ign)
+    if not key or not kit_key:
+        return False
+    evals = get_evals()
+    evals.setdefault(kit_key, {})[key] = now_ms()
+    save_data(EVALS_FILE, evals)
+    return True
+
+
+def unset_eval(ign: str, kit: str) -> bool:
+    """Odebere hráči eval pro kit. Vrátí False, pokud ho neměl."""
+    kit_key = (kit or "").strip().lower()
+    evals = get_evals()
+    bucket = evals.get(kit_key, {})
+    if not isinstance(bucket, dict) or _eval_ign(ign) not in bucket:
+        return False
+    del bucket[_eval_ign(ign)]
+    if not bucket:
+        del evals[kit_key]
+    save_data(EVALS_FILE, evals)
+    return True

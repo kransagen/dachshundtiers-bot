@@ -13,7 +13,7 @@ import discord
 from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, TIERS_UPPER, get_ht3_ticket_category
 from panel import update_panel
 from storage import load_data, save_data
-from utils import DEFAULT_KITS, get_kits, has_tester_role
+from utils import DEFAULT_KITS, get_kits, has_eval, has_tester_role
 
 log = logging.getLogger("dachshundtiers")
 
@@ -324,10 +324,13 @@ class PullChannelSelectView(discord.ui.View):
 # HT3+ tickety: kontrola tieru (limit hráče) + select menu + modál + Close
 # ---------------------------------------------------------------------------
 # HT3+ ticket žebříček (nejhorší → nejlepší, potvrzeno provozovatelem):
-#   LT5 < HT5 < LT4 < HT4 < LT3 < HT3 < LT2 < HT2 < LT1 < HT1
+#   LT5 < HT5 < LT4 < HT4 < LT3 < LT3+eval < HT3 < LT2 < HT2 < LT1 < HT1
 # (LT5 je nejmenší, HT1 je největší.)
+# „LT3+eval" (v kódu LT3E) je status mezi LT3 a HT3: hráč má pořád roli LT3,
+# ale s evalem může otevírat HT3+ tickety. Evaly se drží v data/evals.json
+# (viz utils.has_eval / set_eval / unset_eval).
 HT3_TIER_LADDER = [
-    "LT5", "HT5", "LT4", "HT4", "LT3", "HT3", "LT2", "HT2", "LT1", "HT1",
+    "LT5", "HT5", "LT4", "HT4", "LT3", "LT3E", "HT3", "LT2", "HT2", "LT1", "HT1",
 ]
 
 
@@ -344,6 +347,29 @@ def _next_ticket_tier(current: str) -> str | None:
     if idx == len(HT3_TIER_LADDER) - 1:
         return t  # HT1 = vrchol žebříčku
     return HT3_TIER_LADDER[idx + 1]
+
+
+def _tier_allows_tickets(tier: str) -> bool:
+    """Může hráč otevírat HT3+ tickety podle svého tieru? (LT3+eval a výš)"""
+    t = (tier or "").strip().upper()
+    if t not in HT3_TIER_LADDER:
+        return False
+    return HT3_TIER_LADDER.index(t) >= HT3_TIER_LADDER.index("LT3E")
+
+
+def _effective_ticket_tier(current_tier: str | None, eval_ok: bool) -> str | None:
+    """Tier, ze kterého se počítá limit ticketu.
+
+    Hráč se záznamem „LT3+eval" (eval_ok) se chová jako když má tier LT3E –
+    i když má zapsaný jen LT3 nebo žádný – aby mohl ticket zacílit na HT3.
+    """
+    if not eval_ok:
+        return current_tier
+    cur = (current_tier or "").strip().upper()
+    eval_idx = HT3_TIER_LADDER.index("LT3E")
+    if cur not in HT3_TIER_LADDER:
+        return "LT3E"
+    return cur if HT3_TIER_LADDER.index(cur) >= eval_idx else "LT3E"
 
 
 def _find_player_tier(ign: str, kit: str) -> str | None:
@@ -431,8 +457,21 @@ class HT3Modal(discord.ui.Modal):
         # Kontrola limitu: ticket nesmí být na lepší tier, než hráč může.
         # Hráč je hledaný podle IGN v players.json (stejná data, co posílá /result).
         current_tier = _find_player_tier(ign, kit)
-        limit_tier = _next_ticket_tier(current_tier) if current_tier else None
-        if current_tier and limit_tier and target_tier in HT3_TIER_LADDER:
+        eval_ok = has_eval(ign, kit)
+
+        # Brána: HT3+ ticket otevřou jen hráči s „LT3+eval" (nebo HT3 a výš).
+        if not eval_ok and not _tier_allows_tickets(current_tier):
+            return await interaction.followup.send(
+                "❌ **Bez evalu nelze otevřít HT3+ ticket!**\n"
+                "Eval dostaneš, když **porazíš LT3 testera** (nebo když tvůj "
+                "tester usoudí, že máš HT3 skill). Je to status mezi LT3 a HT3 "
+                "– roli máš pořád LT3, ale můžeš otevírat HT3+ tickety.",
+                ephemeral=True,
+            )
+
+        effective_tier = _effective_ticket_tier(current_tier, eval_ok)
+        limit_tier = _next_ticket_tier(effective_tier) if effective_tier else None
+        if effective_tier and limit_tier and target_tier in HT3_TIER_LADDER:
             limit_idx = HT3_TIER_LADDER.index(limit_tier)
             typed_idx = HT3_TIER_LADDER.index(target_tier)
             if typed_idx > limit_idx:
@@ -482,6 +521,7 @@ class HT3Modal(discord.ui.Modal):
                 value=current_tier or "—",
                 inline=False,
             )
+            .add_field(name="Eval", value="✅ Ano" if eval_ok else "❌ Ne", inline=False)
         )
 
         close_btn = discord.ui.Button(

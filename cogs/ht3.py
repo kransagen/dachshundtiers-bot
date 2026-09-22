@@ -15,7 +15,7 @@ from discord.ext import commands
 
 from config import HT3_COOLDOWN_MS, HT3_PANEL_CHANNEL_ID
 from storage import load_data, save_data
-from utils import has_tester_role
+from utils import has_tester_role, kit_autocomplete, set_eval, unset_eval
 from views import HT3PanelView
 
 HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
@@ -48,6 +48,8 @@ class HT3(commands.Cog):
                 "• Po failed tiertestu se dá znova retestovat za 7 dní.\n"
                 "• Eval dostanete, když porazíte LT3 testera nebo váš tester "
                 "usoudí, že máte HT3 skill.\n"
+                "• LT3 + eval = status mezi LT3 a HT3 – stejná role, ale "
+                "můžete otevírat HT3+ tickety.\n"
                 "• Bez evalu není možné otevřít HT3+ ticket!"
             ),
             color=0x00FF00,
@@ -118,6 +120,54 @@ class HT3(commands.Cog):
             f"✅ Hráč **{hrac.display_name}** (<@{hrac.id}>) byl přidán do "
             f"ticketu <#{channel.id}>. Po `/result` mu bude přístup odebrán."
         )
+
+    # ------------------------------------------------------------------
+    # /seteval / /uneval – status „LT3 + eval" hráči
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="seteval",
+        description="Nastaví hráči „LT3 + eval“ pro kit (může otevírat HT3+ tickety)",
+    )
+    @app_commands.describe(ign="Minecraft IGN hráče", kit="Kit")
+    @app_commands.autocomplete(kit=kit_autocomplete)
+    async def seteval(self, interaction: discord.Interaction, ign: str, kit: str) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+
+        if set_eval(ign, kit):
+            await interaction.response.send_message(
+                f"✅ **{ign.strip()}** dostal „LT3 + eval“ pro kit **{kit.strip()}** – "
+                f"může otevírat HT3+ tickety (role zůstává LT3)."
+            )
+        else:
+            await interaction.response.send_message(
+                f"❌ Neplatný IGN nebo kit (`{ign}` / `{kit}`).", ephemeral=True
+            )
+
+    @app_commands.command(
+        name="uneval",
+        description="Odebere hráči „LT3 + eval“ pro kit (nemůže otevírat HT3+ tickety)",
+    )
+    @app_commands.describe(ign="Minecraft IGN hráče", kit="Kit")
+    @app_commands.autocomplete(kit=kit_autocomplete)
+    async def uneval(self, interaction: discord.Interaction, ign: str, kit: str) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+
+        if unset_eval(ign, kit):
+            await interaction.response.send_message(
+                f"⛔ **{ign.strip()}** přišel o „LT3 + eval“ pro kit **{kit.strip()}** – "
+                f"HT3+ tickety už otevírat nemůže."
+            )
+        else:
+            await interaction.response.send_message(
+                f"ℹ️ **{ign.strip()}** nemá eval pro kit **{kit.strip()}** – nic se neměnilo.",
+                ephemeral=True,
+            )
 
     # ------------------------------------------------------------------
     # /cooldown

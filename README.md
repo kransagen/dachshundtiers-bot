@@ -35,6 +35,15 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   rozdíly, `/playersync apply` vyžaduje explicitní potvrzení tlačítkem.
   Každé použití se zapisuje do `data/playersync_log.json` (audit).
 
+- **`/websync` – synchronizace webu s kanonickou `players.json`** – web
+  (players.json na GitHubu) je jen kopie, jediný zdroj pravdy zůstává lokální
+  kanonická DB. `/websync preview` stáhne web a detekuje chybějící hráče,
+  špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy.
+  `/websync apply` po **explicitním potvrzení** (tlačítko) nahradí players.json
+  na webu kanonickou DB; čtení i zápis se opakují s retry. Každý běh se
+  zapisuje do `data/websync_log.json` (timestamp, počet záznamů,
+  úspěch/selhání a chyby).
+
 ## Funkce
 
 ### 🎯 Fronty na tier testy
@@ -78,6 +87,8 @@ příchody/odchody).
 | `/checkweb` *(tester)* | Projede hráče u **každého kitu** (podle tier rolí z `kit_roles.json`, nastavených přes `/setkitrole`) a hráče, kteří nemají tier zapsaný na webu (`players.json`), **tam automaticky zapíše** – včetně historie s dnešním datem. Následně synchronizuje `players.json` na GitHub (web). V odpovědi ukáže přehled per kit (✅ už zapsáno / ➕ nově / ✏️ aktualizováno). |
 | `/playersync preview` *(admin)* | Porovná tier role na Discordu s `players.json` a ukáže přehled rozdílů – **nic nemění**. |
 | `/playersync apply` *(admin)* | Ukáže stejný přehled a vyžaduje **explicitní potvrzení** (tlačítko) před aplikací změn. Stav se mezi náhledem a potvrzením ověřuje. Každé použití se zapisuje do `data/playersync_log.json`. |
+| `/websync preview` *(admin)* | Stáhne players.json z webu (GitHub) a porovná ho s kanonickou `players.json` – detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy. **Nic neposílá.** |
+| `/websync apply` *(admin)* | Ukáže stejný přehled a po **explicitním potvrzení** (tlačítko) nahradí players.json na webu kanonickou databází. Kanonická DB se mezi náhledem a potvrzením ověřuje; čtení i zápis mají retry. Výsledek se zapisuje do `data/websync_log.json` (timestamp, počet záznamů, úspěch/selhání a chyby). |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
@@ -179,6 +190,7 @@ cogs/
   results.py          # výsledky + statistiky + GitHub sync + auto role
   roles.py            # /setkitrole, /unsetkitrole, /kitrole, /checkweb + auto-grant rolí
   playersync.py       # /playersync (porovnání tier rolí s players.json, audit)
+  websync.py          # /websync (porovnání webu s players.json + zápis na web, audit)
   info.py             # /verze (diagnostika běžící verze)
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje
@@ -239,6 +251,8 @@ v originále):
 `queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
-`pulled_players.json`, `kits.json`. Server-specific mapování rolí je
+`pulled_players.json`, `kits.json`. Auditní logy synchronizací se uchovávají
+v `data/playersync_log.json` (tier role) a `data/websync_log.json` (web;
+**necommitují se**). Server-specific mapování rolí je
 v `data/kit_roles.json` (spravuje `/setkitrole`; **necommituje se** – obsahuje
 ID rolí daného serveru).

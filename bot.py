@@ -74,6 +74,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.kits",
             "cogs.roles",
             "cogs.playersync",
+            "cogs.websync",
             "cogs.info",
         ]
         for extension in extensions:

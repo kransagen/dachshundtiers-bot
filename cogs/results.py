@@ -17,10 +17,23 @@ from discord import app_commands
 from discord.ext import commands
 
 import github_sync
-from config import GITHUB_TOKEN, get_result_channel_id
+from config import (
+    GITHUB_TOKEN,
+    HT3_COOLDOWN_MS,
+    PLAYER_COOLDOWN_MS,
+    get_result_channel_id,
+)
 from panel import update_panel
 from services.queue_service import leave_queue, remove_pulled_player
+from services.results import (
+    EVAL_TIER,
+    RESULT_TIERS,
+    apply_result_to_players,
+    record_result,
+    validate_result_tier,
+)
 from services.store import transaction
+from services.tickets import HT3_TIER_LADDER, get_ticket
 from storage import load_data
 from utils import (
     add_kit,
@@ -36,12 +49,9 @@ from utils import (
 
 log = logging.getLogger("dachshundtiers")
 
-# Povolené tiery v /result (HT3 a výš se řeší přes HT3+ tickety):
-#   LT5, HT5, LT4, HT4, LT3, LT3 + eval
-RESULT_TIERS = {"LT5", "HT5", "LT4", "HT4", "LT3", "LT3E"}
-# Volba „LT3 + eval" (v kódu LT3E): hráč dostane tier LT3 (stejná role)
-# do players.json a navíc status evalu (data/evals.json) – viz set_eval.
-EVAL_TIER = "LT3E"
+# Povolené tiery v /result a EVAL_TIER žijí v services/results.py (jediný
+# zdroj pravdy): queue výsledky LT5..LT3+eval, HT3+ ticket výsledky ověřuje
+# validate_result_tier přímo proti žebříčku (HT3 a výš = jen přes tickety).
 
 # Autocomplete tieru pro /result: (zobrazované jméno, přenášená hodnota).
 # „LT3 + eval" se přenáší jako LT3E (= EVAL_TIER), ať zůstane normalizace
@@ -59,13 +69,26 @@ TIER_OPTIONS = [
 async def tier_autocomplete(
     interaction: discord.Interaction, current: str
 ) -> list[app_commands.Choice]:
-    """Autocomplete tierů /result (LT5 .. LT3 + eval), filtruje podle psaní."""
+    """Autocomplete tierů /result (LT5 .. LT3 + eval), filtruje podle psaní.
+
+    Když /result běží v kanálu HT3+ ticketu, nabídne navíc tiery žebříčku
+    (HT3, LT2, HT2, LT1, HT1) – v ticketu se zapisuje cíl evaluace.
+    """
     text = (current or "").lower()
     out = []
     for name, value in TIER_OPTIONS:
         if not text or text in name.lower() or text in value.lower():
             out.append(app_commands.Choice(name=name, value=value))
-    return out
+    ticket = None
+    if isinstance(interaction.channel, discord.TextChannel):
+        ticket = await get_ticket(interaction.channel_id)
+    if ticket is not None:
+        for t in HT3_TIER_LADDER:
+            if t in RESULT_TIERS:  # LT3+eval už je v TIER_OPTIONS
+                continue
+            if not text or text in t.lower():
+                out.append(app_commands.Choice(name=t, value=t))
+    return out[:25]
 
 
 async def _log_tester_stat(tester_id: str, kit: str, tier: str, month: str) -> None:
@@ -99,22 +122,14 @@ def _apply_result_to_players(
 ) -> list:
     """Aplikuje výsledek /result na daný seznam hráčů (pro GitHub push).
 
-    Idempotentní vůči libovolnému aktuálnímu seznamu – při konfliktu (409) ji
-    ``github_sync.push_players`` zavolá znovu na čerstvě stažených datech.
+    Deleguje na jednotnou aplikaci z services.results – kanonická players.json
+    a GitHub push používají stejnou logiku. Idempotentní vůči libovolnému
+    aktuálnímu seznamu – při konfliktu (409) ji ``github_sync.push_players``
+    zavolá znovu na čerstvě stažených datech.
     """
-    players = [dict(p) for p in (players or [])]
-    player = next(
-        (p for p in players if p.get("username", "").lower() == ign.lower()), None
+    players, _prev = apply_result_to_players(
+        players, ign, mode, new_tier, current_date
     )
-    if player is None:
-        player = {"username": ign, "modes": {}, "history": {}}
-        players.append(player)
-
-    player.setdefault("modes", {})
-    player.setdefault("history", {})
-    player["history"].setdefault(mode, [])
-    player["modes"][mode] = new_tier
-    player["history"][mode].append({"date": current_date, "tier": new_tier})
     return players
 
 
@@ -166,6 +181,7 @@ class Results(commands.Cog):
         outcome="Tester outcome",
         add_role="Role, kterou hráči přidat (nepovinné)",
         remove_role="Role, kterou hráči odebrat (nepovinné)",
+        notes="Poznámky k testu – uloží se do historie výsledku (nepovinné)",
     )
     @app_commands.choices(
         outcome=[
@@ -185,6 +201,7 @@ class Results(commands.Cog):
         outcome: str,
         add_role: discord.Role = None,
         remove_role: discord.Role = None,
+        notes: str = None,
     ) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
@@ -199,14 +216,28 @@ class Results(commands.Cog):
         kit_key = kit_clean.lower()
         tier_up = tier.strip().upper()
 
-        # 0a) Validace tieru: v /result jdou zadat jen tiery do LT3 + eval
-        #     (HT3 a výš se teď řeší výhradně přes HT3+ tickety).
-        if tier_up not in RESULT_TIERS:
-            return await interaction.followup.send(
-                "❌ Neplatný tier! V `/result` lze zadat pouze: "
-                "**LT5, HT5, LT4, HT4, LT3, LT3 + eval**.",
-                ephemeral=True,
-            )
+        notes_clean = (notes or "").strip() or None
+
+        # 0) HT ticket jako počátek evaluace: když /result běží v kanálu
+        #    HT3+ ticketu, výsledek se propojí s ticketem (idempotence:
+        #    1 ticket = max. 1 výsledek) a ticket se po potvrzení zavře.
+        #    Mimo ticket jde o klasický queue výsledek.
+        ticket = None
+        if isinstance(interaction.channel, discord.TextChannel):
+            ticket = await get_ticket(interaction.channel_id)
+
+        # 0a) Validace tieru:
+        #     - v HT ticketu: tier ze žebříčku, maximálně cíl ticketu a
+        #       nikdy horší než aktuální tier hráče (retest nedegraduje),
+        #     - mimo ticket: jen LT5..LT3+eval (HT3 a výš se řeší výhradně
+        #       přes HT3+ tickety).
+        ok_tier, tier_msg = validate_result_tier(
+            tier_up,
+            target_tier=ticket.get("targetTier") if ticket is not None else None,
+            current_tier=ticket.get("currentTier") if ticket is not None else None,
+        )
+        if not ok_tier:
+            return await interaction.followup.send(tier_msg, ephemeral=True)
 
         # 0b) „LT3 + eval" (LT3E) = tier LT3 (stejná role) + eval status.
         #     Do players.json / webu / role jde „LT3", eval se uloží zvlášť.
@@ -227,14 +258,104 @@ class Results(commands.Cog):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # 1) Cooldown hráče (4 dny) – transakčně, aby se souběžné /result
-        #    navzájem nepřepsaly.
-        async def _set_cooldown(tx):
-            cooldowns = tx.get("cooldowns.json", {})
-            cooldowns[target_id] = now_ms()
-            tx.set("cooldowns.json", cooldowns)
+        # 1) Zápis výsledku – atomicky: validace + idempotence + historie
+        #    (data/ht_results.json) + kanonická players.json + cooldowny
+        #    (+ zavření ticketu včetně HT3+ cooldownu a logu). Viz
+        #    services/results.record_result.
+        record = await record_result(
+            ticket_id=ticket["id"] if ticket is not None else None,
+            player_id=target_id,
+            player_name=hrac.display_name or hrac.name,
+            ign=ign_clean,
+            evaluator_id=str(interaction.user.id),
+            evaluator_name=interaction.user.display_name,
+            kit=kit_clean,
+            new_tier=tier_up,
+            display_tier=display_tier,
+            score=score,
+            outcome=outcome,
+            notes=notes_clean,
+            eval_flag=is_eval,
+            now=now_ms(),
+            date=today_cz(),
+            queue_cooldown_ms=PLAYER_COOLDOWN_MS,
+            ht3_cooldown_ms=HT3_COOLDOWN_MS if ticket is not None else 0,
+        )
+        r = record["result"]
+        if r == "duplicate":
+            existing = record.get("existing") or {}
+            if ticket is not None:
+                return await interaction.followup.send(
+                    "ℹ️ Výsledek pro tento ticket už byl zaznamenán "
+                    "(idempotentně – nic se nemění):\n"
+                    f"- **Nový tier:** {existing.get('displayTier') or existing.get('newTier')}\n"
+                    f"- **Kdy:** {existing.get('date') or '?'}\n"
+                    f"- **Tester:** <@{existing.get('evaluatorId', 0)}>\n"
+                    "Historie běží v `data/ht_results.json`.",
+                    ephemeral=True,
+                )
+            summary = ""
+            if existing:
+                summary = (
+                    f" (poslední výsledek: "
+                    f"{existing.get('displayTier') or existing.get('newTier')}"
+                    f" – {existing.get('date') or '?'})"
+                )
+            return await interaction.followup.send(
+                "ℹ️ Hráč má aktivní cooldown (4 dny po posledním /result) – "
+                "pravděpodobně duplicitní odeslání. Nic se nezměnilo." + summary,
+                ephemeral=True,
+            )
+        if r == "not_found":
+            return await interaction.followup.send(
+                "❌ Tento kanál není HT ticket (záznam chybí).", ephemeral=True
+            )
+        if r == "ticket_closed":
+            return await interaction.followup.send(
+                "❌ Ticket je zavřený – nejdřív ho otevři přes **Reopen** "
+                "a výsledek zapiš znovu.",
+                ephemeral=True,
+            )
+        if r == "wrong_player":
+            owner = (record.get("ticket") or {}).get("ownerId")
+            return await interaction.followup.send(
+                "❌ /result v kanálu ticketu zapisuje výsledek VLASTNÍKA "
+                f"ticketu. Tento ticket patří <@{owner}> – hráč v příkazu "
+                "se neshoduje.",
+                ephemeral=True,
+            )
+        if r == "wrong_kit":
+            kit_of = (record.get("ticket") or {}).get("kit")
+            return await interaction.followup.send(
+                f"❌ Kit neodpovídá ticketu – ticket je na kit **{kit_of}**.",
+                ephemeral=True,
+            )
+        if r == "invalid_tier":
+            return await interaction.followup.send(
+                record.get("message", "❌ Neplatný výsledek."), ephemeral=True
+            )
+        if r != "created":
+            return await interaction.followup.send(
+                "❌ Výsledek se nepodařilo uložit.", ephemeral=True
+            )
+        previous_tier = record.get("previous_tier", "N/A")
 
-        await transaction(("cooldowns.json",), _set_cooldown)
+        # 1a) Ticket je zavřený – obnovíme embed panel zprávy (jako Close
+        #     tlačítko), aby byla vidět zavřená kartička.
+        if ticket is not None:
+            try:
+                fresh_ticket = await get_ticket(ticket["id"])
+                if fresh_ticket and fresh_ticket.get("panelMessageId"):
+                    from views import ticket_embed
+
+                    tch = self.bot.get_channel(int(ticket["id"]))
+                    if tch is not None:
+                        tmsg = await tch.fetch_message(
+                            int(fresh_ticket["panelMessageId"])
+                        )
+                        await tmsg.edit(embed=ticket_embed(fresh_ticket))
+            except Exception:  # noqa: BLE001
+                log.exception("Nelze obnovit embed ticketu po /result")
 
         # 2) Odebrání z fronty (atomické – viz services.queue_service)
         removed_from_queue = await leave_queue(target_id, kit_key)
@@ -306,34 +427,8 @@ class Results(commands.Cog):
         current_date = today_cz()
         await _log_tester_stat(str(interaction.user.id), kit_clean, display_tier, month)
 
-        # 5) players.json – transakčně (dvě souběžné /result si nemůžou
-        #    navzájem přepsat zápis hráčů).
-        async def _update_players(tx):
-            players = tx.get("players.json")
-            db_player = next(
-                (p for p in players if p.get("username", "").lower() == ign_clean.lower()), None
-            )
-            prev = "N/A"
-
-            if db_player is None:
-                db_player = {"username": ign_clean, "modes": {}, "history": {}}
-                db_player["modes"][kit_clean] = stored_tier
-                db_player["history"][kit_clean] = [{"date": current_date, "tier": stored_tier}]
-                players.append(db_player)
-            else:
-                db_player.setdefault("modes", {})
-                db_player.setdefault("history", {})
-                db_player["history"].setdefault(kit_clean, [])
-                if db_player["modes"].get(kit_clean):
-                    prev = db_player["modes"][kit_clean].upper()
-                db_player["modes"][kit_clean] = stored_tier
-                db_player["history"][kit_clean].append(
-                    {"date": current_date, "tier": stored_tier}
-                )
-            tx.set("players.json", players)
-            return prev
-
-        previous_tier = await transaction(("players.json",), _update_players)
+        # 5) Kanonická players.json už aktualizoval record_result (krok 1)
+        #    včetně previous_tier – tady už jen navazující kroky.
 
         # 5a) „LT3 + eval" → status evalu (data/evals.json). Tier/role zůstávají
         #     LT3 – hráč ale nově může otevírat HT3+ tickety.
@@ -382,7 +477,11 @@ class Results(commands.Cog):
         embed = (
             discord.Embed(
                 title=f"📝 Výsledek tier testu – {kit_clean.lower()}",
-                description=f"Tier test byl úspěšně dokončen pro frontu **{kit_clean.lower()}**!",
+                description=(
+                    "Evaluace HT3+ ticketu byla úspěšně dokončena!"
+                    if ticket is not None
+                    else f"Tier test byl úspěšně dokončen pro frontu **{kit_clean.lower()}**!"
+                ),
                 color=0x10B981,
             )
             .set_thumbnail(url=avatar_url)
@@ -396,8 +495,12 @@ class Results(commands.Cog):
             )
             .add_field(name="📉 Předchozí tier", value=f"`{previous_tier}`", inline=True)
             .add_field(name="📈 Nový tier", value=f"**{display_tier}**", inline=True)
-            .set_footer(text=current_date)
         )
+        if ticket is not None:
+            embed.add_field(name="🎫 Ticket", value=f"<#{ticket['id']}>", inline=True)
+        if notes_clean:
+            embed.add_field(name="📝 Poznámky", value=notes_clean, inline=False)
+        embed.set_footer(text=current_date)
 
         # 7) Odeslání výsledku do určeného kanálu podle tieru (jako v originále)
         result_channel_id = get_result_channel_id(stored_tier)
@@ -425,6 +528,12 @@ class Results(commands.Cog):
             saved_msg += eval_note
         if role_note:
             saved_msg += role_note
+        if ticket is not None:
+            saved_msg += (
+                "\n🔒 Ticket byl zavřený – hráč má 7denní HT3+ cooldown na "
+                "tento kit. Výsledek je propojený s ticketem "
+                "(`data/ht_results.json`)."
+            )
 
         if result_channel is not None:
             try:

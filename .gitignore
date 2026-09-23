@@ -20,4 +20,5 @@ data/kit_roles.json
 data/evals.json
 data/ht_tickets.json
 data/ht_ticket_logs.json
+data/ht_results.json
 data/.gitkeep

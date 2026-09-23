@@ -6,7 +6,7 @@ from datetime import datetime
 import discord
 from discord import app_commands
 
-from config import TESTER_ROLE_FRAGMENT
+from services.permissions import has_admin_role, has_tester_role as _permissions_has_tester_role
 from storage import data_path, load_data, save_data
 
 # Výchozí sada kitů (použije se, dokud neexistuje data/kits.json)
@@ -66,11 +66,13 @@ def remove_kit(kit: str) -> bool:
 
 
 def has_tester_role(member) -> bool:
-    """Vrátí True, pokud má člen roli, jejíž název obsahuje „tester“."""
-    if member is None:
-        return False
-    roles = getattr(member, "roles", None) or []
-    return any(TESTER_ROLE_FRAGMENT in role.name.lower() for role in roles)
+    """Vrátí True, pokud je člen tester.
+
+    Deleguje na ``services.permissions``: přesný allowlist ID rolí, když je
+    nastaven (TESTER_ROLE_IDS), jinak původní shoda podle názvu role
+    (TESTER_ROLE_FRAGMENT).
+    """
+    return _permissions_has_tester_role(member)
 
 
 def today_cz() -> str:

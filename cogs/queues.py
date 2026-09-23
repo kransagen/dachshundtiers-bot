@@ -17,6 +17,8 @@ from discord.ext import commands
 
 from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID, get_queue_channel_id
 from panel import create_queue_embed, update_panel
+from services.queue_service import join_queue, save_pulled_player
+from services.store import transaction
 from storage import load_data, save_data
 from utils import has_tester_role, kit_autocomplete
 from views import PullChannelSelectView, QueueView, TesterRoomView
@@ -67,10 +69,26 @@ class Queues(commands.Cog):
             )
 
         kit_key = kit.lower()
-        active_queues = load_data("active_queues.json", {})
 
-        if kit_key in active_queues:
-            existing = active_queues[kit_key]
+        # Otevření fronty je atomické: kontrola, že už není otevřená, i zápis
+        # proběhnou v jednom kritickém úseku (žádné dvojité otevření).
+        async def _open(tx):
+            active_queues = tx.get("active_queues.json", {})
+            if kit_key in active_queues:
+                return ("exists", active_queues[kit_key])
+            qdata = {
+                "name": kit,
+                "opener": str(interaction.user.id),
+                "testers": [str(interaction.user.id)],
+                "time": time.time() * 1000,
+            }
+            active_queues[kit_key] = qdata
+            tx.set("active_queues.json", active_queues)
+            return ("ok", qdata)
+
+        status, qdata = await transaction(("active_queues.json",), _open)
+        if status == "exists":
+            existing = qdata
             return await interaction.response.send_message(
                 f"❌ Pouze jeden tester může přímo inicializovat frontu! "
                 f"Queue pro **{existing['name']}** už je otevřená testerem "
@@ -104,17 +122,9 @@ class Queues(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-        active_queues[kit_key] = {
-            "name": kit,
-            "opener": str(interaction.user.id),
-            "testers": [str(interaction.user.id)],
-            "time": time.time() * 1000,
-        }
-        save_data("active_queues.json", active_queues)
-
         queue = load_data("queue.json")
         filtered = [p for p in queue if str(p.get("kit", "")).lower() == kit_key]
-        embed = create_queue_embed(kit, filtered, active_queues[kit_key]["testers"])
+        embed = create_queue_embed(kit, filtered, qdata["testers"])
 
         view = QueueView(kit)
         message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
@@ -165,14 +175,27 @@ class Queues(commands.Cog):
                 ephemeral=True,
             )
 
-        del active_queues[kit_key]
-        save_data("active_queues.json", active_queues)
+        # Uzavření = atomicky: smazání aktivní fronty + vyčištění čekajících
+        # hráčů kitu + odebrání záznamu panelu (žádné souběžné ztráty zápisu).
+        async def _close(tx):
+            active = tx.get("active_queues.json", {})
+            active.pop(kit_key, None)
+            tx.set("active_queues.json", active)
 
-        # Vyčištění všech čekajících hráčů pro tento kit (jako v originále)
-        queue = load_data("queue.json")
-        remaining = [p for p in queue if str(p.get("kit", "")).lower() != kit_key]
-        if len(remaining) != len(queue):
-            save_data("queue.json", remaining)
+            queue = tx.get("queue.json")
+            remaining = [p for p in queue if str(p.get("kit", "")).lower() != kit_key]
+            if len(remaining) != len(queue):
+                tx.set("queue.json", remaining)
+
+            messages = tx.get("queue_messages.json", {})
+            old = messages.pop(kit_key, None)
+            tx.set("queue_messages.json", messages)
+            return old
+
+        old = await transaction(
+            ("active_queues.json", "queue.json", "queue_messages.json"), _close
+        )
+        old_id = old.get("message_id") if isinstance(old, dict) else old
 
         closing_ts = int(time.time())
         embed = discord.Embed(
@@ -186,10 +209,6 @@ class Queues(commands.Cog):
         )
 
         # Panel se upraví přímo v určeném kanálu kitu (bez tlačítek)
-        queue_messages = load_data("queue_messages.json", {})
-        old = queue_messages.pop(kit_key, None)
-        old_id = old.get("message_id") if isinstance(old, dict) else old
-
         channel_id = get_queue_channel_id(kit_key)
         kit_channel = None
         if channel_id:
@@ -215,8 +234,6 @@ class Queues(commands.Cog):
             except discord.HTTPException:
                 pass
 
-        save_data("queue_messages.json", queue_messages)
-
         await interaction.response.send_message(
             f"Queue pro **{kit}** has been closed and all players have been removed.",
             ephemeral=True,
@@ -232,44 +249,38 @@ class Queues(commands.Cog):
     @app_commands.autocomplete(kit=kit_autocomplete)
     async def queue_join(self, interaction: discord.Interaction, ign: str, kit: str) -> None:
         kit_key = kit.lower()
-        active_queues = load_data("active_queues.json", {})
-        if kit_key not in active_queues:
+        user_id = str(interaction.user.id)
+        now = time.time() * 1000
+
+        # Společná atomická cesta jako Join tlačítko (JoinModal): aktivní
+        # fronta + cooldown + duplicita + zápis v jednom kritickém úseku.
+        result = await join_queue(
+            user_id,
+            interaction.user.name,
+            ign,
+            kit,
+            joined_at_ms=now,
+            cooldown_ms=PLAYER_COOLDOWN_MS,
+        )
+        status = result["result"]
+
+        if status == "closed":
             return await interaction.response.send_message(
                 f"❌ Queue pro kit **{kit}** je momentálně zavřená! Počkej, až ji tester otevře.",
                 ephemeral=True,
             )
-
-        user_id = str(interaction.user.id)
-        now = time.time() * 1000
-        cooldowns = load_data("cooldowns.json", {})
-        if user_id in cooldowns and (now - cooldowns[user_id]) < PLAYER_COOLDOWN_MS:
-            remaining = PLAYER_COOLDOWN_MS - (now - cooldowns[user_id])
+        if status == "cooldown":
+            remaining = result["remaining"]
             days = int(remaining // (24 * 60 * 60 * 1000))
             hours = int((remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000))
             return await interaction.response.send_message(
                 f"❌ Máš cooldown na testy! Zkus to znovu za **{days}d {hours}h**.",
                 ephemeral=True,
             )
-
-        queue = load_data("queue.json")
-        if any(
-            p.get("id") == user_id and str(p.get("kit", "")).lower() == kit_key for p in queue
-        ):
+        if status == "duplicate":
             return await interaction.response.send_message(
                 "❌ V této frontě už jsi zapsaný.", ephemeral=True
             )
-
-        queue.append(
-            {
-                "id": user_id,
-                "username": interaction.user.name,
-                "ign": ign.strip(),
-                "kit": kit.strip(),
-                "joinedAt": now,
-                "testerId": None,
-            }
-        )
-        save_data("queue.json", queue)
 
         await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(f"✅ Byl jsi přidán do fronty **{kit.strip()}**.")
@@ -330,25 +341,33 @@ class Queues(commands.Cog):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
 
         kit_key = kit.lower()
-        active_queues = load_data("active_queues.json", {})
-        if kit_key not in active_queues:
+        user_id = str(interaction.user.id)
+
+        async def _join(tx):
+            active_queues = tx.get("active_queues.json", {})
+            qdata = active_queues.get(kit_key)
+            if not qdata:
+                return ("closed", None)
+            if user_id in qdata.get("testers", []):
+                return ("duplicate", qdata)
+            qdata.setdefault("testers", []).append(user_id)
+            tx.set("active_queues.json", active_queues)
+            return ("ok", qdata)
+
+        status, qdata = await transaction(("active_queues.json",), _join)
+        if status == "closed":
             return await interaction.response.send_message(
                 "❌ Tato fronta není otevřená!", ephemeral=True
             )
-
-        user_id = str(interaction.user.id)
-        if user_id in active_queues[kit_key]["testers"]:
+        if status == "duplicate":
             return await interaction.response.send_message(
                 "V této frontě už jsi zapsaný jako aktivní tester.", ephemeral=True
             )
 
-        active_queues[kit_key]["testers"].append(user_id)
-        save_data("active_queues.json", active_queues)
-
         await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
             f"⚔️ <@{user_id}> se přidal jako další aktivní tester pro frontu "
-            f"**{active_queues[kit_key]['name']}**."
+            f"**{qdata['name']}**."
         )
 
     @queue.command(name="leaveq", description="Leave an active queue you are currently testing in")
@@ -359,30 +378,38 @@ class Queues(commands.Cog):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
 
         kit_key = kit.lower()
-        active_queues = load_data("active_queues.json", {})
-        if kit_key not in active_queues:
+        user_id = str(interaction.user.id)
+
+        async def _leave(tx):
+            active_queues = tx.get("active_queues.json", {})
+            qdata = active_queues.get(kit_key)
+            if not qdata:
+                return ("closed", None)
+            testers = qdata.get("testers", [])
+            if user_id not in testers:
+                return ("not_listed", qdata)
+            testers.remove(user_id)
+
+            # Pokud odchází otevíratel, převezme frontu první tester
+            if qdata.get("opener") == user_id and testers:
+                qdata["opener"] = testers[0]
+
+            tx.set("active_queues.json", active_queues)
+            return ("ok", qdata)
+
+        status, qdata = await transaction(("active_queues.json",), _leave)
+        if status == "closed":
             return await interaction.response.send_message(
                 "Tato fronta neexistuje nebo není aktivní.", ephemeral=True
             )
-
-        user_id = str(interaction.user.id)
-        testers = active_queues[kit_key]["testers"]
-        if user_id not in testers:
+        if status == "not_listed":
             return await interaction.response.send_message(
                 "V této frontě nejsi zapsaný.", ephemeral=True
             )
 
-        testers.remove(user_id)
-
-        # Pokud odchází otevíratel, převezme frontu první tester
-        if active_queues[kit_key].get("opener") == user_id and testers:
-            active_queues[kit_key]["opener"] = testers[0]
-
-        save_data("active_queues.json", active_queues)
-
         await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
-            f"👋 <@{user_id}> opustil frontu **{active_queues[kit_key]['name']}**. "
+            f"👋 <@{user_id}> opustil frontu **{qdata['name']}**. "
             "Ostatní testeři mohou pokračovat."
         )
 
@@ -408,7 +435,8 @@ class Queues(commands.Cog):
         kit_name = active_queues.get(kit_key, {}).get("name") or player.get("kit", "?")
 
         # Stejný tok jako pull tlačítko na panelu: tester vybere roomku,
-        # hráč do ní dostane přístup a pošle se uvítací zpráva.
+        # hráč do ní dostane přístup a pošle se uvítací zpráva. Vyřazení
+        # z fronty je atomické (PullChannelSelectView.on_select).
         view = PullChannelSelectView(player, kit_name)
         await interaction.response.send_message(
             content=(
@@ -429,15 +457,20 @@ class Queues(commands.Cog):
             return await interaction.response.send_message("❌ Chybí oprávnění.", ephemeral=True)
 
         user_id = str(hrac.id)
-        queue = load_data("queue.json")
-        entry = next((p for p in queue if p.get("id") == user_id), None)
+
+        async def _remove(tx):
+            queue = tx.get("queue.json")
+            entry = next((p for p in queue if p.get("id") == user_id), None)
+            if entry is None:
+                return None
+            tx.set("queue.json", [p for p in queue if p.get("id") != user_id])
+            return entry
+
+        entry = await transaction(("queue.json",), _remove)
         if entry is None:
             return await interaction.response.send_message(
                 f"❌ Hráč <@{user_id}> nebyl nalezen v žádné aktivní frontě.", ephemeral=True
             )
-
-        queue = [p for p in queue if p.get("id") != user_id]
-        save_data("queue.json", queue)
 
         await interaction.response.send_message(
             f"🧹 Hráč <@{user_id}> byl vyhozen z fronty pro kit **{entry.get('kit')}**."
@@ -522,18 +555,16 @@ class Queues(commands.Cog):
             # Zaznamenání přednastaveného hráče – /result mu pak práva odebere,
             # /skip si odsud přečte záznam. (kit zatím neznáme – zjistí se
             # z fronty, když hráče přepulluje pull tlačítko.)
-            pulled = load_data("pulled_players.json", {})
-            pulled[str(hrac.id)] = {
-                "channel": str(channel.id),
-                "player": {
+            await save_pulled_player(
+                {
                     "id": str(hrac.id),
                     "username": hrac.display_name,
                     "ign": hrac.display_name,
                     "kit": "",
                     "joinedAt": 0,
                 },
-            }
-            save_data("pulled_players.json", pulled)
+                channel.id,
+            )
         room_msg += (
             "\nHráč získá přístup po pullnutí (tlačítko Pull Player ⚔️) a po"
             " `/result` mu bude odebrán. Roomku smažeš tlačítkem níže."
@@ -573,36 +604,58 @@ class Queues(commands.Cog):
         stored_player = None
         was_pulled = False
         access_revoked = False
+        next_player = None
 
-        # 1) Pullnutý hráč? → odeber mu přístup do roomky
-        pulled = load_data("pulled_players.json", {})
-        entry = pulled.get(player_id)
-        if entry is not None:
-            was_pulled = True
+        # 1) Vše atomicky: odebrání práv z roomky + smazání záznamu
+        #    (pulled_players.json) + přesun hráče na konec fronty. Dvě souběžné
+        #    interakce si navzájem nemůžou ztratit zápis.
+        async def _skip_tx(tx):
+            nonlocal kit_key, stored_player, was_pulled, access_revoked, next_player
+
+            pulled = tx.get("pulled_players.json", {})
+            entry = pulled.get(player_id)
             channel_id_raw = None
-            if isinstance(entry, dict):
-                channel_id_raw = entry.get("channel")
-                stored_player = entry.get("player")
-                if isinstance(stored_player, dict):
-                    kit_key = str(stored_player.get("kit", "")).lower()
-            else:
-                # starší formát záznamu (string = channel id)
-                channel_id_raw = entry
-            if channel_id_raw:
-                channel = interaction.guild.get_channel(int(channel_id_raw))
-                if channel is None:
-                    try:
-                        channel = await interaction.guild.fetch_channel(int(channel_id_raw))
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        channel = None
-                if channel is not None:
-                    try:
-                        await channel.set_permissions(hrac, overwrite=None)
-                        access_revoked = True
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
-            del pulled[player_id]
-            save_data("pulled_players.json", pulled)
+            if entry is not None:
+                was_pulled = True
+                if isinstance(entry, dict):
+                    channel_id_raw = entry.get("channel")
+                    stored_player = entry.get("player")
+                    if isinstance(stored_player, dict):
+                        kit_key = str(stored_player.get("kit", "")).lower()
+                else:
+                    # starší formát záznamu (string = channel id)
+                    channel_id_raw = entry
+                if channel_id_raw:
+                    channel = interaction.guild.get_channel(int(channel_id_raw))
+                    if channel is None:
+                        try:
+                            channel = await interaction.guild.fetch_channel(int(channel_id_raw))
+                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                            channel = None
+                    if channel is not None:
+                        try:
+                            await channel.set_permissions(hrac, overwrite=None)
+                            access_revoked = True
+                        except (discord.Forbidden, discord.HTTPException):
+                            pass
+                del pulled[player_id]
+                tx.set("pulled_players.json", pulled)
+
+            queue = tx.get("queue.json")
+            new_queue, new_kit_key, moved = _move_to_queue_end(queue, stored_player, player_id)
+            if not kit_key:
+                kit_key = new_kit_key
+            requeued = len(new_queue) != len(queue)
+            if requeued:
+                tx.set("queue.json", new_queue)
+            next_player = next(
+                (p for p in new_queue if str(p.get("kit", "")).lower() == kit_key), None
+            )
+            return requeued, moved
+
+        requeued, moved = await transaction(
+            ("pulled_players.json", "queue.json"), _skip_tx
+        )
 
         # 1b) Voice: skipnutý hráč nesmí zůstat připojený ve voice roomce
         #     (odebrání práv ho z voice kanálu samo neodpojí).
@@ -620,15 +673,8 @@ class Queues(commands.Cog):
                     err,
                 )
 
-        # 2) Fronta: přesuň hráče na konec
-        queue = load_data("queue.json")
-        new_queue, kit_key, moved = _move_to_queue_end(queue, stored_player, player_id)
-        requeued = False
-        if len(new_queue) != len(queue):
-            save_data("queue.json", new_queue)
-            if kit_key:
-                await update_panel(interaction.guild, kit_key)
-            requeued = True
+        if requeued and kit_key:
+            await update_panel(interaction.guild, kit_key)
 
         if not requeued and not moved and not was_pulled:
             return await interaction.response.send_message(
@@ -637,10 +683,6 @@ class Queues(commands.Cog):
             )
 
         # 3) Kdo bude další na řadě?
-        next_player = next(
-            (p for p in new_queue if str(p.get("kit", "")).lower() == kit_key), None
-        )
-
         parts = [f"⏭️ **{hrac.display_name}** byl přeskočen (AFK)."]
         if access_revoked:
             parts.append("• Přístup do roomky mu byl odebrán.")

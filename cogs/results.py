@@ -9,23 +9,23 @@
 """
 
 import asyncio
-import base64
-import json
 import logging
 import time
 
 import discord
-import requests
 from discord import app_commands
 from discord.ext import commands
 
-from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN, get_result_channel_id
+import github_sync
+from config import GITHUB_TOKEN, get_result_channel_id
 from panel import update_panel
-from storage import load_data, save_data
+from services.queue_service import leave_queue, remove_pulled_player
+from services.store import transaction
+from storage import load_data
 from utils import (
-    DEFAULT_KITS,
     add_kit,
     get_kits,
+    has_admin_role,
     has_tester_role,
     kit_autocomplete,
     month_key,
@@ -68,48 +68,41 @@ async def tier_autocomplete(
     return out
 
 
-def _log_tester_stat(stats_db, tester_id: str, kit: str, tier: str, month: str) -> None:
-    """Zaloguje statistiky testera (total, kits, tiers, monthly, hourlyLogs)."""
-    stat = stats_db.setdefault(
-        tester_id,
-        {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
-    )
-    stat["total"] = stat.get("total", 0) + 1
-    stat["lastTested"] = today_cz()
-    stat["kits"][kit] = stat["kits"].get(kit, 0) + 1
-    stat["tiers"][tier] = stat["tiers"].get(tier, 0) + 1
-    stat["monthly"][month] = stat["monthly"].get(month, 0) + 1
-    stat["hourlyLogs"].append(time.localtime().tm_hour)
-    save_data("testers_stats.json", stats_db)
+async def _log_tester_stat(tester_id: str, kit: str, tier: str, month: str) -> None:
+    """Zaloguje statistiky testera (total, kits, tiers, monthly, hourlyLogs).
+
+    Probíhá transakčně – dvě souběžné interakce si nemůžou navzájem přepsat
+    statistiku (ztráta testu).
+    """
+    async def _run(tx):
+        stats_db = tx.get("testers_stats.json", {})
+        stat = stats_db.setdefault(
+            tester_id,
+            {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
+        )
+        stat["total"] = stat.get("total", 0) + 1
+        stat["lastTested"] = today_cz()
+        stat["kits"][kit] = stat["kits"].get(kit, 0) + 1
+        stat["tiers"][tier] = stat["tiers"].get(tier, 0) + 1
+        stat["monthly"][month] = stat["monthly"].get(month, 0) + 1
+        stat["hourlyLogs"].append(time.localtime().tm_hour)
+        tx.set("testers_stats.json", stats_db)
+
+    return await transaction(("testers_stats.json",), _run)
 
 
 # ---------------------------------------------------------------------------
 # GitHub synchronizace players.json (ekvivalent původní Octokit integrace)
 # ---------------------------------------------------------------------------
-def _sync_players_github(ign: str, mode: str, new_tier: str, current_date: str):
-    api = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-        f"/contents/{GITHUB_FILE_PATH}"
-    )
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
+def _apply_result_to_players(
+    players: list, ign: str, mode: str, new_tier: str, current_date: str
+) -> list:
+    """Aplikuje výsledek /result na daný seznam hráčů (pro GitHub push).
 
-    response = requests.get(api, headers=headers, timeout=20)
-    sha = None
-    if response.status_code == 200:
-        data = response.json()
-        sha = data.get("sha")
-        try:
-            players = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
-        except (json.JSONDecodeError, ValueError):
-            players = []
-    elif response.status_code == 404:
-        players = []
-    else:
-        return False, f"GitHub GET selhal ({response.status_code})"
-
+    Idempotentní vůči libovolnému aktuálnímu seznamu – při konfliktu (409) ji
+    ``github_sync.push_players`` zavolá znovu na čerstvě stažených datech.
+    """
+    players = [dict(p) for p in (players or [])]
     player = next(
         (p for p in players if p.get("username", "").lower() == ign.lower()), None
     )
@@ -122,26 +115,15 @@ def _sync_players_github(ign: str, mode: str, new_tier: str, current_date: str):
     player["history"].setdefault(mode, [])
     player["modes"][mode] = new_tier
     player["history"][mode].append({"date": current_date, "tier": new_tier})
-
-    body = {
-        "message": f"Update {ign} - {mode}: {new_tier}",
-        "content": base64.b64encode(
-            json.dumps(players, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("ascii"),
-    }
-    if sha:
-        body["sha"] = sha
-
-    response = requests.put(api, headers=headers, json=body, timeout=20)
-    if response.status_code in (200, 201):
-        return True, "✅ Úspěšně aktualizováno na GitHubu!"
-    return False, f"❌ GitHub zápis selhal ({response.status_code})"
+    return players
 
 
 async def _sync_players_github_async(interaction, ign, mode, new_tier, current_date) -> None:
     try:
-        ok, message = await asyncio.to_thread(
-            _sync_players_github, ign, mode, new_tier, current_date
+        ok, message, _ = await github_sync.push_players(
+            f"Update {ign} - {mode}: {new_tier}",
+            lambda players: _apply_result_to_players(players, ign, mode, new_tier, current_date),
+            success_message="✅ Úspěšně aktualizováno na GitHubu!",
         )
         if ok:
             await interaction.followup.send(
@@ -245,20 +227,18 @@ class Results(commands.Cog):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # 1) Cooldown hráče (4 dny)
-        cooldowns = load_data("cooldowns.json", {})
-        cooldowns[target_id] = now_ms()
-        save_data("cooldowns.json", cooldowns)
+        # 1) Cooldown hráče (4 dny) – transakčně, aby se souběžné /result
+        #    navzájem nepřepsaly.
+        async def _set_cooldown(tx):
+            cooldowns = tx.get("cooldowns.json", {})
+            cooldowns[target_id] = now_ms()
+            tx.set("cooldowns.json", cooldowns)
 
-        # 2) Odebrání z fronty
-        queue = load_data("queue.json")
-        new_queue = [
-            p
-            for p in queue
-            if not (p.get("id") == target_id and str(p.get("kit", "")).lower() == kit_key)
-        ]
-        if len(new_queue) != len(queue):
-            save_data("queue.json", new_queue)
+        await transaction(("cooldowns.json",), _set_cooldown)
+
+        # 2) Odebrání z fronty (atomické – viz services.queue_service)
+        removed_from_queue = await leave_queue(target_id, kit_key)
+        if removed_from_queue and interaction.guild is not None:
             await update_panel(interaction.guild, kit_key)
 
         # 3) Odebrání práv z tester roomek – po výsledku hráč nesmí zůstat
@@ -266,10 +246,7 @@ class Results(commands.Cog):
         #    pulled_players.json) i přednastavený přístup přes `/mktesterroom
         #    hrac:` – vždy odstraníme hráčův osobní overwrite ve VŠECH
         #    kanálech serveru.
-        pulled_players = load_data("pulled_players.json", {})
-        if target_id in pulled_players:
-            del pulled_players[target_id]
-            save_data("pulled_players.json", pulled_players)
+        await remove_pulled_player(target_id)
 
         member = interaction.guild.get_member(int(target_id))
         if member is None:
@@ -324,33 +301,39 @@ class Results(commands.Cog):
                         err,
                     )
 
-        # 4) Statistiky testera
+        # 4) Statistiky testera (transakčně)
         month = month_key()
         current_date = today_cz()
-        stats_db = load_data("testers_stats.json", {})
-        _log_tester_stat(stats_db, str(interaction.user.id), kit_clean, display_tier, month)
+        await _log_tester_stat(str(interaction.user.id), kit_clean, display_tier, month)
 
-        # 5) players.json
-        players = load_data("players.json")
-        db_player = next(
-            (p for p in players if p.get("username", "").lower() == ign_clean.lower()), None
-        )
-        previous_tier = "N/A"
+        # 5) players.json – transakčně (dvě souběžné /result si nemůžou
+        #    navzájem přepsat zápis hráčů).
+        async def _update_players(tx):
+            players = tx.get("players.json")
+            db_player = next(
+                (p for p in players if p.get("username", "").lower() == ign_clean.lower()), None
+            )
+            prev = "N/A"
 
-        if db_player is None:
-            db_player = {"username": ign_clean, "modes": {}, "history": {}}
-            db_player["modes"][kit_clean] = stored_tier
-            db_player["history"][kit_clean] = [{"date": current_date, "tier": stored_tier}]
-            players.append(db_player)
-        else:
-            db_player.setdefault("modes", {})
-            db_player.setdefault("history", {})
-            db_player["history"].setdefault(kit_clean, [])
-            if db_player["modes"].get(kit_clean):
-                previous_tier = db_player["modes"][kit_clean].upper()
-            db_player["modes"][kit_clean] = stored_tier
-            db_player["history"][kit_clean].append({"date": current_date, "tier": stored_tier})
-        save_data("players.json", players)
+            if db_player is None:
+                db_player = {"username": ign_clean, "modes": {}, "history": {}}
+                db_player["modes"][kit_clean] = stored_tier
+                db_player["history"][kit_clean] = [{"date": current_date, "tier": stored_tier}]
+                players.append(db_player)
+            else:
+                db_player.setdefault("modes", {})
+                db_player.setdefault("history", {})
+                db_player["history"].setdefault(kit_clean, [])
+                if db_player["modes"].get(kit_clean):
+                    prev = db_player["modes"][kit_clean].upper()
+                db_player["modes"][kit_clean] = stored_tier
+                db_player["history"][kit_clean].append(
+                    {"date": current_date, "tier": stored_tier}
+                )
+            tx.set("players.json", players)
+            return prev
+
+        previous_tier = await transaction(("players.json",), _update_players)
 
         # 5a) „LT3 + eval" → status evalu (data/evals.json). Tier/role zůstávají
         #     LT3 – hráč ale nově může otevírat HT3+ tickety.
@@ -559,7 +542,6 @@ class Results(commands.Cog):
     # /addtest (admin)
     # ------------------------------------------------------------------
     @app_commands.command(name="addtest", description="Admin command to manually add historical test logs")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
         tester="The tester to credit",
         amount="Amount of tests to add",
@@ -568,15 +550,24 @@ class Results(commands.Cog):
     async def addtest(
         self, interaction: discord.Interaction, tester: discord.User, amount: int, month: str
     ) -> None:
-        stats_db = load_data("testers_stats.json", {})
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
         tester_id = str(tester.id)
-        stat = stats_db.setdefault(
-            tester_id,
-            {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
-        )
-        stat["total"] = stat.get("total", 0) + amount
-        stat["monthly"][month] = stat["monthly"].get(month, 0) + amount
-        save_data("testers_stats.json", stats_db)
+
+        async def _run(tx):
+            stats_db = tx.get("testers_stats.json", {})
+            stat = stats_db.setdefault(
+                tester_id,
+                {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
+            )
+            stat["total"] = stat.get("total", 0) + amount
+            stat["monthly"][month] = stat["monthly"].get(month, 0) + amount
+            tx.set("testers_stats.json", stats_db)
+
+        await transaction(("testers_stats.json",), _run)
 
         await interaction.response.send_message(
             f"✅ Úspěšně přidáno **{amount}** historických testů uživateli "
@@ -587,57 +578,76 @@ class Results(commands.Cog):
     # /removetest (admin)
     # ------------------------------------------------------------------
     @app_commands.command(name="removetest", description="Odečte testy testerovi")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
         user="Tester, kterému chceš odebrat testy", amount="Počet testů k odebrání"
     )
     async def removetest(self, interaction: discord.Interaction, user: discord.User, amount: int) -> None:
-        stats_db = load_data("testers_stats.json", {})
-        tester_id = str(user.id)
-        stat = stats_db.get(tester_id, {})
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
 
-        if not stat:
-            stat = {
-                "total": 0,
-                "lastTested": "",
-                "kits": {},
-                "tiers": {},
-                "monthly": {},
-                "hourlyLogs": [],
-            }
-            stats_db[tester_id] = stat
+        tester_id = str(user.id)
+        updated_total = 0
 
         # Upraví celkový součet i aktuální měsíční počet (nikdy pod nulu)
-        stat["total"] = max(0, stat.get("total", 0) - amount)
-        stat["monthly"][month_key()] = max(
-            0, stat["monthly"].get(month_key(), 0) - amount
-        )
-        save_data("testers_stats.json", stats_db)
+        async def _run(tx):
+            nonlocal updated_total
+            stats_db = tx.get("testers_stats.json", {})
+            stat = stats_db.get(tester_id)
+            if not stat:
+                stat = {
+                    "total": 0,
+                    "lastTested": "",
+                    "kits": {},
+                    "tiers": {},
+                    "monthly": {},
+                    "hourlyLogs": [],
+                }
+                stats_db[tester_id] = stat
+            stat["total"] = max(0, stat.get("total", 0) - amount)
+            stat["monthly"][month_key()] = max(
+                0, stat["monthly"].get(month_key(), 0) - amount
+            )
+            updated_total = stat["total"]
+            tx.set("testers_stats.json", stats_db)
+
+        await transaction(("testers_stats.json",), _run)
 
         await interaction.response.send_message(
             f"📉 Uživatel **{user.name}** ztratil **{amount}** test(ů). "
-            f"Nyní má celkem **{stat['total']}** testů."
+            f"Nyní má celkem **{updated_total}** testů."
         )
 
     # ------------------------------------------------------------------
     # /removeplayertiers (admin)
     # ------------------------------------------------------------------
     @app_commands.command(name="removeplayertiers", description="Smaže všechny tiery hráče na webu")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(ign="Minecraft jméno hráče (IGN)")
     async def removeplayertiers(self, interaction: discord.Interaction, ign: str) -> None:
-        players = load_data("players.json")
-        index = next(
-            (i for i, p in enumerate(players) if p.get("username", "").lower() == ign.lower()),
-            None,
-        )
-        if index is None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
+        async def _run(tx):
+            players = tx.get("players.json")
+            index = next(
+                (i for i, p in enumerate(players) if p.get("username", "").lower() == ign.lower()),
+                None,
+            )
+            if index is None:
+                return False
+            players.pop(index)
+            tx.set("players.json", players)
+            return True
+
+        removed = await transaction(("players.json",), _run)
+        if not removed:
             return await interaction.response.send_message(
                 f"Hráč **{ign}** nebyl v databázi nalezen.", ephemeral=True
             )
 
-        players.pop(index)
-        save_data("players.json", players)
         await interaction.response.send_message(
             f"✅ Hráči **{ign}** byly úspěšně smazány všechny tiery a byl odebrán z webu."
         )

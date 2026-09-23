@@ -12,6 +12,13 @@ import discord
 
 from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, TIERS_UPPER, get_ht3_ticket_category
 from panel import update_panel
+from services.queue_service import (
+    join_queue,
+    leave_queue,
+    pop_for_kit,
+    remove_by_player_id,
+    save_pulled_player,
+)
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, has_eval, has_tester_role
 
@@ -19,9 +26,42 @@ log = logging.getLogger("dachshundtiers")
 
 
 # ---------------------------------------------------------------------------
+# Bezpečné View / Modal: neošetřené chyby se zalogují a hráč dostane hlášku
+# ---------------------------------------------------------------------------
+class SafeView(discord.ui.View):
+    """View, který neošetřené chyby callbacků zaloguje a pošle hráči hlášku."""
+
+    async def on_error(self, interaction, error, item):
+        log.exception("Chyba v komponentě %s: %s", item, error)
+        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
+
+
+class SafeModal(discord.ui.Modal):
+    """Modál, který neošetřené chyby zaloguje a pošle hráči hlášku."""
+
+    async def on_error(self, interaction, error):
+        log.exception("Chyba v modálu: %s", error)
+        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Modál pro zadání IGN při připojení do fronty (joinbtn → joinmodal)
 # ---------------------------------------------------------------------------
-class JoinModal(discord.ui.Modal):
+class JoinModal(SafeModal):
     def __init__(self, kit: str):
         super().__init__(title=f"Join {kit} Queue")
         self.kit = kit
@@ -36,26 +76,38 @@ class JoinModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         kit_key = self.kit.lower()
-        active_queues = load_data("active_queues.json", {})
-        if not active_queues.get(kit_key):
+        ign = (self.ign_input.value or "").strip()
+
+        # Join probíhá ATOMICky: kontrola aktivní fronty + cooldownu + duplicity
+        # i samotný zápis ve stejném kritickém úseku. Dvě souběžné interakce
+        # (nebo „obejití" přes modál, když cooldown mezitím naskočil) tak
+        # nemůžou hráče zapsat dvakrát ani obejít cooldown.
+        result = await join_queue(
+            str(interaction.user.id),
+            interaction.user.name,
+            ign,
+            self.kit,
+            joined_at_ms=time.time() * 1000,
+            cooldown_ms=PLAYER_COOLDOWN_MS,
+        )
+        status = result["result"]
+
+        if status == "closed":
             return await interaction.response.send_message(
                 "❌ Tato fronta už byla zavřena.", ephemeral=True
             )
-
-        ign = (self.ign_input.value or "").strip()
-        user_id = str(interaction.user.id)
-        queue = load_data("queue.json")
-        queue.append(
-            {
-                "id": user_id,
-                "username": interaction.user.name,
-                "ign": ign,
-                "kit": self.kit,
-                "joinedAt": time.time() * 1000,
-                "testerId": None,
-            }
-        )
-        save_data("queue.json", queue)
+        if status == "cooldown":
+            remaining = result["remaining"]
+            days = int(remaining // (24 * 60 * 60 * 1000))
+            hours = int((remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000))
+            return await interaction.response.send_message(
+                f"❌ Máš cooldown na testy! Zkus to znovu za **{days}d {hours}h**.",
+                ephemeral=True,
+            )
+        if status == "duplicate":
+            return await interaction.response.send_message(
+                "❌ V této frontě už jsi zapsaný.", ephemeral=True
+            )
 
         await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
@@ -67,7 +119,7 @@ class JoinModal(discord.ui.Modal):
 # ---------------------------------------------------------------------------
 # Panel fronty: Join / Leave / Pull tlačítka
 # ---------------------------------------------------------------------------
-class QueueView(discord.ui.View):
+class QueueView(SafeView):
     def __init__(self, kit: str, disabled_join: bool = False):
         super().__init__(timeout=None)
         self.kit = kit
@@ -117,25 +169,21 @@ class QueueView(discord.ui.View):
                 "❌ V této frontě už jsi zapsaný.", ephemeral=True
             )
 
+        # Předběžná kontrola je jen UX „rychlá cesta" – finální (atomická)
+        # kontrola probíhá v JoinModal.on_submit.
         await interaction.response.send_modal(JoinModal(self.kit))
 
     # ---- Leave ----
     async def on_leave(self, interaction: discord.Interaction) -> None:
         kit_key = self.kit.lower()
         user_id = str(interaction.user.id)
-        queue = load_data("queue.json")
-        new_queue = [
-            p
-            for p in queue
-            if not (p.get("id") == user_id and str(p.get("kit", "")).lower() == kit_key)
-        ]
 
-        if len(new_queue) == len(queue):
+        removed = await leave_queue(user_id, kit_key)
+        if not removed:
             return await interaction.response.send_message(
                 f"❌ Nejsi zapsaný ve frontě pro kit **{self.kit}**.", ephemeral=True
             )
 
-        save_data("queue.json", new_queue)
         await update_panel(interaction.guild, kit_key)
         await interaction.response.send_message(
             f"✅ Úspěšně jsi opustil frontu pro kit **{self.kit}**.", ephemeral=True
@@ -177,17 +225,14 @@ class QueueView(discord.ui.View):
 
         channel_id = int(interaction.data["values"][0])
 
-        queue = load_data("queue.json")
-        index = next(
-            (i for i, p in enumerate(queue) if str(p.get("kit", "")).lower() == kit_key), None
-        )
-        if index is None:
+        # Atomický pull: odebere se PRVNÍ hráč kitu. Když ho mezitím někdo
+        # jiný vyřadil (odešel / pullul jiný tester / /result), řekne se to
+        # narovinu a nikdo není vytažený dvakrát.
+        player = await pop_for_kit(kit_key)
+        if player is None:
             return await interaction.response.send_message(
                 "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
             )
-
-        player = queue.pop(index)
-        save_data("queue.json", queue)
 
         active_queues = load_data("active_queues.json", {})
         kit_name = active_queues.get(kit_key, {}).get("name", self.kit)
@@ -245,18 +290,7 @@ async def grant_pull_access(
 
     # Záznam vytaženého hráče (kvůli odebrání práv po /result a kvůli /skip) –
     # nový formát uloží i info o hráči (kit/ign), aby šel vrátit na konec fronty.
-    pulled = load_data("pulled_players.json", {})
-    pulled[str(player["id"])] = {
-        "channel": str(channel_id),
-        "player": {
-            "id": str(player.get("id", "")),
-            "username": player.get("username", ""),
-            "ign": player.get("ign", ""),
-            "kit": str(player.get("kit", "")),
-            "joinedAt": player.get("joinedAt", 0),
-        },
-    }
-    save_data("pulled_players.json", pulled)
+    await save_pulled_player(player, channel_id)
 
     if isinstance(channel, discord.TextChannel):
         try:
@@ -275,13 +309,13 @@ async def grant_pull_access(
     else:
         message = (
             f"⚠️ Hráč <@{player['id']}> byl vytažen z fronty, ale práva se nepovedlo "
-            "udělit (není hráč stále na serveru?). Do roomky přidám hráče hned, "
-            "jakmile server opět uvidí."
+            "udělit (není hráč stále na serveru?). Bot přístup automaticky nedoplní – "
+            "jakmile bude hráč na serveru, přidej ho ručně (např. přes /mktesterroom)."
         )
     await interaction.response.send_message(message, ephemeral=True)
 
 
-class PullChannelSelectView(discord.ui.View):
+class PullChannelSelectView(SafeView):
     """Select roomky pro /queue pull – stejný tok jako pull tlačítko na panelu."""
 
     def __init__(self, player: dict, kit_name: str):
@@ -304,13 +338,14 @@ class PullChannelSelectView(discord.ui.View):
             return
 
         # Hráče z fronty vyřadíme až teď, po výběru roomky (jako u tlačítka –
-        # kdyby tester roomku nevybral, hráč zůstane ve frontě).
-        queue = load_data("queue.json")
-        new_queue = [
-            p for p in queue if p.get("id") != self.player["id"]
-        ]
-        if len(new_queue) != len(queue):
-            save_data("queue.json", new_queue)
+        # kdyby tester roomku nevybral, hráč zůstane ve frontě). Odebrání je
+        # atomické: když hráče mezitím vyřadil někdo jiný (pull/leave/result),
+        # přístup se znovu neuděluje (žádný dvojitý pull).
+        removed = await remove_by_player_id(self.player["id"])
+        if not removed:
+            return await interaction.response.send_message(
+                "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
+            )
 
         await grant_pull_access(
             interaction,
@@ -386,7 +421,7 @@ def _find_player_tier(ign: str, kit: str) -> str | None:
     return None
 
 
-class HT3PanelView(discord.ui.View):
+class HT3PanelView(SafeView):
     def __init__(self):
         super().__init__(timeout=None)
         kits = get_kits() or list(DEFAULT_KITS)
@@ -421,7 +456,7 @@ class HT3PanelView(discord.ui.View):
         await interaction.response.send_modal(HT3Modal(selected_kit))
 
 
-class HT3Modal(discord.ui.Modal):
+class HT3Modal(SafeModal):
     def __init__(self, kit: str):
         super().__init__(title=f"HT3+ Ticket — {kit}")
         self.kit = kit
@@ -576,7 +611,7 @@ class HT3Modal(discord.ui.Modal):
 # ---------------------------------------------------------------------------
 # Turnaj: tlačítko Přihlásit se
 # ---------------------------------------------------------------------------
-class TournamentSignupView(discord.ui.View):
+class TournamentSignupView(SafeView):
     def __init__(self, kit_key: str):
         super().__init__(timeout=None)
         self.kit_key = kit_key
@@ -613,7 +648,7 @@ class TournamentSignupView(discord.ui.View):
 # ---------------------------------------------------------------------------
 # Tester roomka: tlačítko 🔒 Zavřít místnost (smaže kanál)
 # ---------------------------------------------------------------------------
-class TesterRoomView(discord.ui.View):
+class TesterRoomView(SafeView):
     """Tlačítko pro zavření tester roomky (vytvořené přes /mktesterroom)."""
 
     def __init__(self):

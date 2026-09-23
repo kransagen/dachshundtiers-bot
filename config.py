@@ -23,6 +23,23 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _int_list_env(name: str) -> list:
+    """Načte seznam ID z čárkou oddělené proměnné prostředí (neplatné prvky přeskočí)."""
+    raw = os.getenv(name)
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _dict_env(name: str, default: dict) -> dict:
     """Načte mapu "klíč -> ID" z JSON proměnné prostředí (hodnoty převede na int)."""
     raw = os.getenv(name)
@@ -143,6 +160,16 @@ def set_queue_channel_id(kit_key: str, channel_id: int) -> None:
 # --- Role testera ---------------------------------------------------------
 # Stačí, aby název role OBSAHOVAL tento řetězec (case-insensitive).
 TESTER_ROLE_FRAGMENT: str = os.getenv("TESTER_ROLE_FRAGMENT", "tester")
+
+# Bezpečnější allowlist testerů podle ID role (např. "111111,222222").
+# Když je nastaven, tester se pozná POUZE podle přesného ID role – fragment
+# testování podle názvu se ignoruje (žádná role se „testerem" v názvu navíc).
+TESTER_ROLE_IDS: list = _int_list_env("TESTER_ROLE_IDS")
+
+# Role, které smí používat admin příkazy (/addkit, /addtest, /setkitrole, …)
+# i bez Discord oprávnění Administrator. Když není nastaveno, chová se vše
+# stejně jako dřív (musí mít oprávnění Administrator).
+ADMIN_ROLE_IDS: list = _int_list_env("ADMIN_ROLE_IDS")
 
 # --- GitHub synchronizace (volitelné) --------------------------------------
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")

@@ -24,6 +24,30 @@ logging.basicConfig(
 log = logging.getLogger("dachshundtiers")
 
 
+class DachshundTiersTree(discord.app_commands.CommandTree):
+    """Fallback error handler pro VŠECHNY aplikace příkazů.
+
+    Lokální (cog-level ``cog_app_command_error``) handlery běží dál – tenhle
+    zachytí vše, co nikdo neošetřil, zaloguje to a hráči pošle hlášku místo
+    tichého selhání interakce.
+    """
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: discord.app_commands.AppCommandError,
+    ) -> None:
+        log.exception("Chyba v příkazu %s: %s", interaction.command, error)
+        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except (discord.HTTPException, discord.Forbidden) as err:
+            log.warning("Nelze odeslat chybovou hlášku: %s", err)
+
+
 class DachshundTiersBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -34,6 +58,7 @@ class DachshundTiersBot(commands.Bot):
         super().__init__(
             command_prefix="!",
             intents=intents,
+            tree_cls=DachshundTiersTree,
             allowed_mentions=discord.AllowedMentions(
                 everyone=True, users=True, roles=True
             ),

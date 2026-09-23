@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from config import set_queue_channel_id
 from storage import load_data
-from utils import add_kit, get_kits, has_tester_role, kit_autocomplete, remove_kit
+from utils import add_kit, get_kits, has_admin_role, has_tester_role, kit_autocomplete, remove_kit
 from views import HT3PanelView
 
 HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
@@ -45,10 +45,14 @@ class Kits(commands.Cog):
     # /addkit
     # ------------------------------------------------------------------
     @app_commands.command(name="addkit", description="Přidá nový kit do seznamu (HT3+ panel, turnaje)")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(kit="Název nového kitu (např. UHCMace)")
     @app_commands.autocomplete(kit=kit_autocomplete)
     async def addkit(self, interaction: discord.Interaction, kit: str) -> None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
         kit = kit.strip()
         if not kit:
             return await interaction.response.send_message(
@@ -72,10 +76,14 @@ class Kits(commands.Cog):
     # /removekit
     # ------------------------------------------------------------------
     @app_commands.command(name="removekit", description="Odebere kit ze seznamu (HT3+ panel, turnaje)")
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(kit="Název kitu k odebrání")
     @app_commands.autocomplete(kit=kit_autocomplete)
     async def removekit(self, interaction: discord.Interaction, kit: str) -> None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
         kit = kit.strip()
         if not remove_kit(kit):
             return await interaction.response.send_message(

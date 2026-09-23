@@ -19,19 +19,16 @@ Po `/result` se hráči automaticky dá role nového tieru a odeberou se ostatn�
 tier role stejného kitu.
 """
 
-import asyncio
-import base64
-import json
 import logging
 
 import discord
-import requests
 from discord import app_commands
 from discord.ext import commands
 
-from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN
+import github_sync
+from services.store import transaction
 from storage import load_data, save_data
-from utils import get_kits, has_tester_role, kit_autocomplete, today_cz
+from utils import get_kits, has_admin_role, has_tester_role, kit_autocomplete, today_cz
 
 log = logging.getLogger("dachshundtiers")
 
@@ -60,66 +57,6 @@ def _find_mode_key(modes: dict, kit_key_lower: str) -> str | None:
         if str(key).lower() == kit_key_lower:
             return key
     return None
-
-
-def _github_get_players() -> tuple[list | None, str | None]:
-    """Stáhne aktuální players.json z GitHubu (zdroj pravdy webu)."""
-    if not GITHUB_TOKEN:
-        return None, None
-    api = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-        f"/contents/{GITHUB_FILE_PATH}"
-    )
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    try:
-        response = requests.get(api, headers=headers, timeout=20)
-    except requests.RequestException as err:
-        log.warning("GitHub GET selhal v /checkweb: %s", err)
-        return None, None
-    if response.status_code == 200:
-        data = response.json()
-        try:
-            players = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
-            if isinstance(players, list):
-                return players, data.get("sha")
-        except (json.JSONDecodeError, ValueError):
-            return None, None
-    elif response.status_code != 404:
-        log.warning("GitHub GET selhal v /checkweb (%s)", response.status_code)
-        return None, None
-    return [], None
-
-
-def _github_push_players(players: list, sha: str | None) -> tuple[bool, str]:
-    """Pošle celý players.json na GitHub přes Contents API."""
-    if not GITHUB_TOKEN:
-        return False, "⚠️ GITHUB_TOKEN není nastaven – uloženo jen lokálně (web se nezmění)."
-    api = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
-        f"/contents/{GITHUB_FILE_PATH}"
-    )
-    headers = {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-    body = {
-        "message": "checkweb: synchronizace tieru na web",
-        "content": base64.b64encode(
-            json.dumps(players, ensure_ascii=False, indent=2).encode("utf-8")
-        ).decode("ascii"),
-    }
-    if sha:
-        body["sha"] = sha
-    try:
-        response = requests.put(api, headers=headers, json=body, timeout=20)
-    except requests.RequestException as err:
-        return False, f"❌ GitHub zápis selhal: {err}"
-    if response.status_code in (200, 201):
-        return True, "✅ players.json synchronizováno na GitHub – web je aktuální."
-    return False, f"❌ GitHub zápis selhal ({response.status_code})"
 
 
 async def auto_grant_kit_role(
@@ -197,7 +134,6 @@ class Roles(commands.Cog):
         name="setkitrole",
         description="Namapuje roli tieru pro kit (rozdává se po /result)",
     )
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
         kit="Název kitu (např. MolePVP)",
         tier="Tier (např. S, A, B)",
@@ -211,6 +147,11 @@ class Roles(commands.Cog):
         tier: str,
         role: discord.Role,
     ) -> None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
         kit_name = kit.strip()
         kit_key = kit_name.lower()
         tier_up = tier.strip().upper()
@@ -219,10 +160,13 @@ class Roles(commands.Cog):
                 "❌ Zadej platný název kitu a tieru.", ephemeral=True
             )
 
-        roles_map = load_data(KIT_ROLES_FILE, {})
-        kit_map = roles_map.setdefault(kit_key, {})
-        kit_map[tier_up] = str(role.id)
-        save_data(KIT_ROLES_FILE, roles_map)
+        async def _run(tx):
+            roles_map = tx.get(KIT_ROLES_FILE, {})
+            kit_map = roles_map.setdefault(kit_key, {})
+            kit_map[tier_up] = str(role.id)
+            tx.set(KIT_ROLES_FILE, roles_map)
+
+        await transaction((KIT_ROLES_FILE,), _run)
 
         await interaction.response.send_message(
             f"✅ Role **{role.mention}** je namapovaná na kit **{kit_name}** — "
@@ -236,7 +180,6 @@ class Roles(commands.Cog):
         name="unsetkitrole",
         description="Zruší mapování role tieru pro kit",
     )
-    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
         kit="Název kitu (např. MolePVP)",
         tier="Tier (např. S, A, B)",
@@ -248,22 +191,32 @@ class Roles(commands.Cog):
         kit: str,
         tier: str,
     ) -> None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
         kit_key = kit.strip().lower()
         tier_up = tier.strip().upper()
-        roles_map = load_data(KIT_ROLES_FILE, {})
-        kit_map = roles_map.get(kit_key, {})
 
-        if tier_up not in kit_map:
+        async def _run(tx):
+            roles_map = tx.get(KIT_ROLES_FILE, {})
+            kit_map = roles_map.get(kit_key, {})
+            if tier_up not in kit_map:
+                return False
+            del kit_map[tier_up]
+            if not kit_map:
+                roles_map.pop(kit_key, None)
+            tx.set(KIT_ROLES_FILE, roles_map)
+            return True
+
+        removed = await transaction((KIT_ROLES_FILE,), _run)
+        if not removed:
             return await interaction.response.send_message(
                 f"❌ Pro kit **{kit.strip()}** a tier **{tier_up}** žádné "
                 "mapování není.",
                 ephemeral=True,
             )
-
-        del kit_map[tier_up]
-        if not kit_map:
-            roles_map.pop(kit_key, None)
-        save_data(KIT_ROLES_FILE, roles_map)
 
         await interaction.response.send_message(
             f"🗑️ Mapování role pro kit **{kit.strip()}** (tier **{tier_up}**) "
@@ -347,98 +300,135 @@ class Roles(commands.Cog):
 
         # 3) Aktuální webová data: nejlépe přímo z GitHubu (zdroj pravdy),
         #    jinak lokální kopie players.json.
-        players, sha = await asyncio.to_thread(_github_get_players)
+        players, _, _ = await github_sync.fetch_players()
         source = "GitHub"
         if players is None:
             players = load_data("players.json") or []
             source = "lokální kopie"
 
-        # 4) Pro každý kit projdeme členy s tier rolí; chybějící / změněné
-        #    tiery zapíšeme do players.json (modes + history s dnešním datem).
+        # 4) Merge funkce: pro každý kit projde členy s tier rolí a chybějící /
+        #    změněné tiery zapíše do seznamu hráčů (modes + history s dnešním
+        #    datem). Volá se na webovém snapshotu a znovu po každém konfliktu
+        #    (409) při push – proto je čistá a počítadla drží ve merge_state.
         today = today_cz()
-        summary = []
-        changes = []
-        total_checked = 0
-        total_added = 0
-        total_updated = 0
-        total_ok = 0
+        merge_state: dict = {}
 
-        for kit_key, tier_map in roles_map.items():
-            kit_key = (kit_key or "").strip().lower()
-            if not kit_key or not isinstance(tier_map, dict) or not tier_map:
-                continue
-            kit_name = kit_display.get(kit_key, kit_key.capitalize())
+        def _merge(fresh_players: list) -> list:
+            merge_state.clear()
+            out = [dict(p) for p in (fresh_players or [])]
+            summary_local = []
+            changes_local = []
+            checked = 0
+            added_total = 0
+            updated_total = 0
+            ok_total = 0
 
-            kit_roles = []
-            for tier, role_id in tier_map.items():
-                rid = str(role_id)
-                if not rid.isdigit():
+            for kit_key, tier_map in roles_map.items():
+                kit_key = (kit_key or "").strip().lower()
+                if not kit_key or not isinstance(tier_map, dict) or not tier_map:
                     continue
-                role_obj = guild.get_role(int(rid))
-                if role_obj is not None:
-                    kit_roles.append((role_obj, str(tier).strip().upper() or str(tier)))
-            if not kit_roles:
-                continue
+                kit_name = kit_display.get(kit_key, kit_key.capitalize())
 
-            added = updated = ok = 0
-            for member in members:
-                held = [
-                    tier for role_obj, tier in kit_roles if role_obj in member.roles
-                ]
-                if not held:
-                    continue
-                total_checked += 1
-
-                player = _match_web_player(players, member)
-                if player is None:
-                    username = (member.display_name or member.name).strip() or member.name
-                    players.append(
-                        {
-                            "username": username,
-                            "modes": {kit_name: held[0]},
-                            "history": {
-                                kit_name: [{"date": today, "tier": held[0]}]
-                            },
-                        }
-                    )
-                    added += 1
-                    changes.append(f"➕ **{kit_name}** – {username} (**{held[0]}**)")
+                kit_roles = []
+                for tier, role_id in tier_map.items():
+                    rid = str(role_id)
+                    if not rid.isdigit():
+                        continue
+                    role_obj = guild.get_role(int(rid))
+                    if role_obj is not None:
+                        kit_roles.append((role_obj, str(tier).strip().upper() or str(tier)))
+                if not kit_roles:
                     continue
 
-                player.setdefault("modes", {})
-                player.setdefault("history", {})
-                mode_key = _find_mode_key(player["modes"], kit_key) or kit_name
-                existing = player["modes"].get(mode_key)
-                if existing and str(existing).strip().upper() == held[0]:
-                    ok += 1
-                    continue
+                added = updated = ok = 0
+                for member in members:
+                    held = [
+                        tier for role_obj, tier in kit_roles if role_obj in member.roles
+                    ]
+                    if not held:
+                        continue
+                    checked += 1
 
-                player["modes"][mode_key] = held[0]
-                player["history"].setdefault(mode_key, [])
-                player["history"][mode_key].append({"date": today, "tier": held[0]})
-                if existing:
-                    updated += 1
-                    changes.append(
-                        f"✏️ **{kit_name}** – {player.get('username', member.display_name)}: "
-                        f"{existing} → **{held[0]}**"
-                    )
-                else:
-                    added += 1
-                    changes.append(
-                        f"➕ **{kit_name}** – {player.get('username', member.display_name)} "
-                        f"(**{held[0]}**)"
-                    )
+                    player = _match_web_player(out, member)
+                    if player is None:
+                        username = (member.display_name or member.name).strip() or member.name
+                        out.append(
+                            {
+                                "username": username,
+                                "modes": {kit_name: held[0]},
+                                "history": {
+                                    kit_name: [{"date": today, "tier": held[0]}]
+                                },
+                            }
+                        )
+                        added += 1
+                        changes_local.append(
+                            f"➕ **{kit_name}** – {username} (**{held[0]}**)"
+                        )
+                        continue
 
-            total_added += added
-            total_updated += updated
-            total_ok += ok
-            summary.append(
-                f"• **{kit_name}**: ✅ {ok} · ➕ {added} · ✏️ {updated}"
+                    player.setdefault("modes", {})
+                    player.setdefault("history", {})
+                    mode_key = _find_mode_key(player["modes"], kit_key) or kit_name
+                    existing = player["modes"].get(mode_key)
+                    if existing and str(existing).strip().upper() == held[0]:
+                        ok += 1
+                        continue
+
+                    player["modes"][mode_key] = held[0]
+                    player["history"].setdefault(mode_key, [])
+                    player["history"][mode_key].append({"date": today, "tier": held[0]})
+                    if existing:
+                        updated += 1
+                        changes_local.append(
+                            f"✏️ **{kit_name}** – {player.get('username', member.display_name)}: "
+                            f"{existing} → **{held[0]}**"
+                        )
+                    else:
+                        added += 1
+                        changes_local.append(
+                            f"➕ **{kit_name}** – {player.get('username', member.display_name)} "
+                            f"(**{held[0]}**)"
+                        )
+
+                added_total += added
+                updated_total += updated
+                ok_total += ok
+                summary_local.append(
+                    f"• **{kit_name}**: ✅ {ok} · ➕ {added} · ✏️ {updated}"
+                )
+
+            merge_state.update(
+                summary=summary_local,
+                changes=changes_local,
+                total_checked=checked,
+                total_added=added_total,
+                total_updated=updated_total,
+                total_ok=ok_total,
             )
+            return out
 
-        # 5) Uložení lokálně + push na GitHub (web)
-        save_data("players.json", players)
-        _, gh_msg = await asyncio.to_thread(_github_push_players, players, sha)
+        # 5) Sloučení na výchozím snapshotu + lokální uložení + push na GitHub.
+        #    Při konfliktu (409) se merge znovu aplikuje na čerstvá webová data
+        #    a PUT se zopakuje (vše serializované, viz github_sync.py).
+        merged = _merge(players)
+        save_data("players.json", merged)
+        gh_ok, gh_msg, last_built = await github_sync.push_players(
+            "checkweb: synchronizace tieru na web",
+            _merge,
+            success_message="✅ players.json synchronizováno na GitHub – web je aktuální.",
+        )
+        if gh_ok and last_built is not None:
+            save_data("players.json", last_built)
+
+        # Počítadla a změny z posledního běhu merge (odpovídají tomu, co je
+        # teď na webu / v lokálním souboru).
+        summary = merge_state["summary"]
+        changes = merge_state["changes"]
+        total_checked = merge_state["total_checked"]
+        total_added = merge_state["total_added"]
+        total_updated = merge_state["total_updated"]
+        total_ok = merge_state["total_ok"]
 
         embed = discord.Embed(
             title="🔎 /checkweb – synchronizace tierů na web",

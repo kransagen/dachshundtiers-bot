@@ -43,6 +43,25 @@ HT3_COOLDOWNS_FILE = "ht3_cooldowns.json"
 STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
 
+# Typ ticketu: HT3+ eval tickety (vytváří HT3 panel) versus HT Fight tickety
+# (pro /topresult). Běžný HT3 panel zakládá tickety typu ``eval``; HT Fight
+# tickety zatím nevytváří žádný cog – pole slouží jako jednoznačný identifikátor
+# pro validaci /topresult („verify the ticket is an HT Fight ticket").
+TICKET_TYPE_EVAL = "eval"
+TICKET_TYPE_FIGHT = "fight"
+
+
+def get_ticket_type(ticket: dict) -> str:
+    """Typ ticketu (``eval`` | ``fight``); staré záznamy bez pole = ``eval``."""
+    if not isinstance(ticket, dict):
+        return TICKET_TYPE_EVAL
+    return ticket.get("ticketType") or TICKET_TYPE_EVAL
+
+
+def is_ht_fight_ticket(ticket: dict) -> bool:
+    """Je ticket HT Fight ticket? (pouze takové akceptuje /topresult)"""
+    return get_ticket_type(ticket) == TICKET_TYPE_FIGHT
+
 # ---------------------------------------------------------------------------
 # HT3+ ticket žebříček a pomocné funkce tierů (přesunuto z views.py – testovatelné)
 # ---------------------------------------------------------------------------
@@ -156,6 +175,7 @@ def make_ticket(
     eval_ok: bool,
     category_id: int,
     panel_message_id=None,
+    ticket_type: str = TICKET_TYPE_EVAL,
     now: int,
 ) -> dict:
     """Sestaví nový ticket (bez zápisu)."""
@@ -174,6 +194,7 @@ def make_ticket(
         "members": [],
         "categoryId": category_id,
         "panelMessageId": str(panel_message_id) if panel_message_id else None,
+        "ticketType": ticket_type or TICKET_TYPE_EVAL,
         "createdAt": now,
         "closedAt": None,
     }
@@ -194,6 +215,7 @@ async def create_ticket(
     eval_ok: bool,
     category_id: int,
     panel_message_id=None,
+    ticket_type: str = TICKET_TYPE_EVAL,
     now: int,
 ) -> dict:
     """Transakčně vytvoří ticket (prevence duplicit uvnitř kritického úseku).
@@ -232,6 +254,7 @@ async def create_ticket(
             eval_ok=eval_ok,
             category_id=category_id,
             panel_message_id=panel_message_id,
+            ticket_type=ticket_type,
             now=now,
         )
         tickets[channel_id] = ticket

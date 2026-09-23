@@ -1,268 +1,361 @@
-"""Žebříček top výsledků – /topresult (čistá logika, bez discord.py).
+"""HT Fight výsledky – /topresult (čistá logika, bez discord.py).
 
-Žádná druhá databáze: žebříček se počítá VŽDY z kanonické ``data/players.json``
-(jediný zdroj pravdy). Historie výsledků (``ht_results.json``) se k němu
-nepřímo vztahuje jen přes kanonická data, která zapisuje, ale nic dalšího
-udržovat nepotřebuje.
+``/topresult`` je specializovaná verze ``/result`` pro HT Fighty: vytvoří
+veřejný výsledek HT Fightu v určeném kanálu a zapinguje nakonfigurovanou roli.
+NENÍ to žebříček a nepočítá žádné „top" hráče.
 
-Řazení používá skutečnou tier hierarchii projektu (``HT3_TIER_LADDER``
-z services/tickets):
+Klíčové vlastnosti:
+  - záznam jde do STEJNÉ kanonické historie výsledků jako /result
+    (``data/ht_results.json``, append-only) s ``resultType: "ht_fight"`` —
+    žádná samostatná databáze (žádný topresults.json),
+  - **nikdy nemění tier hráče** (players.json se nedotýká): /topresult výsledek
+    jen zaznamenává a publikuje, změna tieru jde vždy přes /result a HT Fight
+    pravidla, která definují změnu tieru, zatím v projektu neexistují,
+  - idempotence pro HT Fight ticket: klíč ``{ticketId}:ht_fight`` — druhé
+    odeslání vrátí ``duplicate`` a nic nepošle dvakrát,
+  - validace: HT tier ze žebříčku (bez virtuálního LT3E), skóre ``0-4``
+    (``^\d+-\d+$``), status tieru neprázdný, kit registrovaný,
+  - formát zprávy přesně zachovává styl používaný na serveru:
 
-    LT5 < HT5 < LT4 < HT4 < LT3 < LT3+eval < HT3 < LT2 < HT2 < LT1 < HT1
+        <@HRAC> - <IGN> - **<STATUS>** - <KIT>
 
-Pořadí hráče je dané jeho **nejlepším tierem** napříč kity:
-  1. nejlepší tier (vyšší v žebříčku = lepší),
-  2. počet kitů s tímto nejlepším tierem,
-  3. celkový počet tier záznamů,
-  4. username (abecedně, case-insensitive).
+        **<HT_TIER> Fighty:**
+        > <vyhrál|prohrál> <SKÓRE> <@SOUPER>
 
-Varianty záznamů se normalizují („LT3 EVAL" → LT3E atd.). Tiery mimo žebříček
-(turnajové S/A/B, R-tiery jako RLT2) se neskórují – takoví hráči se
-v žebříčku neobjeví (jsou ve ``excluded``) a zobrazí se jen v přehledu.
-Nechceme si vymýšlet pořadí, které hierarchie nezná.
+        <@&ROLE>
 
-Filtry: ``tier`` (nejlepší tier = přesně tento tier), ``limit`` (velikost
-stránky) a ``page`` (číslování stránek – paginace „pokud je potřeba",
-přes page parametry).
+Žádná závislost na discord.py → snadné testy.
 """
 
-import math
+import logging
+import re
+import time
 
-from services.tickets import HT3_TIER_LADDER
+from services.results import (
+    HT_RESULTS_FILE,
+    make_result,
+    normalize_tier,
+)
+from services.store import read as store_read, transaction
+from services.tickets import (
+    HT3_TIER_LADDER,
+    HT_TICKETS_FILE,
+    STATUS_OPEN,
+    is_ht_fight_ticket,
+)
 
-# Normalizace známých variant zápisu tierů (před řazením).
-TIER_ALIASES = {
-    "LT3 EVAL": "LT3E",
-    "LT3 EVALUATION": "LT3E",
-    "LT3+EVAL": "LT3E",
-}
+log = logging.getLogger("dachshundtiers")
 
-# Displejové názvy tierů (pro embed).
-TIER_DISPLAY = {"LT3E": "LT3 + eval"}
+# --- Konstanty --------------------------------------------------------------
 
-DEFAULT_LIMIT = 10
-MAX_LIMIT = 25
+# HT Fight tier musí být reálný tier ze žebříčku; virtuální status LT3E (eval)
+# není fight tier.
+HT_FIGHT_TIERS = tuple(t for t in HT3_TIER_LADDER if t != "LT3E")
 
+# Idempotentní klíč HT Fight výsledku uvnitř ticketu: ticketId + result_type.
+HT_FIGHT_TICKET_KEY_SUFFIX = ":ht_fight"
+# Klíč HT Fight výsledku mimo ticket (unikatní podle času zápisu).
+HT_FIGHT_RESULT_PREFIX = "htfight-"
 
-def normalize_tier(value) -> str:
-    """Normalizuje tier (velikost písmen, whitespace, známé aliasy)."""
-    raw = value
-    if raw is None:
-        return ""
-    s = str(raw).strip().upper()
-    return TIER_ALIASES.get(s, s)
+# Skóre ve formátu používaném serverem: "0-4" (body hráče - body soupeře).
+# Nepovolujeme "abc", "4", "4-", "-4" ani "4-x".
+SCORE_RE = re.compile(r"^\d+-\d+$")
 
+MAX_STATUS_LEN = 64
 
-def tier_display(value) -> str:
-    """Displejový název tieru („LT3E" → „LT3 + eval")."""
-    t = normalize_tier(value)
-    return TIER_DISPLAY.get(t, t)
-
-
-def tier_rank(value):
-    """Index tieru v žebříčku (0 = nejhorší) nebo None, když není v žebříčku."""
-    t = normalize_tier(value)
-    if t in HT3_TIER_LADDER:
-        return HT3_TIER_LADDER.index(t)
-    return None
-
-
-def validate_filter_tier(value) -> str | None:
-    """Ověří filtr ``tier:...`` – vrací normalizovaný tier, nebo None (neplatný)."""
-    t = normalize_tier(value)
-    return t if t in HT3_TIER_LADDER else None
+_MSG_BAD_SCORE = (
+    "❌ Neplatné skóre `{score}`! Povolený formát je např. **0-4** "
+    "(body hráče – body soupeře, bez mezer)."
+)
+_MSG_BAD_TIER = (
+    "❌ Neplatný HT tier `{fight_tier}`. Platné HT Fight tiery: "
+    + ", ".join(f"**{t}" for t in HT_FIGHT_TIERS)
+    + "."
+)
 
 
-def _clean_players(players) -> list:
-    """Kanonická players.json bez poškozených záznamů (objekt s username)."""
-    out = []
-    for p in (players or []):
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# Validace (čisté funkce)
+# ---------------------------------------------------------------------------
+def validate_ht_fight_score(score: str) -> tuple[bool, str]:
+    """Validace skóre HT Fightu: ``0-4`` (dvě čísla spojená pomlčkou)."""
+    raw = (score or "").strip()
+    if not SCORE_RE.match(raw):
+        return False, _MSG_BAD_SCORE.format(score=(score or "").strip())
+    return True, ""
+
+
+def validate_ht_fight_tier(fight_tier: str) -> tuple[bool, str]:
+    """Validace HT Fight tieru: reálný tier ze žebříčku (bez LT3E)."""
+    t = normalize_tier(fight_tier)
+    if t not in HT_FIGHT_TIERS:
+        return False, _MSG_BAD_TIER.format(fight_tier=(fight_tier or "").strip())
+    return True, ""
+
+
+def validate_ht_fight_status(tier_status: str) -> tuple[bool, str]:
+    """Status tieru („Zůstává Low Tier 3", …) – neprázdný a krátký."""
+    s = (tier_status or "").strip()
+    if not s or len(s) > MAX_STATUS_LEN:
+        return (
+            False,
+            "❌ Neplatný status tieru – zadej krátký text, např. "
+            "**Zůstává Low Tier 3** (max. 64 znaků).",
+        )
+    return True, ""
+
+
+def validate_ht_fight_outcome(outcome: str) -> tuple[bool, str]:
+    """Výsledek hráče: Won (hráč vyhrál) / Lost (hráč prohrál)."""
+    o = (outcome or "").strip().upper()
+    if o not in ("WON", "LOST"):
+        return False, "❌ Neplatný výsledek zápasu – použij **vyhrál** nebo **prohrál**."
+    return True, ""
+
+
+def is_registered_kit(kit: str, kits) -> bool:
+    """Je kit v registrovaném seznamu (case-insensitive)?"""
+    key = (kit or "").strip().lower()
+    if not key:
+        return False
+    return any(str(k).strip().lower() == key for k in (kits or []))
+
+
+def validate_topresult_config(channel_id, role_id) -> tuple[bool, str]:
+    """Ověří konfiguraci /topresult (kanál + role). 0/missing = chyba."""
+    if not channel_id or not role_id:
+        return (
+            False,
+            "❌ Chybí konfigurace **/topresult**: nastav `TOP_RESULT_CHANNEL_ID` "
+            "a `TOP_RESULT_ROLE_ID` v .env (viz `.env.example`).",
+        )
+    return True, ""
+
+
+def ht_fight_outcome_display(outcome: str) -> str:
+    """Displejové sloveso výsledku: Won → „vyhrál", Lost → „prohrál"."""
+    o = (outcome or "").strip().upper()
+    return {"WON": "vyhrál", "LOST": "prohrál"}.get(o, (outcome or "").strip())
+
+
+# ---------------------------------------------------------------------------
+# Formát zprávy (přesně zachovává styl serveru)
+# ---------------------------------------------------------------------------
+def format_topresult_message(
+    *,
+    player_id,
+    ign: str,
+    tier_status: str,
+    kit: str,
+    fight_tier: str,
+    outcome: str,
+    score: str,
+    opponent_id,
+    role_id,
+) -> str:
+    """Sestaví text HT Fight výsledku (včetně role mentionu ``<@&id>``).
+
+    Příklad:
+
+        <@1419031701920940163> - mendu__ - **Zůstává Low Tier 3** - MolePVP
+
+        **HT3 Fighty:**
+        > prohrál 0-4 <@1018169843347882076>
+
+        <@&1523984977371594772>
+    """
+    return "\n".join(
+        [
+            f"<@{player_id}> - {ign} - **{tier_status}** - {kit}",
+            "",
+            f"**{normalize_tier(fight_tier)} Fighty:**",
+            f"> {ht_fight_outcome_display(outcome)} {score} <@{opponent_id}>",
+            "",
+            f"<@&{role_id}>",
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Čtení aktuálního tieru hráče (jen pro kontext záznamu, nikdy se nemění)
+# ---------------------------------------------------------------------------
+def find_player_tier_in(players, ign: str, kit: str) -> str | None:
+    """Tier hráče (IGN+kit) v daném seznamu hráčů, nebo None."""
+    if not isinstance(players, list):
+        return None
+    ign_key = (ign or "").strip().lower()
+    for p in players:
         if not isinstance(p, dict):
             continue
-        if not str(p.get("username", "") or "").strip():
+        if str(p.get("username", "")).strip().lower() != ign_key:
             continue
-        out.append(p)
-    return out
-
-
-def _sort_key(entry: dict) -> tuple:
-    return (
-        -entry["best_rank"],
-        -entry["best_kits_count"],
-        -entry["total"],
-        str(entry["username"]).lower(),
-    )
-
-
-def build_ranking(players) -> dict:
-    """Sestaví žebříček z kanonické players.json (nic nemění).
-
-    Vrací::
-        {
-          "ranked": [
-              {"username", "best_tier", "best_tier_display", "best_rank",
-               "best_kits", "best_kits_count", "total",
-               "kits": {kit: tier},  # normalizované tiery hráče
-               "rank": int},
-              ...
-          ],
-          "excluded": [username, ...],  # jen tiery mimo žebříček
-          "total_players": int,
-          "total_ranked": int,
-        }
-    """
-    players = _clean_players(players)
-    entries = []
-    excluded = []
-    for p in players:
-        username = str(p.get("username", "") or "").strip()
-        modes = p.get("modes") if isinstance(p.get("modes"), dict) else {}
-        kits = {}
-        for kit, tier in modes.items():
-            t = normalize_tier(tier) if tier else None
-            if t:
-                kits[str(kit).strip()] = t
-
-        ranked_kits = {
-            k: t for k, t in kits.items() if tier_rank(t) is not None
-        }
-        if not ranked_kits:
-            excluded.append(username)
-            continue
-
-        best_rank = max(tier_rank(t) for t in ranked_kits.values())
-        best_tier = HT3_TIER_LADDER[best_rank]
-        best_kits = sorted(
-            k for k, t in ranked_kits.items() if tier_rank(t) == best_rank
-        )
-        entries.append(
-            {
-                "username": username,
-                "best_tier": best_tier,
-                "best_tier_display": TIER_DISPLAY.get(best_tier, best_tier),
-                "best_rank": best_rank,
-                "best_kits": best_kits,
-                "best_kits_count": len(best_kits),
-                "total": len(ranked_kits),
-                # Všechny kity hráče (i turnajové S/A nebo R-tiery mimo
-                # žebříček) – pro zobrazení per-hráče; řazení je jen z ladderu.
-                "kits": dict(sorted(kits.items(), key=lambda kv: str(kv[0]).lower())),
-                "rank": 0,
-            }
-        )
-
-    entries.sort(key=_sort_key)
-    # Stejné skóre (nejlepší tier + počet kitů + počet záznamů) → stejné místo;
-    # v rámci skupiny rozhoduje abeceda, další pokračuje hned za nimi.
-    rank = 0
-    prev_key = None
-    for idx, entry in enumerate(entries, start=1):
-        key = _sort_key(entry)[:3]
-        if key != prev_key:
-            rank = idx
-            prev_key = key
-        entry["rank"] = rank
-
-    return {
-        "ranked": entries,
-        "excluded": sorted(set(excluded), key=str.lower),
-        "total_players": len(players),
-        "total_ranked": len(entries),
-    }
-
-
-def filter_by_tier(entries: list, tier: str) -> list:
-    """Filtruje seřazené hráče na ty s nejlepším tierem == ``tier``.
-
-    ``tier`` musí projít ``validate_filter_tier`` (jinak vyvolá ValueError).
-    """
-    t = validate_filter_tier(tier)
-    if t is None:
-        raise ValueError(
-            f"❌ Neplatný tier `{tier}`. Platné hodnoty: "
-            f"{', '.join(HT3_TIER_LADDER)} (např. HT3, LT2)."
-        )
-    return [e for e in entries if e["best_tier"] == t]
-
-
-def paginate(entries: list, limit: int = None, page: int = 1) -> dict:
-    """Paginace seřazených záznamů („pokud je potřeba").
-
-    Vrací::
-        {"items": [...], "limit": int, "page": int, "total_pages": int,
-         "total": int, "start": int, "end": int}
-    """
-    limit = int(limit) if limit is not None else DEFAULT_LIMIT
-    limit = min(max(limit, 1), MAX_LIMIT)
-    total = len(entries)
-    total_pages = max(1, math.ceil(total / limit)) if total else 1
-    page = min(max(int(page or 1), 1), total_pages)
-    start = (page - 1) * limit
-    end = start + limit
-    return {
-        "items": entries[start:end],
-        "limit": limit,
-        "page": page,
-        "total_pages": total_pages,
-        "total": total,
-        "start": start,
-        "end": end,
-    }
-
-
-def find_player(players, names) -> dict | None:
-    """Najde hráče v players.json podle více kandidátů (case-insensitive).
-
-    ``names`` = discord jména člena (display_name, name, nick, ...).
-    """
-    candidates = {
-        str(n).strip().lower() for n in (names or []) if str(n or "").strip()
-    }
-    if not candidates:
-        return None
-    for p in _clean_players(players):
-        if str(p.get("username", "")).strip().lower() in candidates:
-            return p
+        modes = p.get("modes")
+        if not isinstance(modes, dict):
+            return None
+        tier = modes.get(kit)
+        return normalize_tier(tier) if tier else None
     return None
 
 
-def player_summary(ranking: dict, player: dict) -> dict:
-    """Souhrn jednoho hráče pro /topresult @player.
+# ---------------------------------------------------------------------------
+# Záznam HT Fight výsledku (transakčně, do kanonické historie)
+# ---------------------------------------------------------------------------
+async def record_ht_fight(
+    *,
+    ticket_id=None,
+    player_id: str,
+    player_name: str = "",
+    ign: str,
+    evaluator_id: str,
+    evaluator_name: str = "",
+    kit: str,
+    fight_tier: str,
+    score: str,
+    outcome: str,
+    opponent_id: str,
+    opponent_name: str = "",
+    tier_status: str,
+    notes: str = None,
+    now: int = None,
+    date: str = "",
+) -> dict:
+    """Zapíše HT Fight výsledek atomicky do ``data/ht_results.json``.
 
-    Vrací: username, rank (None = mimo žebříček), best_tier, total,
-           kits (setříděné od nejlepšího tieru), excluded (bool).
+    Na rozdíl od ``record_result`` (z /result) se při /topresult **nikdy**
+    nemění players.json, cooldowny ani se nezavírá ticket – jde čistě o záznam
+    + publikaci. Tier změna HT Fightu by musela projít kanonickou logikou
+    /result (v projektu zatím neexistuje, viz README).
+
+    ``ticket_id`` (ID kanálu HT Fight ticketu) → výsledek se propojí
+    s ticketem a idempotentně klíčuje jako ``{ticketId}:ht_fight``:
+    - ticket musí existovat, být otevřený a **typem** HT Fight ticket,
+    - hráč musí být vlastníkem, kit musí sedět,
+    - druhé odeslání vrátí ``duplicate`` s existujícím záznamem.
+
+    ``ticket_id=None`` → volný HT Fight výsledek (klíč ``htfight-{hráč}-{čas}``),
+    žádná deduplikace (každý zápas je samostatný).
+
+    Vrací:
+      - ``{"result": "created", "record": {...}, "previous_tier": ...}``
+      - ``{"result": "duplicate", "existing": {...}}``
+      - ``{"result": "not_found"}`` / ``{"result": "not_fight_ticket", "ticket"}``
+      - ``{"result": "ticket_closed", "ticket"}``
+      - ``{"result": "wrong_player", "ticket"}`` / ``{"result": "wrong_kit", "ticket"}``
+      - ``{"result": "invalid_*", "message": ...}``
     """
-    username = str(player.get("username", "") or "").strip()
-    entry = next(
-        (e for e in ranking["ranked"] if e["username"].lower() == username.lower()),
-        None,
-    )
-    if entry is not None:
-        kits = sorted(
-            entry["kits"].items(),
-            key=lambda kv: (tier_rank(kv[1]) is None, -(tier_rank(kv[1]) or -1)),
-        )
+    if now is None:
+        now = _now_ms()
+    player_id = str(player_id)
+    evaluator_id = str(evaluator_id)
+    score_clean = (score or "").strip()
+    status_clean = (tier_status or "").strip()
+    outcome_clean = "Won" if (outcome or "").strip().upper() == "WON" else "Lost"
+
+    # Základní validace (rychlá, před transakcí) ---------------------------------
+    if not player_id or not (ign or "").strip() or not (kit or "").strip():
         return {
-            "username": username,
-            "rank": entry["rank"],
-            "best_tier": entry["best_tier"],
-            "best_tier_display": entry["best_tier_display"],
-            "total": entry["total"],
-            "kits": [(k, TIER_DISPLAY.get(v, v)) for k, v in kits],
-            "excluded": False,
+            "result": "invalid_argument",
+            "message": "❌ Hráč, IGN a kit jsou povinné.",
         }
-    # Hráč je v players.json, ale nemá žádný tier ze žebříčku.
-    modes = player.get("modes") if isinstance(player.get("modes"), dict) else {}
-    kits = sorted(
-        ((str(k).strip(), tier_display(v)) for k, v in modes.items() if v),
-        key=lambda kv: str(kv[0]).lower(),
-    )
-    return {
-        "username": username,
-        "rank": None,
-        "best_tier": None,
-        "best_tier_display": None,
-        "total": len(kits),
-        "kits": kits,
-        "excluded": True,
-    }
+    ok, msg = validate_ht_fight_tier(fight_tier)
+    if not ok:
+        return {"result": "invalid_tier", "message": msg}
+    ok, msg = validate_ht_fight_score(score_clean)
+    if not ok:
+        return {"result": "invalid_score", "message": msg}
+    ok, msg = validate_ht_fight_outcome(outcome)
+    if not ok:
+        return {"result": "invalid_outcome", "message": msg}
+    ok, msg = validate_ht_fight_status(status_clean)
+    if not ok:
+        return {"result": "invalid_status", "message": msg}
+
+    files = [HT_RESULTS_FILE, "players.json"]
+    if ticket_id is not None:
+        files.append(HT_TICKETS_FILE)
+
+    async def _run(tx):
+        results = tx.get(HT_RESULTS_FILE, {})
+
+        if ticket_id is not None:
+            tid = str(ticket_id)
+            key = f"{tid}{HT_FIGHT_TICKET_KEY_SUFFIX}"
+            existing = results.get(key)
+            if existing is not None:
+                return {"result": "duplicate", "existing": existing}
+
+            tickets = tx.get(HT_TICKETS_FILE, {})
+            ticket = tickets.get(tid)
+            if ticket is None:
+                return {"result": "not_found"}
+            if not is_ht_fight_ticket(ticket):
+                return {"result": "not_fight_ticket", "ticket": ticket}
+            if ticket.get("status") != STATUS_OPEN:
+                return {"result": "ticket_closed", "ticket": ticket}
+            if str(ticket.get("ownerId", "")) != player_id:
+                return {"result": "wrong_player", "ticket": ticket}
+            if str(ticket.get("kit", "")).strip().lower() != str(kit).strip().lower():
+                return {"result": "wrong_kit", "ticket": ticket}
+            result_id = key
+        else:
+            result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
+
+        # Tier hráče v čase zápasu – JEN kontext záznamu (players.json se
+        # nezmění – /topresult žádnou změnu tieru nedělá).
+        players = tx.get("players.json", [])
+        previous = find_player_tier_in(players, ign, kit) or "N/A"
+
+        record = make_result(
+            result_id=result_id,
+            kind="ht_fight",
+            ticket_id=str(ticket_id) if ticket_id is not None else None,
+            player_id=player_id,
+            player_name=player_name,
+            ign=ign,
+            evaluator_id=evaluator_id,
+            evaluator_name=evaluator_name,
+            kit=kit,
+            previous_tier=previous,
+            new_tier="",  # žádná změna tieru
+            display_tier="",
+            score=score_clean,
+            outcome=outcome_clean,
+            notes=notes,
+            eval_flag=False,
+            now=now,
+            date=date,
+            result_type="ht_fight",
+            fight_tier=fight_tier,
+            tier_status=status_clean,
+            opponent_id=str(opponent_id) if opponent_id else None,
+            opponent_name=opponent_name,
+        )
+        results[result_id] = record
+        tx.set(HT_RESULTS_FILE, results)
+
+        return {"result": "created", "record": record, "previous_tier": previous}
+
+    return await transaction(tuple(files), _run)
+
+
+# ---------------------------------------------------------------------------
+# Čtení HT Fight výsledků (restart-safe)
+# ---------------------------------------------------------------------------
+async def get_ht_fight_result_for_ticket(ticket_id) -> dict | None:
+    """HT Fight výsledek pro daný ticket (podle ID kanálu), nebo None."""
+    results = await store_read(HT_RESULTS_FILE, {})
+    return results.get(f"{str(ticket_id)}{HT_FIGHT_TICKET_KEY_SUFFIX}")
+
+
+async def get_ht_fight_results() -> list:
+    """Všechny HT Fight výsledky v pořadí zápisu."""
+    results = await store_read(HT_RESULTS_FILE, {})
+    return [
+        r
+        for r in results.values()
+        if isinstance(r, dict) and r.get("resultType") == "ht_fight"
+    ]

@@ -52,11 +52,16 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   zapisuje do `data/websync_log.json` (timestamp, počet záznamů,
   úspěch/selhání a chyby).
 
-- **`/topresult` – žebříček top výsledků** – počítá se vždy jen z kanonické
-  `players.json` (žádná druhá databáze) a řadí podle skutečné tier hierarchie
-  projektu (LT5 … HT1): nejlepší tier napříč kity → počet kitů s ním → počet
-  záznamů → jméno. Podporuje `@player`, `tier:…`, `limit:…` a `page:…`
-  (paginace).
+- **`/topresult` – HT Fight výsledek (specializovaná verze `/result`)** – **není
+  to žebříček**: vytvoří veřejný výsledek HT Fightu přesně ve stylu serveru do
+  vyhrazeného kanálu (`TOP_RESULT_CHANNEL_ID`) a zapinguje nakonfigurovanou
+  roli (`TOP_RESULT_ROLE_ID`, `<@&ID>`). Záznam jde do **stejné** kanonické
+  historie jako `/result` (`data/ht_results.json`, `resultType: "ht_fight"`)
+  a **nikdy nemění tier hráče** (players.json se nedotýká) – změna tieru po HT
+  Fightu by musela projít kanonickou logikou `/result`, která v projektu zatím
+  není definovaná. V kanálu HT Fight ticketu se hráč/IGN/kit berou z ticketu
+  (autoritativně) a druhé odeslání se zablokuje (idempotence
+  `ticketId + result_type`). Validuje skóre `0-4`.
 
 - **`/datacheck` – kontrola integrity dat** – projede všechny místní databáze
   a hlásí duplicitní hráče / Discord ID / IGN, neplatné tiery, konfliktní
@@ -112,7 +117,7 @@ příchody/odchody).
 | `/playersync apply` *(admin)* | Ukáže stejný přehled a vyžaduje **explicitní potvrzení** (tlačítko) před aplikací změn. Stav se mezi náhledem a potvrzením ověřuje. Každé použití se zapisuje do `data/playersync_log.json`. |
 | `/websync preview` *(admin)* | Stáhne players.json z webu (GitHub) a porovná ho s kanonickou `players.json` – detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy. **Nic neposílá.** |
 | `/websync apply` *(admin)* | Ukáže stejný přehled a po **explicitním potvrzení** (tlačítko) nahradí players.json na webu kanonickou databází. Kanonická DB se mezi náhledem a potvrzením ověřuje; čtení i zápis mají retry. Výsledek se zapisuje do `data/websync_log.json` (timestamp, počet záznamů, úspěch/selhání a chyby). |
-| `/topresult [player] [tier] [limit] [page]` | Žebříček top výsledků z kanonické `players.json` (řazení: nejlepší tier → počet kitů → počet záznamů). `player` = umístění konkrétního hráče, `tier` = filtr na hráče s tímto nejlepším tierem, `limit` = velikost stránky (1–25), `page` = stránka (paginace). |
+| `/topresult hrac ign kit fight_tier outcome score opponent tier_status` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json` (players.json se **nemění**) a pošle zprávu ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`. V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
 | `/datacheck` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, vše se auditlugguje do `data/datacheck_log.json`. |
 
 `/result`:
@@ -217,7 +222,7 @@ cogs/
   playersync.py       # /playersync (porovnání tier rolí s players.json, audit)
   websync.py          # /websync (porovnání webu s players.json + zápis na web, audit)
   checkweb.py         # /checkweb (Discord × players.json × web, per-záznamová rozhodnutí, audit)
-  topresult.py        # /topresult (žebříček top výsledků z kanonické players.json)
+  topresult.py        # /topresult (HT Fight výsledky – stejná historie jako /result)
   datacheck.py        # /datacheck (kontrola integrity dat + bezpečné opravy, audit)
   info.py             # /verze (diagnostika běžící verze)
   ht3.py              # HT3+ tickety
@@ -262,6 +267,8 @@ v `.env` (viz `.env.example`):
 | `HT3_TICKET_CATEGORIES_JSON` | Mapa „kit/tier → kategorie“ pro HT3+ tickety, např. `{"randompot":"...","ironaxe":"..."}`. |
 | `RESULT_CHANNEL_LOWER` | Výsledkový kanál pro LT3 a níž (`/result`). |
 | `RESULT_CHANNEL_UPPER` | Výsledkový kanál pro HT3 a výš (`/result`). |
+| `TOP_RESULT_CHANNEL_ID` | Vyhrazený kanál pro veřejné HT Fight výsledky (`/topresult`). |
+| `TOP_RESULT_ROLE_ID` | Role, kterou `/topresult` pinguje (`<@&ID>`) – jen tato. |
 | `QUEUE_CHANNELS_JSON` | Mapa „kit → určený kanál panelu fronty“, např. `{"randompot":"..."}`. |
 | `TESTER_ROOM_CATEGORY_ID` | Kategorie pro tester roomky (`/mktesterroom`); `0` = bez kategorie. |
 | `TOURNAMENT_RESULT_CHANNEL_ID` | Kanál pro `/turnajresult`. |
@@ -279,7 +286,9 @@ v originále):
 `queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
-`pulled_players.json`, `kits.json`. Auditní logy synchronizací se uchovávají
+`pulled_players.json`, `kits.json`. Kanonická historie výsledků (jak `/result`,
+tak `/topresult` s `resultType=ht_fight`) je v `data/ht_results.json`
+(append-only, **necommituje se**). Auditní logy synchronizací se uchovávají
 v `data/playersync_log.json` (tier role), `data/websync_log.json` (web),
 `data/checkweb_log.json` (porovnání Discord × DB × web) a
 `data/datacheck_log.json` (kontrola integrity; **necommitují se**). Server-specific mapování rolí je

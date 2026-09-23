@@ -74,6 +74,12 @@ HT3_COOLDOWN_MS: int = 7 * 24 * 60 * 60 * 1000     # 7 dní mezi HT3+ tickety na
 HT3_PANEL_CHANNEL_ID: int = _int_env("HT3_PANEL_CHANNEL_ID", 1511738760377925833)
 TOURNAMENT_RESULT_CHANNEL_ID: int = _int_env("TOURNAMENT_RESULT_CHANNEL_ID", 1505130493283405884)
 
+# --- HT Fighty (/topresult) ------------------------------------------------
+# Vyhrazený kanál a role pro veřejné oznámení HT Fight výsledků. 0 = nenastaveno
+# (příkaz /topresult pak vrátí jasnou admin chybu místo tichého selhání).
+TOP_RESULT_CHANNEL_ID: int = _int_env("TOP_RESULT_CHANNEL_ID", 0)
+TOP_RESULT_ROLE_ID: int = _int_env("TOP_RESULT_ROLE_ID", 0)
+
 # --- Výsledkové kanály rozdělené podle tieru (= originál) -------------------
 RESULT_CHANNEL_LOWER: int = _int_env("RESULT_CHANNEL_LOWER", 1505130409632206888)
 RESULT_CHANNEL_UPPER: int = _int_env("RESULT_CHANNEL_UPPER", 1505130493283405884)

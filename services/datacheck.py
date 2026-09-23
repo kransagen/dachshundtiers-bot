@@ -426,8 +426,17 @@ def check_orphaned_results(results: dict, players: list, tickets: dict) -> list:
         ign = _normalize_key(r.get("ign"))
         if not ign or ign not in player_igns:
             reasons.append("hráč není v players.json")
-        is_ticket = r.get("kind") == "ticket" or not rid.startswith("queue-")
+        # HT Fight výsledky (/topresult, resultType=ht_fight) se NEPOVAŽUJÍ za
+        # ticket výsledky: volné zápasy nemají ticketId vůbec, u ticket zápasu
+        # se odkaz ověří jen když je ticketId vyplněný.
+        kind = r.get("kind")
+        is_ht_fight = kind == "ht_fight" or r.get("resultType") == "ht_fight"
+        is_ticket = (not is_ht_fight) and (
+            kind == "ticket" or not rid.startswith("queue-")
+        )
         if is_ticket and str(r.get("ticketId") or "").strip() not in ticket_ids:
+            reasons.append("reference na neexistující ticket")
+        elif is_ht_fight and (r.get("ticketId")) and str(r["ticketId"]).strip() not in ticket_ids:
             reasons.append("reference na neexistující ticket")
         if reasons:
             out.append(

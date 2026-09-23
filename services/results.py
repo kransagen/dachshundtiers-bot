@@ -52,6 +52,12 @@ RESULT_TIERS = {"LT5", "HT5", "LT4", "HT4", "LT3", "LT3E"}
 # do players.json a navíc status evalu (data/evals.json) – viz set_eval.
 EVAL_TIER = "LT3E"
 
+# Typ výsledku v kanonické historii (data/ht_results.json):
+#   normal   – klasický /result (queue nebo HT3+ eval ticket),
+#   ht_fight – HT Fight výsledek (/topresult) – zapisuje se do STEJNÉ historie,
+#              jen se nikdy NEDOTÝKÁ players.json (žádná změna tieru).
+RESULT_TYPES = ("normal", "ht_fight")
+
 HT_RESULTS_FILE = "ht_results.json"
 QUEUE_RESULT_PREFIX = "queue-"
 
@@ -196,9 +202,20 @@ def make_result(
     eval_flag: bool,
     now: int,
     date: str,
+    result_type: str = "normal",
+    fight_tier: str = None,
+    tier_status: str = None,
+    opponent_id: str = None,
+    opponent_name: str = "",
 ) -> dict:
-    """Sestaví neměnný záznam výsledku (bez zápisu)."""
-    return {
+    """Sestaví neměnný záznam výsledku (bez zápisu).
+
+    ``result_type`` (``normal`` | ``ht_fight``) rozlišuje klasický /result od
+    HT Fight výsledku (/topresult). HT Fight záznam navíc nese ``fightTier``,
+    ``tierStatus`` a ``opponentId``/``opponentName`` – tier hráče (players.json)
+    se při něm nikdy nemění.
+    """
+    record = {
         "id": result_id,
         "kind": kind,
         "ticketId": str(ticket_id) if ticket_id else None,
@@ -215,9 +232,24 @@ def make_result(
         "outcome": outcome or "",
         "notes": (notes or "").strip() or None,
         "eval": bool(eval_flag),
+        "resultType": result_type,
         "timestamp": now,
         "date": date,
     }
+    if result_type == "ht_fight":
+        record["fightTier"] = normalize_tier(fight_tier)
+        record["tierStatus"] = (tier_status or "").strip()
+        record["opponentId"] = str(opponent_id) if opponent_id else None
+        record["opponentName"] = opponent_name or ""
+    return record
+
+
+def get_result_type(record: dict) -> str:
+    """Typ výsledku; staré záznamy bez pole = ``normal``."""
+    if not isinstance(record, dict):
+        return "normal"
+    rt = record.get("resultType")
+    return rt if rt in RESULT_TYPES else "normal"
 
 
 def _latest_player_result(results: dict, player_id: str) -> dict | None:

@@ -18,4 +18,6 @@ venv/
 data/ht3_panel_message.json
 data/kit_roles.json
 data/evals.json
+data/ht_tickets.json
+data/ht_ticket_logs.json
 data/.gitkeep

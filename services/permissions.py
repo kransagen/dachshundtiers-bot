@@ -3,6 +3,8 @@
 - ``has_tester_role``: když je nastaven allowlist ID rolí (``TESTER_ROLE_IDS``),
   tester se pozná POUZE podle přesného ID role. Bez allowlistu zůstává původní
   chování: role, jejíž název obsahuje ``TESTER_ROLE_FRAGMENT``.
+- ``get_tester_roles``: najde tester ROLE v kolekci rolí (pro oprávnění
+  kanálů ticketů) – stejná pravidla jako ``has_tester_role``.
 - ``has_admin_role``: role z ``ADMIN_ROLE_IDS`` (když je allowlist nastaven)
   nebo Discord oprávnění Administrator. Bez allowlistu se chová přesně jako
   předtím (jen Administrator).
@@ -22,6 +24,29 @@ def _has_role_id(member, role_ids) -> bool:
         if isinstance(rid, int) and rid in allowed:
             return True
     return False
+
+
+def get_tester_roles(roles) -> list:
+    """Vrátí role, které se považují za tester role (pro oprávnění kanálů).
+
+    Při nastaveném allowlistu (``TESTER_ROLE_IDS``) přesná shoda ID, jinak
+    původní chování: role, jejíž název obsahuje ``TESTER_ROLE_FRAGMENT``.
+    Vstupem je libovolná kolekce role-objektů (``.id`` / ``.name``).
+    """
+    roles = list(roles or [])
+    if TESTER_ROLE_IDS:
+        allowed = set(TESTER_ROLE_IDS)
+        return [
+            r
+            for r in roles
+            if isinstance(getattr(r, "id", None), int) and r.id in allowed
+        ]
+    fragment = TESTER_ROLE_FRAGMENT
+    return [
+        r
+        for r in roles
+        if fragment in (getattr(r, "name", "") or "").lower()
+    ]
 
 
 def has_tester_role(member) -> bool:

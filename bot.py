@@ -15,7 +15,7 @@ from discord.ext import commands
 
 from config import DISCORD_TOKEN, GUILD_ID
 from storage import ensure_data_dir, load_data
-from views import HT3PanelView, QueueView, TournamentSignupView
+from views import HT3PanelView, HTTicketView, QueueView, TournamentSignupView
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +123,27 @@ class DachshundTiersBot(commands.Bot):
                 self.add_view(HT3PanelView(), message_id=int(ht3_panel["message_id"]))
             except (ValueError, discord.ClientException) as err:
                 log.warning("Nelze zaregistrovat HT3 panel: %s", err)
+
+        # HT tickety: re-registrace persistentních tlačítek otevřených ticketů
+        # (Claim HT / Unclaim / Close / Reopen). Zavřené tickety už view nepotřebují.
+        ht_tickets = load_data("ht_tickets.json", {})
+        for channel_id, ticket in ht_tickets.items():
+            if not isinstance(ticket, dict):
+                continue
+            if ticket.get("status") != "open":
+                continue
+            message_id = ticket.get("panelMessageId")
+            if not message_id:
+                log.warning(
+                    "Ticket %s nemá panelMessageId – tlačítka se neregistrují "
+                    "(otevře se znovu po restartu příště).",
+                    channel_id,
+                )
+                continue
+            try:
+                self.add_view(HTTicketView(), message_id=int(message_id))
+            except (ValueError, discord.ClientException) as err:
+                log.warning("Nelze zaregistrovat view ticketu %s: %s", channel_id, err)
 
         # Turnaje: zaregistrování tlačítek a naplánování konce přihlašování
         from cogs.tournaments import end_tournament_signup

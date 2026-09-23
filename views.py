@@ -12,12 +12,29 @@ import discord
 
 from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, TIERS_UPPER, get_ht3_ticket_category
 from panel import update_panel
+from services.permissions import get_tester_roles
 from services.queue_service import (
     join_queue,
     leave_queue,
     pop_for_kit,
     remove_by_player_id,
     save_pulled_player,
+)
+from services.tickets import (
+    HT3_TIER_LADDER,
+    claim_ticket,
+    close_ticket,
+    create_ticket,
+    effective_ticket_tier,
+    find_open_ticket,
+    find_player_tier,
+    get_ticket,
+    log_ticket_event,
+    next_ticket_tier,
+    reopen_ticket,
+    set_panel_message,
+    tier_allows_tickets,
+    unclaim_ticket,
 )
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, has_eval, has_tester_role
@@ -356,69 +373,76 @@ class PullChannelSelectView(SafeView):
 
 
 # ---------------------------------------------------------------------------
-# HT3+ tickety: kontrola tieru (limit hráče) + select menu + modál + Close
+# HT3+ tickety: kontrola tieru (limit hráče) + select menu + modál + tlačítka
 # ---------------------------------------------------------------------------
-# HT3+ ticket žebříček (nejhorší → nejlepší, potvrzeno provozovatelem):
-#   LT5 < HT5 < LT4 < HT4 < LT3 < LT3+eval < HT3 < LT2 < HT2 < LT1 < HT1
-# (LT5 je nejmenší, HT1 je největší.)
-# „LT3+eval" (v kódu LT3E) je status mezi LT3 a HT3: hráč má pořád roli LT3,
-# ale s evalem může otevírat HT3+ tickety. Evaly se drží v data/evals.json
-# (viz utils.has_eval / set_eval / unset_eval).
-HT3_TIER_LADDER = [
-    "LT5", "HT5", "LT4", "HT4", "LT3", "LT3E", "HT3", "LT2", "HT2", "LT1", "HT1",
-]
+# Žebříček tierů a čisté pomocné funkce (next_ticket_tier, tier_allows_tickets,
+# effective_ticket_tier, find_player_tier) žijí v services/tickets.py, aby se
+# daly testovat bez discord.py – viz tam.
+#
+# (LT5 je nejmenší, HT1 je největší.) „LT3+eval" (v kódu LT3E) je status mezi
+# LT3 a HT3: hráč má pořád roli LT3, ale s evalem může otevírat HT3+ tickety.
+# Evaly se drží v data/evals.json (viz utils.has_eval / set_eval / unset_eval).
 
 
-def _next_ticket_tier(current: str) -> str | None:
-    """O stupeň lepší tier (přímý následník v žebříčku) – limit hráče.
+def _apply_ticket_overwrites(guild, *, owner_member):
+    """Overwrite kanálu ticketu: server skrytý, vlastník + tester role vidí.
 
-    Příklad: LT3 → HT3, HT3 → LT2, LT2 → HT2, HT1 → HT1 (vrchol).
-    Vrací None, pokud tier nelze přečíst (R-tiery / neznámý formát).
+    Claimer a členové (/add) se přidávají průběžně přes
+    ``grant_channel_access`` / ``revoke_channel_access``.
     """
-    t = (current or "").strip().upper()
-    if t not in HT3_TIER_LADDER:
-        return None  # R-tiery / neznámý formát – nekontrolujeme
-    idx = HT3_TIER_LADDER.index(t)
-    if idx == len(HT3_TIER_LADDER) - 1:
-        return t  # HT1 = vrchol žebříčku
-    return HT3_TIER_LADDER[idx + 1]
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    if owner_member is not None:
+        overwrites[owner_member] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True
+        )
+    for role in get_tester_roles(guild.roles):
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True
+        )
+    return overwrites
 
 
-def _tier_allows_tickets(tier: str) -> bool:
-    """Může hráč otevírat HT3+ tickety podle svého tieru? (LT3+eval a výš)"""
-    t = (tier or "").strip().upper()
-    if t not in HT3_TIER_LADDER:
-        return False
-    return HT3_TIER_LADDER.index(t) >= HT3_TIER_LADDER.index("LT3E")
-
-
-def _effective_ticket_tier(current_tier: str | None, eval_ok: bool) -> str | None:
-    """Tier, ze kterého se počítá limit ticketu.
-
-    Hráč se záznamem „LT3+eval" (eval_ok) se chová jako když má tier LT3E –
-    i když má zapsaný jen LT3 nebo žádný – aby mohl ticket zacílit na HT3.
-    """
-    if not eval_ok:
-        return current_tier
-    cur = (current_tier or "").strip().upper()
-    eval_idx = HT3_TIER_LADDER.index("LT3E")
-    if cur not in HT3_TIER_LADDER:
-        return "LT3E"
-    return cur if HT3_TIER_LADDER.index(cur) >= eval_idx else "LT3E"
-
-
-def _find_player_tier(ign: str, kit: str) -> str | None:
-    """Najde hráče v players.json a vrátí jeho aktuální tier pro daný kit."""
-    try:
-        players = load_data("players.json", []) or []
-    except Exception:
-        return None
-    for p in players:
-        if str(p.get("username", "")).strip().lower() == ign.strip().lower():
-            modes = p.get("modes") or {}
-            tier = modes.get(kit)
-            return str(tier).strip().upper() if tier else None
-    return None
+def ticket_embed(ticket: dict) -> discord.Embed:
+    """Embed ticketu (stav, vlastník, claimer, členové) – aktualizuje se akcemi."""
+    if not isinstance(ticket, dict):
+        ticket = {}
+    closed = ticket.get("status") != "open"
+    claimer = (
+        f"<@{ticket['claimerId']}>"
+        if ticket.get("claimerId")
+        else "— (volný)"
+    )
+    members = ", ".join(f"<@{m}>" for m in (ticket.get("members") or [])) or "—"
+    embed = (
+        discord.Embed(
+            title="HT3+ Ticket Request",
+            color=0xEF4444 if closed else 0x00FF00,
+        )
+        .add_field(name="IGN", value=ticket.get("ign") or "—", inline=False)
+        .add_field(
+            name="Tvůj současný tier / Požadovaný",
+            value=ticket.get("targetTier") or "—",
+            inline=False,
+        )
+        .add_field(name="GAMEMODE", value=ticket.get("kit") or "—", inline=False)
+        .add_field(
+            name="Tvůj aktuální tier (databáze)",
+            value=ticket.get("currentTier") or "—",
+            inline=False,
+        )
+        .add_field(name="Eval", value="✅ Ano" if ticket.get("eval") else "❌ Ne", inline=False)
+        .add_field(
+            name="Status",
+            value="🔒 Zavřený" if closed else "🟢 Otevřený",
+            inline=False,
+        )
+        .add_field(name="Ticket vlastní", value=f"<@{ticket.get('ownerId', '0')}>", inline=False)
+        .add_field(name="Převzal (Claim)", value=claimer, inline=False)
+        .add_field(name="Členové (/add)", value=members, inline=False)
+    )
+    return embed
 
 
 class HT3PanelView(SafeView):
@@ -491,11 +515,11 @@ class HT3Modal(SafeModal):
 
         # Kontrola limitu: ticket nesmí být na lepší tier, než hráč může.
         # Hráč je hledaný podle IGN v players.json (stejná data, co posílá /result).
-        current_tier = _find_player_tier(ign, kit)
+        current_tier = find_player_tier(ign, kit)
         eval_ok = has_eval(ign, kit)
 
         # Brána: HT3+ ticket otevřou jen hráči s „LT3+eval" (nebo HT3 a výš).
-        if not eval_ok and not _tier_allows_tickets(current_tier):
+        if not eval_ok and not tier_allows_tickets(current_tier):
             return await interaction.followup.send(
                 "❌ **Bez evalu nelze otevřít HT3+ ticket!**\n"
                 "Eval dostaneš, když **porazíš LT3 testera** (nebo když tvůj "
@@ -504,8 +528,8 @@ class HT3Modal(SafeModal):
                 ephemeral=True,
             )
 
-        effective_tier = _effective_ticket_tier(current_tier, eval_ok)
-        limit_tier = _next_ticket_tier(effective_tier) if effective_tier else None
+        effective_tier = effective_ticket_tier(current_tier, eval_ok)
+        limit_tier = next_ticket_tier(effective_tier) if effective_tier else None
         if effective_tier and limit_tier and target_tier in HT3_TIER_LADDER:
             limit_idx = HT3_TIER_LADDER.index(limit_tier)
             typed_idx = HT3_TIER_LADDER.index(target_tier)
@@ -518,8 +542,24 @@ class HT3Modal(SafeModal):
                     ephemeral=True,
                 )
 
+        # Prevence duplicit (rychlá kontrola; autoritativní je uvnitř
+        # create_ticket v transaction – tam se případné souběžné vytvoření
+        # stejného hráče + kitu pozná a přepíše tento kanál).
+        existing = await find_open_ticket(str(interaction.user.id), kit)
+        if existing is not None:
+            return await interaction.followup.send(
+                f"❌ Už máš otevřený HT3+ ticket pro kit **{kit}**: "
+                f"<#{existing.get('id')}>. Nejprve ho zavři.",
+                ephemeral=True,
+            )
+
         guild = interaction.guild
-        everyone = guild.default_role
+        owner_member = guild.get_member(interaction.user.id)
+        if owner_member is None:
+            try:
+                owner_member = await guild.fetch_member(interaction.user.id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                owner_member = None
 
         # Kategorie podle tieru, pak podle kitu, jinak výchozí (configurable)
         category_id = get_ht3_ticket_category(target_tier, kit)
@@ -538,37 +578,61 @@ class HT3Modal(SafeModal):
         channel = await guild.create_text_channel(
             name=f"{ign}-{target_tier}-{kit}".lower(),
             category=category,
-            overwrites={
-                everyone: discord.PermissionOverwrite(view_channel=False),
-                interaction.user: discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True
-                ),
-            },
+            overwrites=_apply_ticket_overwrites(guild, owner_member=owner_member),
         )
 
-        embed = (
-            discord.Embed(title="HT3+ Ticket Request", color=0x00FF00)
-            .add_field(name="IGN", value=ign, inline=False)
-            .add_field(name="Tvůj současný tier / Požadovaný", value=target_tier, inline=False)
-            .add_field(name="GAMEMODE", value=kit, inline=False)
-            .add_field(
-                name="Tvůj aktuální tier (databáze)",
-                value=current_tier or "—",
-                inline=False,
+        ticket = None
+        result = await create_ticket(
+            channel_id=channel.id,
+            owner_id=str(interaction.user.id),
+            owner_name=interaction.user.display_name or interaction.user.name,
+            ign=ign,
+            kit=kit,
+            target_tier=target_tier,
+            current_tier=current_tier,
+            eval_ok=eval_ok,
+            category_id=category_id,
+            now=int(time.time() * 1000),
+        )
+        if result["result"] == "duplicate":
+            # Závod: ticket pro stejný kit mezitím vznikl jinde – tenhle kanál
+            # je prázdný, smažeme ho a pošleme odkaz na existující ticket.
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            existing_dup = result["ticket"]
+            return await interaction.followup.send(
+                f"❌ Už máš otevřený HT3+ ticket pro kit **{kit}**: "
+                f"<#{existing_dup.get('id')}>. Nejprve ho zavři.",
+                ephemeral=True,
             )
-            .add_field(name="Eval", value="✅ Ano" if eval_ok else "❌ Ne", inline=False)
+        ticket = result["ticket"]
+
+        embed = ticket_embed(ticket)
+        ticket_view = HTTicketView()
+        message = await channel.send(
+            content=f"<@{interaction.user.id}>", embed=embed, view=ticket_view
         )
 
-        close_btn = discord.ui.Button(
-            style=discord.ButtonStyle.danger,
-            label="🔒 Close Ticket",
-            custom_id=f"close_ht3_{interaction.user.id}_{kit}",
-        )
-        close_btn.callback = self.on_close
-        ticket_view = discord.ui.View(timeout=None)
-        ticket_view.add_item(close_btn)
+        # Registrace persistentní view – tlačítka ticketu přežijí restart
+        # (interaction.client = bot; u nové registrace i po restartu).
+        try:
+            interaction.client.add_view(ticket_view, message_id=message.id)
+        except (ValueError, discord.ClientException) as err:
+            log.warning("Nelze zaregistrovat view ticketu %s: %s", channel.id, err)
 
-        await channel.send(content=f"<@{interaction.user.id}>", embed=embed, view=ticket_view)
+        # Do záznamu doplníme ID panel zprávy (restart-safe readd view)
+        await set_panel_message(channel.id, str(message.id))
+
+        await log_ticket_event(
+            channel.id,
+            "created",
+            str(interaction.user.id),
+            interaction.user.display_name or interaction.user.name,
+            details=f"Ticket {target_tier} / {kit} (IGN {ign})",
+        )
+
         note = ""
         if current_tier and limit_tier and target_tier != limit_tier:
             note = (
@@ -579,33 +643,226 @@ class HT3Modal(SafeModal):
             f"Ticket byl vytvořen: <#{channel.id}>{note}", ephemeral=True
         )
 
-    async def on_close(self, interaction: discord.Interaction) -> None:
-        # custom_id: close_ht3_{userId}_{kit}
-        parts = interaction.data.get("custom_id", "").split("_")
+
+class HTTicketView(SafeView):
+    """Persistentní tlačítka ticketu: Claim HT / Unclaim / Close / Reopen.
+
+    View je bezstavový – stav se čte z ``ht_tickets.json`` podle ID kanálu
+    (``interaction.channel_id``), takže stejně funguje i po restartu bota.
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        claim = discord.ui.Button(
+            style=discord.ButtonStyle.success,
+            label="✅ Claim HT",
+            custom_id="ht_claim",
+        )
+        unclaim = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="↩️ Unclaim",
+            custom_id="ht_unclaim",
+        )
+        close = discord.ui.Button(
+            style=discord.ButtonStyle.danger,
+            label="🔒 Close Ticket",
+            custom_id="ht_close",
+        )
+        reopen = discord.ui.Button(
+            style=discord.ButtonStyle.secondary,
+            label="🔓 Reopen Ticket",
+            custom_id="ht_reopen",
+        )
+        claim.callback = self.on_claim
+        unclaim.callback = self.on_unclaim
+        close.callback = self.on_close
+        reopen.callback = self.on_reopen
+        self.add_item(claim)
+        self.add_item(unclaim)
+        self.add_item(close)
+        self.add_item(reopen)
+
+    @staticmethod
+    async def _active_ticket(interaction) -> dict | None:
+        ticket = await get_ticket(interaction.channel_id)
+        if ticket is None:
+            await _ticket_not_found(interaction)
+            return None
+        return ticket
+
+    async def _refresh(self, interaction, ticket) -> None:
+        """Aktualizuje embed panel zprávy ticketu (pokud existuje)."""
         try:
-            user_id = parts[2]
-        except IndexError:
-            user_id = ""
-        kit = "_".join(parts[3:]) if len(parts) > 3 else ""
+            message = interaction.message
+            if message is not None:
+                await message.edit(embed=ticket_embed(ticket))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
-        ht3_cooldowns = load_data("ht3_cooldowns.json", {})
-        ht3_cooldowns.setdefault(user_id, {})[kit] = time.time() * 1000 + HT3_COOLDOWN_MS
-        save_data("ht3_cooldowns.json", ht3_cooldowns)
+    async def on_claim(self, interaction: discord.Interaction) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+        ticket = await self._active_ticket(interaction)
+        if ticket is None:
+            return
+        result = await claim_ticket(
+            interaction.channel_id, str(interaction.user.id), interaction.user.display_name
+        )
+        r = result["result"]
+        if r == "not_open":
+            return await interaction.response.send_message(
+                "❌ Ticket je zavřený – nejdřív ho otevři (Reopen).", ephemeral=True
+            )
+        if r == "own_ticket":
+            return await interaction.response.send_message(
+                "❌ Nemůžeš si převzít vlastní ticket.", ephemeral=True
+            )
+        if r == "already_claimed":
+            other = result.get("claimer_name") or f"<@{result.get('claimer_id')}>"
+            return await interaction.response.send_message(
+                f"❌ Ticket už má převzatý **{other}** – nejdřív se ho musí vzdát.",
+                ephemeral=True,
+            )
+        if r != "claimed":
+            return await interaction.response.send_message(
+                "❌ Ticket se nepodařilo převzít.", ephemeral=True
+            )
 
+        ticket = result["ticket"]
+        await grant_channel_access(interaction.channel, str(interaction.user.id))
+        await log_ticket_event(
+            interaction.channel_id, "claimed", str(interaction.user.id),
+            interaction.user.display_name,
+            details=f"Claim: {ticket.get('ign')} / {ticket.get('kit')}",
+        )
+        await self._refresh(interaction, ticket)
         await interaction.response.send_message(
-            "Ticket se zavírá a byl nastaven 7denní cooldown..."
+            f"✅ **{interaction.user.display_name}** převzal/a ticket "
+            f"<#{interaction.channel_id}> – můžeš začít test.",
+            ephemeral=True,
         )
 
-        channel = interaction.channel
+    async def on_unclaim(self, interaction: discord.Interaction) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+        ticket = await self._active_ticket(interaction)
+        if ticket is None:
+            return
+        result = await unclaim_ticket(
+            interaction.channel_id, str(interaction.user.id), force=True
+        )
+        if result["result"] != "unclaimed":
+            return await interaction.response.send_message(
+                "❌ Ticket nemá nikdo převzatý (nebo se nepodařilo uvolnit).",
+                ephemeral=True,
+            )
+        previous = result["previous"]
+        await revoke_channel_access(interaction.channel, previous["claimer_id"])
+        await log_ticket_event(
+            interaction.channel_id, "unclaimed", str(interaction.user.id),
+            interaction.user.display_name,
+            details=f"Vzdal se: {previous['claimer_name'] or previous['claimer_id']}",
+        )
+        await self._refresh(interaction, result["ticket"])
+        await interaction.response.send_message(
+            "↩️ Ticket je zase volný – nikdo ho nemá převzatý.", ephemeral=True
+        )
 
-        async def _delete_later() -> None:
-            await asyncio.sleep(3)
-            try:
-                await channel.delete()
-            except (discord.NotFound, discord.HTTPException):
-                pass
+    async def on_close(self, interaction: discord.Interaction) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+        ticket = await self._active_ticket(interaction)
+        if ticket is None:
+            return
+        result = await close_ticket(
+            interaction.channel_id,
+            str(interaction.user.id),
+            cooldown_ms=HT3_COOLDOWN_MS,
+        )
+        r = result["result"]
+        if r == "already_closed":
+            return await interaction.response.send_message(
+                "❌ Ticket už je zavřený.", ephemeral=True
+            )
+        if r != "closed":
+            return await interaction.response.send_message(
+                "❌ Ticket se nepodařilo zavřít.", ephemeral=True
+            )
+        await log_ticket_event(
+            interaction.channel_id, "closed", str(interaction.user.id),
+            interaction.user.display_name,
+            details="7denní HT3+ cooldown nastaven",
+        )
+        await self._refresh(interaction, result["ticket"])
+        await interaction.response.send_message(
+            "🔒 Ticket zavřený – hráč má 7denní HT3+ cooldown na tento kit. "
+            "Kanál zůstává (Reopen / log).",
+            ephemeral=True,
+        )
 
-        asyncio.create_task(_delete_later())
+    async def on_reopen(self, interaction: discord.Interaction) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Tester!", ephemeral=True
+            )
+        ticket = await self._active_ticket(interaction)
+        if ticket is None:
+            return
+        result = await reopen_ticket(interaction.channel_id, str(interaction.user.id))
+        if result["result"] == "not_closed":
+            return await interaction.response.send_message(
+                "❌ Ticket už je otevřený.", ephemeral=True
+            )
+        if result["result"] != "reopened":
+            return await interaction.response.send_message(
+                "❌ Ticket se nepodařilo znovu otevřít.", ephemeral=True
+            )
+        await log_ticket_event(
+            interaction.channel_id, "reopened", str(interaction.user.id),
+            interaction.user.display_name,
+        )
+        await self._refresh(interaction, result["ticket"])
+        await interaction.response.send_message(
+            "🔓 Ticket je zase otevřený.", ephemeral=True
+        )
+
+
+async def _ticket_not_found(interaction) -> None:
+    await interaction.response.send_message(
+        "❌ Tento kanál není HT ticket (záznam chybí).", ephemeral=True
+    )
+
+
+async def grant_channel_access(channel, user_id: str) -> None:
+    """Přidá uživateli explicitní přístup do kanálu ticketu (best effort)."""
+    guild = getattr(channel, "guild", None)
+    member = guild.get_member(int(user_id)) if guild else None
+    if member is None:
+        return
+    try:
+        await channel.set_permissions(
+            member, view_channel=True, send_messages=True
+        )
+    except (discord.Forbidden, discord.HTTPException) as err:
+        log.warning("Nelze udělit přístup do ticketu %s pro %s: %s", channel.id, user_id, err)
+
+
+async def revoke_channel_access(channel, user_id: str) -> None:
+    """Odebere explicitní přístup uživatele do kanálu ticketu (best effort)."""
+    guild = getattr(channel, "guild", None)
+    member = guild.get_member(int(user_id)) if guild else None
+    if member is None:
+        return
+    try:
+        await channel.set_permissions(member, overwrite=None)
+    except (discord.Forbidden, discord.HTTPException) as err:
+        log.warning("Nelze odebrat přístup do ticketu %s pro %s: %s", channel.id, user_id, err)
 
 
 # ---------------------------------------------------------------------------

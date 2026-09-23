@@ -61,6 +61,28 @@ class PermissionsTests(unittest.TestCase):
     def test_admin_none_member(self):
         self.assertFalse(permissions.has_admin_role(None))
 
+    # ------------------------------------------------------------------
+    # get_tester_roles – hledání tester ROLE pro oprávnění kanálů ticketů
+    # ------------------------------------------------------------------
+    def test_get_tester_roles_allowlist(self):
+        roles = [role(101, "Tester"), role(202, "Tester/Admin"), role(303, "Moderátor")]
+        with mock.patch.object(permissions, "TESTER_ROLE_IDS", [101, 303]):
+            found = permissions.get_tester_roles(roles)
+            self.assertEqual([r.id for r in found], [101, 303])
+        with mock.patch.object(permissions, "TESTER_ROLE_IDS", []):
+            self.assertEqual(permissions.get_tester_roles([]), [])
+
+    def test_get_tester_roles_fragment_fallback(self):
+        roles = [role(1, "Head Tester"), role(2, "Tester"), role(3, "Admin")]
+        with mock.patch.object(permissions, "TESTER_ROLE_IDS", []):
+            found = permissions.get_tester_roles(roles)
+            self.assertEqual([r.id for r in found], [1, 2])
+
+    def test_get_tester_roles_none_or_empty(self):
+        with mock.patch.object(permissions, "TESTER_ROLE_IDS", []):
+            self.assertEqual(permissions.get_tester_roles(None), [])
+            self.assertEqual(permissions.get_tester_roles([]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

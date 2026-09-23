@@ -22,6 +22,11 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   v `data/kit_roles.json` (necommituje se).
 - **Opraven bug „Synchronizováno 0"** – `tree.copy_global_to(guild=...)` před
   `sync(guild=...)`, takže slash příkazy na serveru nikdy nezmizí.
+- **`/checkweb` nově zapisuje na web** – projede hráče u **každého kitu**
+  (podle tier rolí z `/setkitrole`) a chybějící / změněné tiery **automaticky
+  zapíše do `players.json`** (modes + history) a synchronizuje na GitHub, takže
+  web se sám doplní. Data čte primárně z GitHubu (aby nepřepsal novější změny
+  od `/result`), jinak z lokální kopie.
 
 ## Funkce
 
@@ -63,7 +68,7 @@ příchody/odchody).
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit – po `/result` ji hráč dostane automaticky. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
-| `/checkweb` *(všichni)* | Projede všechny hráče s tier rolí (z `kit_roles.json` + role typu LT3/HT1…) a zkontroluje, jestli jsou registrovaní na webu (`players.json`). Neregistrované vypíše včetně role. Příkaz může použít kdokoli. |
+| `/checkweb` *(tester)* | Projede hráče u **každého kitu** (podle tier rolí z `kit_roles.json`, nastavených přes `/setkitrole`) a hráče, kteří nemají tier zapsaný na webu (`players.json`), **tam automaticky zapíše** – včetně historie s dnešním datem. Následně synchronizuje `players.json` na GitHub (web). V odpovědi ukáže přehled per kit (✅ už zapsáno / ➕ nově / ✏️ aktualizováno). |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),

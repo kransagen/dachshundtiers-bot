@@ -11,29 +11,115 @@ obsahuje serverové ID rolí)::
 Krátký slovník:
 - /setkitrole  – namapuje roli tieru pro kit,
 - /unsetkitrole– zruší mapování,
-- /kitrole     – vypíše všechna mapování.
+- /kitrole     – vypíše všechna mapování,
+- /checkweb    – zkontroluje hráče u každého kitu a chybějící/změněné tiery
+                 zapíše do players.json (web) a synchronizuje na GitHub.
 
 Po `/result` se hráči automaticky dá role nového tieru a odeberou se ostatní
 tier role stejného kitu.
 """
 
+import asyncio
+import base64
+import json
 import logging
-import re
 
 import discord
+import requests
 from discord import app_commands
 from discord.ext import commands
 
+from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN
 from storage import load_data, save_data
-from utils import has_tester_role, kit_autocomplete
+from utils import get_kits, has_tester_role, kit_autocomplete, today_cz
 
 log = logging.getLogger("dachshundtiers")
 
 KIT_ROLES_FILE = "kit_roles.json"
 
-# Role, které vypadají jako tier role (i kdyby nebyly v kit_roles.json):
-# LT3, HT1, RLT5, RHT2, „UHCMace HT3", „HT3 (UHCMace)" …
-_TIER_ROLE_RE = re.compile(r"(?i)(?:^|\W)(?:R?LT|R?HT)[1-5](?:\W|$)")
+# ---------------------------------------------------------------------------
+# Pomocné funkce pro /checkweb (zápis tierů na web / players.json + GitHub)
+# ---------------------------------------------------------------------------
+def _match_web_player(players: list, member) -> dict | None:
+    """Najde hráče v players.json podle nicku / display name / username."""
+    candidates = {member.nick, member.display_name, member.name}
+    names = {c.strip().lower() for c in candidates if c and c.strip()}
+    return next(
+        (
+            p
+            for p in players
+            if str(p.get("username", "")).strip().lower() in names
+        ),
+        None,
+    )
+
+
+def _find_mode_key(modes: dict, kit_key_lower: str) -> str | None:
+    """Klíč módu bez ohledu na velikost písmen („MolePVP" vs „molepvp")."""
+    for key in modes:
+        if str(key).lower() == kit_key_lower:
+            return key
+    return None
+
+
+def _github_get_players() -> tuple[list | None, str | None]:
+    """Stáhne aktuální players.json z GitHubu (zdroj pravdy webu)."""
+    if not GITHUB_TOKEN:
+        return None, None
+    api = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/contents/{GITHUB_FILE_PATH}"
+    )
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    try:
+        response = requests.get(api, headers=headers, timeout=20)
+    except requests.RequestException as err:
+        log.warning("GitHub GET selhal v /checkweb: %s", err)
+        return None, None
+    if response.status_code == 200:
+        data = response.json()
+        try:
+            players = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+            if isinstance(players, list):
+                return players, data.get("sha")
+        except (json.JSONDecodeError, ValueError):
+            return None, None
+    elif response.status_code != 404:
+        log.warning("GitHub GET selhal v /checkweb (%s)", response.status_code)
+        return None, None
+    return [], None
+
+
+def _github_push_players(players: list, sha: str | None) -> tuple[bool, str]:
+    """Pošle celý players.json na GitHub přes Contents API."""
+    if not GITHUB_TOKEN:
+        return False, "⚠️ GITHUB_TOKEN není nastaven – uloženo jen lokálně (web se nezmění)."
+    api = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+        f"/contents/{GITHUB_FILE_PATH}"
+    )
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+    }
+    body = {
+        "message": "checkweb: synchronizace tieru na web",
+        "content": base64.b64encode(
+            json.dumps(players, ensure_ascii=False, indent=2).encode("utf-8")
+        ).decode("ascii"),
+    }
+    if sha:
+        body["sha"] = sha
+    try:
+        response = requests.put(api, headers=headers, json=body, timeout=20)
+    except requests.RequestException as err:
+        return False, f"❌ GitHub zápis selhal: {err}"
+    if response.status_code in (200, 201):
+        return True, "✅ players.json synchronizováno na GitHub – web je aktuální."
+    return False, f"❌ GitHub zápis selhal ({response.status_code})"
 
 
 async def auto_grant_kit_role(
@@ -220,103 +306,162 @@ class Roles(commands.Cog):
         await interaction.response.send_message(embed=embed)
 
     # ------------------------------------------------------------------
-    # /checkweb – projede hráče s tier rolemi a zkontroluje registraci na webu
+    # /checkweb – projede hráče u každého kitu a chybějící tiery zapíše
+    #             do players.json + synchronizuje na GitHub (web)
     # ------------------------------------------------------------------
     @app_commands.command(
         name="checkweb",
-        description="Projede hráče s tier rolemi a zkontroluje, jestli jsou registrovaní na webu",
+        description="Zkontroluje hráče u každého kitu a chybějící tiery zapíše na web",
     )
     async def checkweb(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             return await interaction.response.send_message(
                 "❌ Pouze na serveru.", ephemeral=True
             )
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro testery.", ephemeral=True
+            )
 
         await interaction.response.defer(ephemeral=True)
         guild = interaction.guild
 
-        # 1) Tier role = role namapované v kit_roles.json + role se jménem
-        #    jako tier (LT3, HT1, RLT5, „UHCMace HT3" …).
         roles_map = load_data(KIT_ROLES_FILE, {})
-        mapped_ids = {
-            str(rid)
-            for kit_map in roles_map.values()
-            for rid in (kit_map or {}).values()
-            if rid
-        }
-        tier_roles = [
-            r
-            for r in guild.roles
-            if str(r.id) in mapped_ids or _TIER_ROLE_RE.search(r.name)
-        ]
+        if not roles_map:
+            return await interaction.followup.send(
+                "ℹ️ Žádné mapování rolí – nejdřív nastav `/setkitrole`.",
+                ephemeral=True,
+            )
 
-        # 2) Členové serveru (zkusíme načíst plný seznam, jinak cache)
-        members = list(guild.members)
+        # 1) Displejové názvy kitů (data/kits.json) pro zápis do players.json.
+        kit_display = {str(k).lower(): str(k) for k in get_kits()}
+
+        # 2) Členové serveru (zkusíme plný seznam, jinak cache)
+        members = [m for m in guild.members if not m.bot]
         try:
             fetched = await guild.fetch_members().flatten()
             if fetched:
-                members = fetched
+                members = [m for m in fetched if not m.bot]
         except Exception:  # noqa: BLE001 – bez members intentu fallback na cache
             pass
 
-        players_with_tier_role = [
-            m
-            for m in members
-            if not m.bot and any(r in m.roles for r in tier_roles)
-        ]
+        # 3) Aktuální webová data: nejlépe přímo z GitHubu (zdroj pravdy),
+        #    jinak lokální kopie players.json.
+        players, sha = await asyncio.to_thread(_github_get_players)
+        source = "GitHub"
+        if players is None:
+            players = load_data("players.json") or []
+            source = "lokální kopie"
 
-        # 3) Webová data = players.json (posílá se na GitHub / na web)
-        players = load_data("players.json") or []
-        web_names = {str(p.get("username", "")).strip().lower() for p in players}
+        # 4) Pro každý kit projdeme členy s tier rolí; chybějící / změněné
+        #    tiery zapíšeme do players.json (modes + history s dnešním datem).
+        today = today_cz()
+        summary = []
+        changes = []
+        total_checked = 0
+        total_added = 0
+        total_updated = 0
+        total_ok = 0
 
-        missing = []
-        registered = 0
-        for m in players_with_tier_role:
-            candidates = {m.nick, m.display_name, m.name}
-            if any(
-                (c or "").strip().lower() in web_names
-                for c in candidates
-                if c and c.strip()
-            ):
-                registered += 1
-            else:
-                missing.append(m)
+        for kit_key, tier_map in roles_map.items():
+            kit_key = (kit_key or "").strip().lower()
+            if not kit_key or not isinstance(tier_map, dict) or not tier_map:
+                continue
+            kit_name = kit_display.get(kit_key, kit_key.capitalize())
 
-        total = len(players_with_tier_role)
+            kit_roles = []
+            for tier, role_id in tier_map.items():
+                rid = str(role_id)
+                if not rid.isdigit():
+                    continue
+                role_obj = guild.get_role(int(rid))
+                if role_obj is not None:
+                    kit_roles.append((role_obj, str(tier).strip().upper() or str(tier)))
+            if not kit_roles:
+                continue
+
+            added = updated = ok = 0
+            for member in members:
+                held = [
+                    tier for role_obj, tier in kit_roles if role_obj in member.roles
+                ]
+                if not held:
+                    continue
+                total_checked += 1
+
+                player = _match_web_player(players, member)
+                if player is None:
+                    username = (member.display_name or member.name).strip() or member.name
+                    players.append(
+                        {
+                            "username": username,
+                            "modes": {kit_name: held[0]},
+                            "history": {
+                                kit_name: [{"date": today, "tier": held[0]}]
+                            },
+                        }
+                    )
+                    added += 1
+                    changes.append(f"➕ **{kit_name}** – {username} (**{held[0]}**)")
+                    continue
+
+                player.setdefault("modes", {})
+                player.setdefault("history", {})
+                mode_key = _find_mode_key(player["modes"], kit_key) or kit_name
+                existing = player["modes"].get(mode_key)
+                if existing and str(existing).strip().upper() == held[0]:
+                    ok += 1
+                    continue
+
+                player["modes"][mode_key] = held[0]
+                player["history"].setdefault(mode_key, [])
+                player["history"][mode_key].append({"date": today, "tier": held[0]})
+                if existing:
+                    updated += 1
+                    changes.append(
+                        f"✏️ **{kit_name}** – {player.get('username', member.display_name)}: "
+                        f"{existing} → **{held[0]}**"
+                    )
+                else:
+                    added += 1
+                    changes.append(
+                        f"➕ **{kit_name}** – {player.get('username', member.display_name)} "
+                        f"(**{held[0]}**)"
+                    )
+
+            total_added += added
+            total_updated += updated
+            total_ok += ok
+            summary.append(
+                f"• **{kit_name}**: ✅ {ok} · ➕ {added} · ✏️ {updated}"
+            )
+
+        # 5) Uložení lokálně + push na GitHub (web)
+        save_data("players.json", players)
+        _, gh_msg = await asyncio.to_thread(_github_push_players, players, sha)
+
         embed = discord.Embed(
-            title="🔎 Registrace na webu (players.json)",
+            title="🔎 /checkweb – synchronizace tierů na web",
             description=(
-                f"Hráčů s tier rolí: **{total}**\n"
-                f"✅ Na webu: **{registered}**\n"
-                f"❌ Chybí na webu: **{len(missing)}**"
+                f"Zkontrolováno hráčů (kit × hráč): **{total_checked}**\n"
+                f"✅ Již zapsáno: **{total_ok}**\n"
+                f"➕ Nově zapsáno: **{total_added}**\n"
+                f"✏️ Aktualizováno: **{total_updated}**\n"
+                f"📦 Zdroj dat: {source}\n\n"
+                + "\n".join(summary)
             ),
-            color=0x10B981 if not missing else 0xEF4444,
+            color=0x10B981 if total_added + total_updated == 0 else 0xF59E0B,
         )
-        if missing:
-            lines = []
-            for m in missing[:25]:
-                roles_str = ", ".join(
-                    r.name for r in m.roles if r in tier_roles
-                )
-                lines.append(f"• {m.mention} — `{m.display_name}` ({roles_str})")
-            if len(missing) > 25:
-                lines.append(f"…a dalších {len(missing) - 25}")
+        if changes:
+            lines = changes[:15]
+            if len(changes) > 15:
+                lines.append(f"…a dalších {len(changes) - 15} změn")
             embed.add_field(
-                name="❌ Neregistrovaní na webu",
+                name="Změny na webu",
                 value="\n".join(lines),
                 inline=False,
             )
-            embed.set_footer(
-                text="Tip: chybějícího hráče zaregistruješ přes /result. "
-                "Hráč se hledá podle nicku/IGN na serveru."
-            )
-        else:
-            embed.add_field(
-                name="🎉",
-                value="Všichni hráči s tier rolí jsou zaregistrovaní na webu!",
-                inline=False,
-            )
-
+        embed.set_footer(text=f"{gh_msg} · {today}")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 

@@ -44,6 +44,20 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   zapisuje do `data/websync_log.json` (timestamp, počet záznamů,
   úspěch/selhání a chyby).
 
+- **`/topresult` – žebříček top výsledků** – počítá se vždy jen z kanonické
+  `players.json` (žádná druhá databáze) a řadí podle skutečné tier hierarchie
+  projektu (LT5 … HT1): nejlepší tier napříč kity → počet kitů s ním → počet
+  záznamů → jméno. Podporuje `@player`, `tier:…`, `limit:…` a `page:…`
+  (paginace).
+
+- **`/datacheck` – kontrola integrity dat** – projede všechny místní databáze
+  a hlásí duplicitní hráče / Discord ID / IGN, neplatné tiery, konfliktní
+  Discord role, chybějící webové záznamy, neplatné eval reference a osamocené
+  tickety a výsledky. **Nic se automaticky nemaže** – bezpečné opravy (zavření
+  osamoceného ticketu = jen status, bezeztrátová normalizace tierů) se aplikují
+  jen po explicitním potvrzení tlačítkem a auditluggou do
+  `data/datacheck_log.json`.
+
 ## Funkce
 
 ### 🎯 Fronty na tier testy
@@ -89,6 +103,8 @@ příchody/odchody).
 | `/playersync apply` *(admin)* | Ukáže stejný přehled a vyžaduje **explicitní potvrzení** (tlačítko) před aplikací změn. Stav se mezi náhledem a potvrzením ověřuje. Každé použití se zapisuje do `data/playersync_log.json`. |
 | `/websync preview` *(admin)* | Stáhne players.json z webu (GitHub) a porovná ho s kanonickou `players.json` – detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy. **Nic neposílá.** |
 | `/websync apply` *(admin)* | Ukáže stejný přehled a po **explicitním potvrzení** (tlačítko) nahradí players.json na webu kanonickou databází. Kanonická DB se mezi náhledem a potvrzením ověřuje; čtení i zápis mají retry. Výsledek se zapisuje do `data/websync_log.json` (timestamp, počet záznamů, úspěch/selhání a chyby). |
+| `/topresult [player] [tier] [limit] [page]` | Žebříček top výsledků z kanonické `players.json` (řazení: nejlepší tier → počet kitů → počet záznamů). `player` = umístění konkrétního hráče, `tier` = filtr na hráče s tímto nejlepším tierem, `limit` = velikost stránky (1–25), `page` = stránka (paginace). |
+| `/datacheck` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, vše se auditlugguje do `data/datacheck_log.json`. |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
@@ -191,6 +207,8 @@ cogs/
   roles.py            # /setkitrole, /unsetkitrole, /kitrole, /checkweb + auto-grant rolí
   playersync.py       # /playersync (porovnání tier rolí s players.json, audit)
   websync.py          # /websync (porovnání webu s players.json + zápis na web, audit)
+  topresult.py        # /topresult (žebříček top výsledků z kanonické players.json)
+  datacheck.py        # /datacheck (kontrola integrity dat + bezpečné opravy, audit)
   info.py             # /verze (diagnostika běžící verze)
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje
@@ -252,7 +270,7 @@ v originále):
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
 `pulled_players.json`, `kits.json`. Auditní logy synchronizací se uchovávají
-v `data/playersync_log.json` (tier role) a `data/websync_log.json` (web;
-**necommitují se**). Server-specific mapování rolí je
+v `data/playersync_log.json` (tier role), `data/websync_log.json` (web) a
+`data/datacheck_log.json` (kontrola integrity; **necommitují se**). Server-specific mapování rolí je
 v `data/kit_roles.json` (spravuje `/setkitrole`; **necommituje se** – obsahuje
 ID rolí daného serveru).

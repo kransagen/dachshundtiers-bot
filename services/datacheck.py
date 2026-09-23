@@ -306,7 +306,7 @@ def check_missing_website_records(players: list) -> list:
                         "warning",
                         f"🌐 **{username}** má tier pro **{kit}** v modes, ale "
                         "žádný záznam v historii – web by hráče zobrazil bez "
-                        "historie. Doplň záznam (návrh: /result nebo /checkweb).",
+                        "historie. Doplň záznam (návrh: /result).",
                     )
                 )
     return out

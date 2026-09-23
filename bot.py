@@ -75,6 +75,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.roles",
             "cogs.playersync",
             "cogs.websync",
+            "cogs.checkweb",
             "cogs.topresult",
             "cogs.datacheck",
             "cogs.info",

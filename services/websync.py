@@ -4,9 +4,10 @@ Jak web spotřebovává data (ověřeno – viz ``github_sync.py``)
 -------------------------------------------------------------
 Web (DachshundTiers) čte ``players.json`` na GitHubu (repo + cesta
 z ``GITHUB_*`` env). Jeho jediným zapisovatelem je tento bot:
-- ``/result`` a ``/checkweb`` posílají změny přes ``github_sync.push_players``
-  (PUTo přes GitHub Contents API, při konfliktu 409 se merge zopakuje na
-  čerstvých datech, všechny pushy sdílí jeden lock),
+- ``/result`` posílá změny přes ``github_sync.push_players`` a
+  ``/websync apply`` nahrazuje celý soubor kanonickou DB (PUTo přes GitHub
+  Contents API, při konfliktu 409 se merge zopakuje na čerstvých datech,
+  všechny pushy sdílí jeden lock),
 - bez ``GITHUB_TOKEN`` se web nikdy nemění.
 
 Neexistuje žádná druhá databáze: pokaždé se vybere **kanonická** hráčská

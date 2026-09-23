@@ -5,7 +5,7 @@ někdo jiný): při konfliktu se aktuální soubor znovu stáhne, merge funkce s
 znovu aplikuje na čerstvá data a PUT se zopakuje (až ``MAX_PUSH_ATTEMPTS``).
 
 Všechny push navíc sdílejí jeden lock, takže dvě naše vlastní synchronizace
-(např. ``/result`` a ``/checkweb`` naráz) si navzájem nekonfliktují.
+(např. ``/result`` a ``/websync apply`` naráz) si navzájem nekonfliktují.
 
 Merge funkce (``build_fn``) musí být idempotentní pro libovolný aktuální
 seznam hráčů – kvůli opakování po konfliktu. Návratová hodnota je nový

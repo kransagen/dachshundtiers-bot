@@ -24,4 +24,5 @@ data/ht_results.json
 data/playersync_log.json
 data/websync_log.json
 data/datacheck_log.json
+data/checkweb_log.json
 data/.gitkeep

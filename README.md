@@ -22,11 +22,19 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   v `data/kit_roles.json` (necommituje se).
 - **Opraven bug „Synchronizováno 0"** – `tree.copy_global_to(guild=...)` před
   `sync(guild=...)`, takže slash příkazy na serveru nikdy nezmizí.
-- **`/checkweb` nově zapisuje na web** – projede hráče u **každého kitu**
-  (podle tier rolí z `/setkitrole`) a chybějící / změněné tiery **automaticky
-  zapíše do `players.json`** (modes + history) a synchronizuje na GitHub, takže
-  web se sám doplní. Data čte primárně z GitHubu (aby nepřepsal novější změny
-  od `/result`), jinak z lokální kopie.
+- **`/checkweb` – bezpečná synchronizace webu (preview / apply)** – pro každého
+  hráče a kit porovná **Discord tier role × `players.json` × web (GitHub)**
+  (statusy: shoda / chybějící role / databáze ≠ Discord / web ≠ DB / víc tier
+  rolí = **KONFLIKT** / neznámá role / neznámý hráč / duplicitní hráč).
+  **Nic nezapisuje automaticky** – Discord role už NEJSOU autoritativní zdroj
+  (zdrojem pravdy zůstává hodnocení `/result`, Discord role je projekce DB).
+  `/checkweb preview` je čistý náhled; jediný zapisovatel je `/checkweb apply`,
+  který vyžaduje **explicitní per-záznamové rozhodnutí** ([Use Discord] /
+  [Keep Database] / [Ignore]) a potvrzení tlačítkem. Použití „Use Discord“
+  změní JEN tier v `players.json` (**bez zápisu do historie**). Každé
+  rozhodnutí se auditlugguje do `data/checkweb_log.json` (actor, player, kit,
+  old/new tier, reason, timestamp, source). Web se tímto příkazem nemění
+  (na to slouží `/websync`).
 
 - **`/playersync` – synchronizace tier rolí s players.json** – porovná Discord
   tier role (`/setkitrole`) s kanonickou `players.json` a detekuje chybějící
@@ -98,7 +106,8 @@ příchody/odchody).
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit – po `/result` ji hráč dostane automaticky. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
-| `/checkweb` *(tester)* | Projede hráče u **každého kitu** (podle tier rolí z `kit_roles.json`, nastavených přes `/setkitrole`) a hráče, kteří nemají tier zapsaný na webu (`players.json`), **tam automaticky zapíše** – včetně historie s dnešním datem. Následně synchronizuje `players.json` na GitHub (web). V odpovědi ukáže přehled per kit (✅ už zapsáno / ➕ nově / ✏️ aktualizováno). |
+| `/checkweb preview` *(admin)* | Porovná pro každého hráče a kit **Discord role × `players.json` × web** (statusy: MATCH / MISSING_DISCORD_ROLE / DATABASE_MISMATCH / WEBSITE_MISMATCH / MULTIPLE_TIER_ROLES (KONFLIKT) / UNKNOWN_ROLE / UNKNOWN_PLAYER / DUPLICATE_PLAYER). **Nic nemění** – Discord role už nejsou zdroj pravdy, jen projekce DB. |
+| `/checkweb apply` *(admin)* | Ukáže záznamy k řešení a vyžaduje **explicitní per-záznamové rozhodnutí** ([Use Discord] / [Keep Database] / [Ignore]) + potvrzení tlačítkem. „Use Discord" změní JEN tier v `players.json` **bez historie**; u KONFLIKTU (víc rolí) se nikdy nevybírá automaticky. Stav se mezi náhledem a potvrzením ověřuje. Každé rozhodnutí se píše do `data/checkweb_log.json` (actor, player, kit, old/new tier, reason, timestamp, source). Web se nemění – na to je `/websync`. |
 | `/playersync preview` *(admin)* | Porovná tier role na Discordu s `players.json` a ukáže přehled rozdílů – **nic nemění**. |
 | `/playersync apply` *(admin)* | Ukáže stejný přehled a vyžaduje **explicitní potvrzení** (tlačítko) před aplikací změn. Stav se mezi náhledem a potvrzením ověřuje. Každé použití se zapisuje do `data/playersync_log.json`. |
 | `/websync preview` *(admin)* | Stáhne players.json z webu (GitHub) a porovná ho s kanonickou `players.json` – detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy. **Nic neposílá.** |
@@ -204,9 +213,10 @@ utils.py              # pomocné funkce
 cogs/
   queues.py           # fronty
   results.py          # výsledky + statistiky + GitHub sync + auto role
-  roles.py            # /setkitrole, /unsetkitrole, /kitrole, /checkweb + auto-grant rolí
+  roles.py            # /setkitrole, /unsetkitrole, /kitrole + auto-grant rolí
   playersync.py       # /playersync (porovnání tier rolí s players.json, audit)
   websync.py          # /websync (porovnání webu s players.json + zápis na web, audit)
+  checkweb.py         # /checkweb (Discord × players.json × web, per-záznamová rozhodnutí, audit)
   topresult.py        # /topresult (žebříček top výsledků z kanonické players.json)
   datacheck.py        # /datacheck (kontrola integrity dat + bezpečné opravy, audit)
   info.py             # /verze (diagnostika běžící verze)
@@ -270,7 +280,8 @@ v originále):
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
 `pulled_players.json`, `kits.json`. Auditní logy synchronizací se uchovávají
-v `data/playersync_log.json` (tier role), `data/websync_log.json` (web) a
+v `data/playersync_log.json` (tier role), `data/websync_log.json` (web),
+`data/checkweb_log.json` (porovnání Discord × DB × web) a
 `data/datacheck_log.json` (kontrola integrity; **necommitují se**). Server-specific mapování rolí je
 v `data/kit_roles.json` (spravuje `/setkitrole`; **necommituje se** – obsahuje
 ID rolí daného serveru).

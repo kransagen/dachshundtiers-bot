@@ -28,6 +28,13 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   web se sám doplní. Data čte primárně z GitHubu (aby nepřepsal novější změny
   od `/result`), jinak z lokální kopie.
 
+- **`/playersync` – synchronizace tier rolí s players.json** – porovná Discord
+  tier role (`/setkitrole`) s kanonickou `players.json` a detekuje chybějící
+  role, špatné role, víc tier rolí, neznámé hráče, chybějící hráče a neplatné
+  tiery. **Nikdy neřeší konflikty automaticky** – `/playersync preview` ukáže
+  rozdíly, `/playersync apply` vyžaduje explicitní potvrzení tlačítkem.
+  Každé použití se zapisuje do `data/playersync_log.json` (audit).
+
 ## Funkce
 
 ### 🎯 Fronty na tier testy
@@ -69,6 +76,8 @@ příchody/odchody).
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
 | `/checkweb` *(tester)* | Projede hráče u **každého kitu** (podle tier rolí z `kit_roles.json`, nastavených přes `/setkitrole`) a hráče, kteří nemají tier zapsaný na webu (`players.json`), **tam automaticky zapíše** – včetně historie s dnešním datem. Následně synchronizuje `players.json` na GitHub (web). V odpovědi ukáže přehled per kit (✅ už zapsáno / ➕ nově / ✏️ aktualizováno). |
+| `/playersync preview` *(admin)* | Porovná tier role na Discordu s `players.json` a ukáže přehled rozdílů – **nic nemění**. |
+| `/playersync apply` *(admin)* | Ukáže stejný přehled a vyžaduje **explicitní potvrzení** (tlačítko) před aplikací změn. Stav se mezi náhledem a potvrzením ověřuje. Každé použití se zapisuje do `data/playersync_log.json`. |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
@@ -169,6 +178,7 @@ cogs/
   queues.py           # fronty
   results.py          # výsledky + statistiky + GitHub sync + auto role
   roles.py            # /setkitrole, /unsetkitrole, /kitrole, /checkweb + auto-grant rolí
+  playersync.py       # /playersync (porovnání tier rolí s players.json, audit)
   info.py             # /verze (diagnostika běžící verze)
   ht3.py              # HT3+ tickety
   tournaments.py      # turnaje

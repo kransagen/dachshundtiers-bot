@@ -21,7 +21,10 @@ Detekované kategorie (názvy podle požadavku):
 - ``missing_player``  – hráč v DB má tier pro kit, ale na serveru není žádný
                         člen pod tímto jménem (jen report – oprava není možná),
 - ``invalid_tier``    – tier v DB pro kit není namapovaný v kit_roles.json
-                        (jen report – oprava je ruční).
+                        (jen report – oprava je ruční),
+- ``retired_tier_in_db`` – hráč má v DB retired tier (R-prefix) pro kit
+                        (jen report – retired tier = archivovaná historie,
+                        roli neřeší, jen se nahlásí).
 
 Analýza je čistá funkce nad normalizovanými daty (členové bez discord.py)::
 
@@ -37,7 +40,10 @@ Analýza je čistá funkce nad normalizovanými daty (členové bez discord.py):
     analyze_sync(players, members, roles_map, kit_display)
 
 Člen ↔ hráč se páruje podle jména (IGN = nick / display name / username,
-case-insensitive), stejně jako u ``/checkweb``. Poškozená data se přeskakují.
+case-insensitive), stejně jako u ``/checkweb``. Když má hráč v players.json
+vyplněné ``discordId`` (permanentní identita), párování jde PŘEDNOSTNĚ podle
+Discord ID člena – jméno je jen mutovatelný údaj (řeší změnu IGN).
+Poškozená data se přeskakují.
 """
 
 import logging
@@ -57,6 +63,7 @@ KINDS = (
     "unknown_player",
     "missing_player",
     "invalid_tier",
+    "retired_tier_in_db",
 )
 
 KIND_LABELS = {
@@ -66,7 +73,26 @@ KIND_LABELS = {
     "unknown_player": "👤 Neznámí hráči",
     "missing_player": "🚫 Chybějící hráči",
     "invalid_tier": "❌ Neplatné tiery",
+    "retired_tier_in_db": "🧓 Retired tiery v DB",
 }
+
+# Retired tiery (archivovaná historie) – konvence data/players.json:
+# hodnota v "modes" začíná "R" (např. "RLT2" = retired LT2). Retired tier
+# NENÍ aktuální tier: nesynchronizuje se na žádnou roli a nikdy neovlivní
+# wrong_role / missing_role / multiple_roles.
+RETIRED_TIER_PREFIX = "R"
+
+
+def is_retired_tier(tier, retired_tiers=None) -> bool:
+    """Je tier retired? R-prefix (konvence) nebo explicitní seznam tierů."""
+    t = str(tier or "").strip().upper()
+    if not t:
+        return False
+    if retired_tiers:
+        extra = {str(x).strip().upper() for x in retired_tiers}
+        if t in extra:
+            return True
+    return t.startswith(RETIRED_TIER_PREFIX) and len(t) > 1
 
 
 def _now_ms() -> int:
@@ -152,8 +178,23 @@ def _match_player(players, names) -> dict | None:
     return None
 
 
-def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
+def analyze_sync(
+    players,
+    members,
+    roles_map,
+    kit_display=None,
+    *,
+    retired_tiers=None,
+    match_by_discord_id=True,
+) -> dict:
     """Porovná role a DB a vrátí nálezy + navržené akce (neupravuje data).
+
+    - ``retired_tiers``       – extra seznam retired tierů nad rámec R-prefixu;
+                               retired tiery se jen reportují
+                               (``retired_tier_in_db``) a nikdy neovlivní role,
+    - ``match_by_discord_id`` – hráči s vyplněným ``discordId`` (permanentní
+                               identita) se párují PŘEDNOSTNĚ podle ID člena;
+                               jméno (mutable IGN) je až sekundární.
 
     Vrací::
         {
@@ -176,6 +217,14 @@ def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
         key=lambda m: str(m.get("id", "")),
     )
 
+    # discordId → hráč (permanentní identita; jméno je mutable údaj)
+    players_by_discord: dict = {}
+    if match_by_discord_id:
+        for p in players:
+            pid = str(p.get("discordId", "") or "").strip()
+            if pid and pid not in players_by_discord:
+                players_by_discord[pid] = p
+
     findings: list = []
     summary = {kind: 0 for kind in KINDS}
     checked = 0
@@ -187,13 +236,17 @@ def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
         if not kit_key or not isinstance(kit_map, dict):
             continue
 
-        # Platné mapování tier → role (přeskakujeme poškozené záznamy)
+        # Platné mapování tier → role (přeskakujeme poškozené záznamy).
+        # Retired tier role (R-prefix) se do analýzy aktuálních rolí
+        # NEZAPOČÍTÁVÁ – retired tier je archivovaná historie, role se neřeší.
         tier_to_role = {}
         role_to_tier = {}
         for tier, role_id in kit_map.items():
             tier_up = str(tier).strip().upper()
             rid = str(role_id).strip()
             if not tier_up or not rid.isdigit():
+                continue
+            if is_retired_tier(tier_up, retired_tiers):
                 continue
             tier_to_role[tier_up] = rid
             role_to_tier[rid] = tier_up
@@ -210,6 +263,12 @@ def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
                 key = str(n).strip().lower()
                 if key and key not in members_by_name:
                     members_by_name[key] = m
+        # Index členů podle Discord ID (permanentní identita – viz výše)
+        members_by_discord = {}
+        for m in members:
+            mid = str(m.get("id", "") or "").strip()
+            if mid and mid not in members_by_discord:
+                members_by_discord[mid] = m
 
         # Očekávaný tier z DB (pro tento kit) pro každého člena
         expected_by_member: dict = {}
@@ -221,6 +280,25 @@ def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
             if mode_val is None or not str(mode_val).strip():
                 continue
             tier = str(mode_val).strip().upper()
+            if is_retired_tier(tier, retired_tiers):
+                # Retired tier = archivovaná historie, ne aktuální tier.
+                # Nesynchronizuje se na žádnou roli; jen se nahlásí.
+                findings.append(
+                    _finding(
+                        "retired_tier_in_db",
+                        ign=ign,
+                        kit=kit_name,
+                        kit_key=kit_key,
+                        expected_tier=tier,
+                        message=(
+                            f"🧓 **{ign}** má v players.json retired tier "
+                            f"**{tier}** pro **{kit_name}** – archivovaná "
+                            "historie, aktuální role se neřeší."
+                        ),
+                    )
+                )
+                summary["retired_tier_in_db"] += 1
+                continue
             if tier not in tier_to_role:
                 findings.append(
                     _finding(
@@ -238,7 +316,13 @@ def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
                 )
                 summary["invalid_tier"] += 1
                 continue
-            member = members_by_name.get(ign.lower())
+            member = None
+            if match_by_discord_id:
+                pid = str(p.get("discordId", "") or "").strip()
+                if pid:
+                    member = members_by_discord.get(pid)
+            if member is None:
+                member = members_by_name.get(ign.lower())
             if member is None:
                 findings.append(
                     _finding(
@@ -295,7 +379,13 @@ def analyze_sync(players, members, roles_map, kit_display=None) -> dict:
                     continue
                 # Člen drží tier roli, ale DB nemá pro tento kit žádný tier –
                 # buď je hráč v DB bez tieru (špatná role), nebo v DB vůbec není.
-                player = _match_player(players, m.get("names") or [])
+                player = None
+                if match_by_discord_id:
+                    mid = str(m.get("id", "") or "").strip()
+                    if mid:
+                        player = players_by_discord.get(mid)
+                if player is None:
+                    player = _match_player(players, m.get("names") or [])
                 for rid in held_ids:
                     if player is not None:
                         findings.append(

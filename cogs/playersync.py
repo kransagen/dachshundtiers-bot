@@ -23,10 +23,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from services.permissions import has_admin_role
-from services.playersync import (
+from services.role_sync import (
     KIND_LABELS,
     KINDS,
-    analyze_sync,
+    analyze_role_sync,
     fingerprint,
     log_playersync_event,
     make_member,
@@ -221,7 +221,7 @@ class PlayerSync(commands.Cog):
         players = load_data("players.json", []) or []
         kit_display = {str(k).lower(): str(k) for k in get_kits()}
         members = [_member_to_dict(m) for m in await _guild_members(guild)]
-        return analyze_sync(players, members, roles_map, kit_display)
+        return analyze_role_sync(players, members, roles_map, kit_display)
 
     async def _apply_actions(self, guild: discord.Guild, actions: list) -> list:
         """Aplikuje akce (add/remove rolí); každá akce se vyhodnotí zvlášť."""

@@ -24,6 +24,7 @@ import time
 
 from services.store import read as store_read, transaction
 from services.tickets import HT_TICKETS_FILE, HT3_TIER_LADDER, STATUS_CLOSED
+from services.playersync import is_retired_tier
 
 log = logging.getLogger("dachshundtiers")
 
@@ -39,6 +40,8 @@ KINDS = (
     "invalid_eval_references",
     "orphaned_tickets",
     "orphaned_results",
+    "retired_tiers_in_modes",
+    "duplicate_player_discord_ids",
 )
 
 KIND_LABELS = {
@@ -51,6 +54,8 @@ KIND_LABELS = {
     "invalid_eval_references": "🎓 Neplatné eval reference",
     "orphaned_tickets": "🎟️ Osamocené tickety",
     "orphaned_results": "📋 Osamocené výsledky",
+    "retired_tiers_in_modes": "🧓 Retired tiery v modes",
+    "duplicate_player_discord_ids": "🆔 Duplicitní discordId hráčů",
 }
 
 # Známý vesmír tierů: žebříček + aliasy LT3-evalu + turnajové S/A/B + R-tiery.
@@ -312,6 +317,59 @@ def check_missing_website_records(players: list) -> list:
     return out
 
 
+def check_retired_tiers_in_modes(players: list) -> list:
+    """Retired tiery (R-prefix) v modes = archivovaná historie, ne aktuální tier.
+
+    Jen report – retired tiery se nikdy nemazou ani nepřepisují.
+    """
+    out = []
+    for p in (players or []):
+        if not isinstance(p, dict):
+            continue
+        username = _username(p)
+        raw_modes = p.get("modes")
+        modes = raw_modes if isinstance(raw_modes, dict) else {}
+        for kit, tier in sorted(modes.items()):
+            if is_retired_tier(tier):
+                raw = str(tier).strip()
+                out.append(
+                    _finding(
+                        "retired_tiers_in_modes",
+                        "warning",
+                        f"🧓 **{username}** · **{kit}** má retired tier "
+                        f"`{raw}` v modes (aktuální tiery). Patří do retired "
+                        "historie – role se nesynchronizuje. (Nic se nemění "
+                        "automaticky.)",
+                    )
+                )
+    return out
+
+
+def check_player_discord_ids(players: list) -> list:
+    """Duplicitní discordId napříč hráči – jeden Discord účet = jeden hráč."""
+    seen: dict[str, list] = {}
+    for p in (players or []):
+        if not isinstance(p, dict):
+            continue
+        did = str(p.get("discordId", "") or "").strip()
+        username = _username(p)
+        if not did or not username:
+            continue
+        seen.setdefault(did, []).append(username)
+    out = []
+    for did, usernames in sorted(seen.items()):
+        if len(usernames) > 1:
+            out.append(
+                _finding(
+                    "duplicate_player_discord_ids",
+                    "error",
+                    f"🆔 Discord ID **{did}** patří {len(usernames)} hráčům: "
+                    f"{', '.join(sorted(usernames))} – konflikt identity.",
+                )
+            )
+    return out
+
+
 def check_eval_references(evals: dict, players: list, kits: list) -> list:
     player_igns = {_normalize_key(_username(p)) for p in (players or []) if isinstance(p, dict)}
     kit_keys = {_normalize_key(k) for k in (kits or [])}
@@ -500,6 +558,8 @@ async def run_datacheck(
     findings += check_invalid_tiers(players)
     findings += check_kit_roles_conflicts(kit_roles)
     findings += check_missing_website_records(players)
+    findings += check_retired_tiers_in_modes(players)
+    findings += check_player_discord_ids(players)
     findings += check_eval_references(evals, players, kits)
     findings += check_orphaned_tickets(tickets, channel_exists=channel_exists)
     findings += check_orphaned_results(results, players, tickets)

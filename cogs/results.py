@@ -1,14 +1,16 @@
 """Cog s výsledky tier testů a statistikami testerů.
 
-- /result            – zápis výsledku testu (cooldown, players.json, statistiky, GitHub)
+- /result            – zápis výsledku testu (cooldown, players.json, statistiky)
 - /testerstats       – portfolio jednoho testera
 - /testersstats      – tabulka testerů (tento měsíc / všechny časy)
 - /addtest           – admin: přidání historických testů
 - /removetest        – admin: odečtení testů (upraví total i aktuální měsíc, min 0)
-- /removeplayertiers – admin: smazání hráče z players.json
+- /removeplayertiers – admin: odebrání všech aktuálních tierů hráče (historie zůstává)
+
+Pozn.: /result NEZapisuje na GitHub automaticky – kanonická players.json se
+na web propaguje výhradně přes /websync (jeden zápis do webu).
 """
 
-import asyncio
 import logging
 import time
 
@@ -16,9 +18,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-import github_sync
 from config import (
-    GITHUB_TOKEN,
     HT3_COOLDOWN_MS,
     PLAYER_COOLDOWN_MS,
     get_result_channel_id,
@@ -28,7 +28,6 @@ from services.queue_service import leave_queue, remove_pulled_player
 from services.results import (
     EVAL_TIER,
     RESULT_TIERS,
-    apply_result_to_players,
     record_result,
     validate_result_tier,
 )
@@ -112,45 +111,6 @@ async def _log_tester_stat(tester_id: str, kit: str, tier: str, month: str) -> N
         tx.set("testers_stats.json", stats_db)
 
     return await transaction(("testers_stats.json",), _run)
-
-
-# ---------------------------------------------------------------------------
-# GitHub synchronizace players.json (ekvivalent původní Octokit integrace)
-# ---------------------------------------------------------------------------
-def _apply_result_to_players(
-    players: list, ign: str, mode: str, new_tier: str, current_date: str
-) -> list:
-    """Aplikuje výsledek /result na daný seznam hráčů (pro GitHub push).
-
-    Deleguje na jednotnou aplikaci z services.results – kanonická players.json
-    a GitHub push používají stejnou logiku. Idempotentní vůči libovolnému
-    aktuálnímu seznamu – při konfliktu (409) ji ``github_sync.push_players``
-    zavolá znovu na čerstvě stažených datech.
-    """
-    players, _prev = apply_result_to_players(
-        players, ign, mode, new_tier, current_date
-    )
-    return players
-
-
-async def _sync_players_github_async(interaction, ign, mode, new_tier, current_date) -> None:
-    try:
-        ok, message, _ = await github_sync.push_players(
-            f"Update {ign} - {mode}: {new_tier}",
-            lambda players: _apply_result_to_players(players, ign, mode, new_tier, current_date),
-            success_message="✅ Úspěšně aktualizováno na GitHubu!",
-        )
-        if ok:
-            await interaction.followup.send(
-                f"{message}\n- **Hráč:** {ign}\n- **Mód:** {mode}\n- **Tier:** {new_tier}",
-                ephemeral=True,
-            )
-        else:
-            await interaction.followup.send(message, ephemeral=True)
-    except Exception as err:  # noqa: BLE001
-        await interaction.followup.send(
-            f"❌ Nastala chyba při zápisu na GitHub: {err}", ephemeral=True
-        )
 
 
 class Results(commands.Cog):
@@ -516,8 +476,10 @@ class Results(commands.Cog):
             f"Hráč: <@{target_id}> | Tester: <@{interaction.user.id}>"
         )
         saved_msg = (
-            f"✅ Výsledek uložen na GitHubu pro hráče **{ign_clean}** — "
+            f"✅ Výsledek uložen do players.json pro hráče **{ign_clean}** — "
             f"mód **{kit_clean}**, tier **{display_tier}**."
+            "\n🌐 Web se aktualizuje samostatně přes **/websync** "
+            "(players.json → GitHub) – /result už na GitHub neposílá."
         )
         if new_kit_added:
             saved_msg += (
@@ -552,12 +514,6 @@ class Results(commands.Cog):
                 f"{saved_msg} (Výsledkový kanál <#{result_channel_id}> nebyl nalezen.)",
                 embed=embed,
                 ephemeral=True,
-            )
-
-        # 8) Volitelný GitHub sync
-        if GITHUB_TOKEN:
-            asyncio.create_task(
-                _sync_players_github_async(interaction, ign_clean, kit_clean, stored_tier, current_date)
             )
 
     # ------------------------------------------------------------------
@@ -731,7 +687,10 @@ class Results(commands.Cog):
     # ------------------------------------------------------------------
     # /removeplayertiers (admin)
     # ------------------------------------------------------------------
-    @app_commands.command(name="removeplayertiers", description="Smaže všechny tiery hráče na webu")
+    @app_commands.command(
+        name="removeplayertiers",
+        description="Odebere hráči všechny aktuální tiery (historie zůstává)",
+    )
     @app_commands.describe(ign="Minecraft jméno hráče (IGN)")
     async def removeplayertiers(self, interaction: discord.Interaction, ign: str) -> None:
         if not has_admin_role(interaction.user):
@@ -740,25 +699,41 @@ class Results(commands.Cog):
             )
 
         async def _run(tx):
-            players = tx.get("players.json")
-            index = next(
-                (i for i, p in enumerate(players) if p.get("username", "").lower() == ign.lower()),
-                None,
-            )
-            if index is None:
-                return False
-            players.pop(index)
-            tx.set("players.json", players)
-            return True
+            players = tx.get("players.json", [])
+            if not isinstance(players, list):
+                return None
+            for p in players:
+                if not isinstance(p, dict):
+                    continue
+                if str(p.get("username", "") or "").strip().lower() != ign.strip().lower():
+                    continue
+                modes = p.get("modes")
+                if not isinstance(modes, dict) or not modes:
+                    return []
+                cleared = sorted(str(k) for k in modes.keys())
+                p["modes"] = {}
+                tx.set("players.json", players)
+                return cleared
+            return None
 
-        removed = await transaction(("players.json",), _run)
-        if not removed:
+        cleared = await transaction(("players.json",), _run)
+        if cleared is None:
             return await interaction.response.send_message(
                 f"Hráč **{ign}** nebyl v databázi nalezen.", ephemeral=True
             )
+        if not cleared:
+            return await interaction.response.send_message(
+                f"Hráč **{ign}** nemá žádné aktuální tiery. Záznam a historie "
+                "zůstávají beze změny.",
+                ephemeral=True,
+            )
 
         await interaction.response.send_message(
-            f"✅ Hráči **{ign}** byly úspěšně smazány všechny tiery a byl odebrán z webu."
+            f"✅ Hráči **{ign}** byly odebrány aktuální tiery: "
+            f"`{', '.join(cleared)}`.\n"
+            "Záznam hráče a historie zůstávají. Web se aktualizuje přes "
+            "**/websync** (players.json → GitHub).",
+            ephemeral=True,
         )
 
 

@@ -28,16 +28,21 @@ from services.datacheck import (
     check_missing_website_records,
     check_orphaned_results,
     check_orphaned_tickets,
+    check_player_discord_ids,
+    check_retired_tiers_in_modes,
     check_ticket_identities,
 )
 
 
-def _player(username, modes=None, history=None):
-    return {
+def _player(username, modes=None, history=None, discord_id=None):
+    p = {
         "username": username,
         "modes": dict(modes or {}),
         "history": dict(history or {}),
     }
+    if discord_id is not None:
+        p["discordId"] = str(discord_id)
+    return p
 
 
 def _ticket(cid, owner="1", ign="alice", kit="AnchorPvP", status="open", **extra):
@@ -242,6 +247,47 @@ class PureCheckTests(unittest.TestCase):
         ]
         self.assertEqual(len(check_missing_website_records(players)), 1)
 
+    def test_retired_tiers_in_modes(self):
+        players = [
+            _player("rl", {"AnchorPvP": "RLT2"}),
+            _player("ok", {"AnchorPvP": "HT3"}),
+        ]
+        findings = check_retired_tiers_in_modes(players)
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f["kind"], "retired_tiers_in_modes")
+        self.assertEqual(f["severity"], "warning")
+        self.assertIsNone(f["repair"])  # retired tier se nesmí mazat/přepisovat
+        self.assertIn("rl", f["message"])
+
+    def test_retired_tiers_in_modes_clean(self):
+        self.assertEqual(
+            check_retired_tiers_in_modes([_player("ok", {"AnchorPvP": "HT3"})]),
+            [],
+        )
+
+    def test_player_discord_id_duplicates(self):
+        players = [
+            _player("One", discord_id="42"),
+            _player("Two", discord_id="42"),
+            _player("Three", discord_id="7"),
+            _player("NoId"),
+        ]
+        findings = check_player_discord_ids(players)
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f["kind"], "duplicate_player_discord_ids")
+        self.assertEqual(f["severity"], "error")
+        self.assertIn("42", f["message"])
+        self.assertIn("One", f["message"])
+        self.assertIn("Two", f["message"])
+
+    def test_player_discord_id_clean(self):
+        self.assertEqual(
+            check_player_discord_ids([_player("A", discord_id="1"), _player("B")]),
+            [],
+        )
+
     def test_eval_references(self):
         players = [_player("Alice")]
         evals = {
@@ -346,6 +392,9 @@ class RunDataCheckTests(unittest.TestCase):
                         {"AnchorPvP": [{"date": "1.1.2026", "tier": "LT3"}]}),
                 _player("ALICE", {"IronAxe": " lt3 "}),  # duplicita + nekanonický
                                                          # tier + bez historie
+                _player("Retired", {"AnchorPvP": "RLT2"}),   # retired v modes
+                _player("Dup1", discord_id="42"),            # duplicitní discordId
+                _player("Dup2", discord_id="42"),
             ],
         )
         self._write("evals.json", {"nosuchkit": {"alice": 1}})
@@ -376,7 +425,7 @@ class RunDataCheckTests(unittest.TestCase):
                 channel_exists=exists, now=5,
             )
             self.assertTrue(report["has_issues"])
-            # každá z devíti kategorií aspoň jednou
+            # všechny kategorie (11) aspoň jednou
             for kind in datacheck.KINDS:
                 self.assertGreaterEqual(
                     report["summary"][kind], 1, f"{kind} nebyl detekován"

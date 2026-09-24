@@ -71,6 +71,36 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   jen po explicitním potvrzení tlačítkem a auditluggou do
   `data/datacheck_log.json`.
 
+## Architektura synchronizace (Discord → DB → Web)
+
+Tok dat je jednosměrný, kanonická `players.json` je **jediný zdroj pravdy**:
+
+1. **Hodnocení píše do DB** – `/result` (a `/topresult` s `resultType=ht_fight`)
+   zapisuje tier + historii do kanonické `players.json`. Na web/GitHub
+   **nic neposílá**.
+2. **Discord role = projekce DB** – `/playersync` čte `players.json` +
+   `kit_roles.json` přes centrální `services/role_sync.py`, navrhne rozdíly
+   a `/playersync apply` je po potvrzení aplikuje (audit v
+   `playersync_log.json`).
+3. **Web = kopie** – jediný zapisovatel `players.json` na GitHub je
+   `/websync` (preview/apply s potvrzením, audit v `websync_log.json`).
+   Žádný jiný příkaz web nemění.
+
+Pravidla z auditu (kodifikovaná v `services/role_sync.py` + `services/datacheck.py`):
+
+- **Retired tiery** – tier s prefixem `R` v `players.json` (např. `RLT2`) je
+  archivovaná historie: **nikdy se nemaže ani nepřepisuje**. RoleSync je
+  ignoruje (retired role z `kit_roles.json` nezpůsobí wrong_role /
+  unknown_player) a `/playersync` je reportuje jako samostatnou kategorii
+  „🧓 Retired tiery v DB" bez návrhu akce. Datacheck hlásí retired tiery
+  zapomenuté v `modes` („🧓 Retired tiery v modes") – jen report, žádná oprava.
+- **`discordId` = permanentní identita** – hráč s polem `discordId` se páruje
+  s Discord členem podle ID (přes změnu IGN); jméno je jen fallback.
+  Duplicitní `discordId` napříč hráči detekuje datacheck
+  („🆔 Duplicitní discordId hráčů").
+- **`/removeplayertiers`** odebírá jen aktuální tiery (`modes`); záznam hráče
+  i historie zůstávají.
+
 ## Funkce
 
 ### 🎯 Fronty na tier testy
@@ -107,7 +137,7 @@ příchody/odchody).
 | `/testersstats current\|all` | Žebříček testerů (tento měsíc / všechny časy). |
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |
 | `/removetest user amount` *(admin)* | Odečtení testů (upraví i aktuální měsíc, nikdy pod nulu). |
-| `/removeplayertiers ign` *(admin)* | Smazání hráče z `players.json`. |
+| `/removeplayertiers ign` *(admin)* | Odebere hráči **všechny aktuální tiery** (`modes`); záznam hráče i historie zůstávají. Web se aktualizuje přes `/websync`. |
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit – po `/result` ji hráč dostane automaticky. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru pro kit. |
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
@@ -118,7 +148,7 @@ příchody/odchody).
 | `/websync preview` *(admin)* | Stáhne players.json z webu (GitHub) a porovná ho s kanonickou `players.json` – detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy. **Nic neposílá.** |
 | `/websync apply` *(admin)* | Ukáže stejný přehled a po **explicitním potvrzení** (tlačítko) nahradí players.json na webu kanonickou databází. Kanonická DB se mezi náhledem a potvrzením ověřuje; čtení i zápis mají retry. Výsledek se zapisuje do `data/websync_log.json` (timestamp, počet záznamů, úspěch/selhání a chyby). |
 | `/topresult hrac ign kit fight_tier outcome score opponent tier_status` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json` (players.json se **nemění**) a pošle zprávu ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`. V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
-| `/datacheck` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, vše se auditlugguje do `data/datacheck_log.json`. |
+| `/datacheck` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky, **retired tiery v modes** a **duplicitní discordId hráčů**. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, vše se auditlugguje do `data/datacheck_log.json`. |
 
 `/result`:
 - nastaví hráči 4denní cooldown (`cooldowns.json`),
@@ -138,7 +168,9 @@ příchody/odchody).
 - **pošle výsledek do určeného výsledkového kanálu podle tieru** – HT3 a výš
   (HT3/LT2/HT2/LT1/HT1) jdou do `RESULT_CHANNEL_UPPER`, LT3 a níž do
   `RESULT_CHANNEL_LOWER`. Tester dostane jen soukromé potvrzení,
-- **volitelně** synchronizuje `players.json` na GitHub (ekvivalent původní Octokit integrace).
+- **volitelně** zapíše roli dle `/setkitrole` (viz výše). Na GitHub už
+  **nic neposílá** – web (players.json na GitHubu) se aktualizuje výhradně
+  přes `/websync`.
 
 ### 💸 HT3+ tickety
 | Příkaz | Popis |
@@ -286,7 +318,9 @@ v originále):
 `queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
-`pulled_players.json`, `kits.json`. Kanonická historie výsledků (jak `/result`,
+`pulled_players.json`, `kits.json`. `players.json` obsahuje pro každého hráče
+`modes` (aktuální tiery), `history` (archiv) a volitelně `discordId`
+(permanentní identita pro párování s Discord účtem při změně IGN). Kanonická historie výsledků (jak `/result`,
 tak `/topresult` s `resultType=ht_fight`) je v `data/ht_results.json`
 (append-only, **necommituje se**). Auditní logy synchronizací se uchovávají
 v `data/playersync_log.json` (tier role), `data/websync_log.json` (web),

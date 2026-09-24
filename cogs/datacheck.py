@@ -7,7 +7,8 @@ pravdy) a nahlásí problémy:
   - neplatné tiery (mimo známou hierarchii),
   - konfliktní Discord role (jedna role na víc kitů/tierů),
   - chybějící webové záznamy (modes bez historie),
-  - neplatné eval reference, osamocené tickety a výsledky.
+  - neplatné eval reference, osamocené tickety a výsledky,
+  - retired tiery v modes (archivovaná historie) a duplicitní discordId hráčů.
 
 NIC se automaticky nemaže. Když existují **bezpečné opravy** (jen zavření
 osamoceného ticketu – záznam zůstává – a bezeztrátová normalizace tierů),

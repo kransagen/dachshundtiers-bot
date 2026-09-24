@@ -200,5 +200,46 @@ class QueueServiceTests(unittest.TestCase):
         asyncio.run(main())
 
 
+class CooldownRemainingTests(unittest.TestCase):
+    """cooldowns.json ukládá čas POSLEDNÍHO testu (ne expiry).
+
+    Semantika je sdílená join flow (/queue) i /cooldown zobrazením –
+    „kolik zbývá" = last_test + cooldown_ms - now, ne last_test - now.
+    """
+
+    COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
+
+    def test_remaining_inside_window(self):
+        now = 1_000_000
+        remaining = queue_service.cooldown_remaining(
+            {"1": now - 60_000}, "1", now, self.COOLDOWN_MS
+        )
+        self.assertEqual(remaining, self.COOLDOWN_MS - 60_000)
+
+    def test_expired_returns_none(self):
+        now = 1_000_000
+        remaining = queue_service.cooldown_remaining(
+            # „starý" timestamp – test proběhl dávno, cooldown vypršel
+            {"1": now - self.COOLDOWN_MS - 1},
+            "1",
+            now,
+            self.COOLDOWN_MS,
+        )
+        self.assertIsNone(remaining)
+
+    def test_no_record_returns_none(self):
+        now = 1_000_000
+        self.assertIsNone(
+            queue_service.cooldown_remaining({}, "1", now, self.COOLDOWN_MS)
+        )
+
+    def test_other_player_unaffected(self):
+        now = 1_000_000
+        remaining = queue_service.cooldown_remaining(
+            {"2": now - 60_000}, "1", now, self.COOLDOWN_MS
+        )
+        self.assertIsNone(remaining)
+
+
 if __name__ == "__main__":
     unittest.main()

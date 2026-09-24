@@ -20,7 +20,8 @@ Behavior:
 - **výhra povyšuje hráče** na další tier (services/topresult.py – kanonické
   pravidlo next_ticket_tier); výhra udělí i novou tier roli (stejná logika
   jako /result – auto_grant_kit_role); prohra tier ani roli nemění,
-- výhra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown,
+- prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown;
+  výhra ticket NEZAVÍRÁ ani cooldown nenastavuje (hráč ve výhře pokračuje),
 - oznámení má stav pending → sent/failed (retry tlačítkem po selhání –
   záznam v historii zůstává append-only, mění se jen stav oznámení),
 - příkaz NIKDY nepoužije ``RESULT_CHANNEL_LOWER`` / ``RESULT_CHANNEL_UPPER``,
@@ -261,7 +262,8 @@ class TopResult(commands.Cog):
             )
 
         # 1) Zápis do kanonické historie (ht_results.json, resultType=ht_fight):
-        #    výhra = povýšení hráče + zavření ticketu; prohra = beze změny.
+        #    výhra = povýšení hráče, ticket zůstává otevřený; prohra = zavření
+        #    ticketu + HT3+ cooldown vlastníka.
         record = await record_ht_fight(
             ticket_id=ticket["id"] if ticket is not None else None,
             player_id=player_id,
@@ -357,7 +359,7 @@ class TopResult(commands.Cog):
                 log.exception("Nelze udělit tier roli po HT Fightu (%s)", kit_clean)
                 grant_note = "⚠️ Tier roli se nepodařilo udělit – oprav ji manuálně."
 
-        # 1b) Výhra v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
+        # 1b) Prohra v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
         if ticket is not None:
             try:
                 fresh_ticket = await get_ticket(ticket["id"])

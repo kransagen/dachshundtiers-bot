@@ -11,8 +11,9 @@ Klíčové vlastnosti:
   - **výhra povyšuje hráče** na další tier v players.json (canonické pravidlo:
     ``next_ticket_tier`` ze žebříčku bez virtuálního LT3E), **prohra tier
     nemění**; neznámý/nečitelný tier → žádné povýšení (nikdy se nehádá),
-  - výhra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
-    vlastníkovi a připíše událost do logu ticketu (sdílené zavírání s /result),
+  - prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
+    vlastníkovi a připíše událost do logu ticketu (sdílené zavírání s /result);
+    výhra ticket NEZAVÍRÁ ani cooldown nenastavuje,
   - idempotence pro HT Fight ticket: klíč ``{ticketId}:ht_fight`` — druhé
     odeslání vrátí ``duplicate`` a nic nepošle dvakrát,
   - validace: HT tier ze žebříčku (bez virtuálního LT3E), skóre ``0-4``
@@ -259,8 +260,9 @@ async def record_ht_fight(
     Povýšení: **výhra** posune hráče na další tier v players.json
     (``next_ticket_tier`` – žebříček bez virtuálního LT3E), **prohra** tier
     nemění. Neznámý/nečitelný aktuální tier → žádné povýšení (nikdy se nehádá).
-    Výhra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
-    vlastníkovi (``ht3_cooldown_ms``) a připíše událost do logu ticketu.
+    Prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
+    vlastníkovi (``ht3_cooldown_ms``) a připíše událost do logu ticketu;
+    výhra ticket NEZAVÍRÁ a cooldown nenastavuje (hráč ve výhře pokračuje).
 
     ``ticket_id`` (ID kanálu HT Fight ticketu) → výsledek se propojí
     s ticketem a idempotentně klíčuje jako ``{ticketId}:ht_fight``:
@@ -386,9 +388,11 @@ async def record_ht_fight(
         results[result_id] = record
         tx.set(HT_RESULTS_FILE, results)
 
-        # Výhra uvnitř HT Fight ticketu = vyřešený ticket → zavření + HT3+
+        # Prohra uvnitř HT Fight ticketu = vyřešený ticket → zavření + HT3+
         # cooldown vlastníka + událost v logu (sdílené zavírání s /result).
-        if ticket_id is not None and outcome_clean == "Won":
+        # Výhra ticket NIKDY nezavírá a cooldown nenastavuje – hráč může
+        # ve výhře pokračovat, prohra ho pošle do cooldownu.
+        if ticket_id is not None and outcome_clean == "Lost":
             close_ticket_in_tx(
                 tx,
                 tickets,
@@ -399,7 +403,7 @@ async def record_ht_fight(
                 actor_name=evaluator_name,
                 ht3_cooldown_ms=ht3_cooldown_ms,
                 log_action="ht_fight",
-                log_details=f"{previous} → {new_tier}",
+                log_details=f"{previous} (prohra)",
             )
 
         return {"result": "created", "record": record, "previous_tier": previous}

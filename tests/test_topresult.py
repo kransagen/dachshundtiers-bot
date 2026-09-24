@@ -13,9 +13,9 @@ Pokrývají zadání /topresult:
 - VÝHRA povyšuje hráče v players.json přes kanonickou apply_result_to_players
   (next_ticket_tier ze žebříčku bez LT3E); prohra tier nemění; neznámý nebo
   retired aktuální tier se nikdy nehádá (žádné povýšení),
-- VÝHRA uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
-  vlastníka a připíše událost do logu ticketu (sdílené zavírání s /result;
-  prohra nechává ticket otevřený),
+- PROHRA uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
+  vlastníka a připíše událost do logu ticketu (sdílené zavírání s /result);
+  výhra nechává ticket otevřený a cooldown nenastavuje,
 - oznámení výsledku do kanálu: pending → sent/failed + messageId.
 Oprávnění (tester role) se hlídá v cogy přes has_tester_role – stejně jako
 /result (tyto čisté testy discord.py nespouštějí; test_permissions.py pokrývá
@@ -389,9 +389,9 @@ class RecordHTFightTicketTests(unittest.TestCase):
             self.assertEqual(data["ticketId"], "2001")
             self.assertEqual(data["id"], "2001:ht_fight")
             self.assertEqual(data["resultType"], "ht_fight")
-            # ticket zůstává OTEVŘENÝ (zavírá ho až /result logika)
+            # prohra zavírá HT Fight ticket (WIN ho nechává otevřený)
             ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "open")
+            self.assertEqual(ticket["status"], "closed")
             # players.json beze změny
             players = storage.load_data("players.json", [])
             self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
@@ -496,12 +496,13 @@ class ResultTypeIntegrationTests(unittest.TestCase):
         # fungovat a může koexistovat s HT Fight výsledkem (jiný idempotentní
         # klíč: ticketId vs ticketId:ht_fight).
         async def main():
-            # HT Fight výsledek nejdřív (ticket otevřený) – klíč ticketId:ht_fight
+            # HT Fight výsledek nejdřív (výhra nechává ticket OTEVŘENÝ) –
+            # klíč ticketId:ht_fight
             fight = await topresult.record_ht_fight(
                 ticket_id=2001, player_id="1", player_name="a",
                 ign="mendu__", evaluator_id="9", evaluator_name="t",
-                kit="MolePVP", fight_tier="HT3", score="0-4",
-                outcome="Lost", opponent_id="2", tier_status="Zůstává LT3",
+                kit="MolePVP", fight_tier="HT3", score="4-1",
+                outcome="Won", opponent_id="2", tier_status="Povýšen na HT3",
                 now=NOW + 1, date="24.09.2026",
             )
             self.assertEqual(fight["result"], "created")
@@ -533,9 +534,10 @@ class ResultTypeIntegrationTests(unittest.TestCase):
 class RecordHTFightPromotionTests(unittest.TestCase):
     """Výhra povyšuje hráče, prohra/neznámý/retired tier nemění.
 
-    Výhra uvnitř HT Fight ticketu = povýšení + zavření + HT3+ cooldown
-    vlastníka + událost v logu + oznámení pending. Konflikt identity
-    (IGN patří jinému Discord ID) se odmítá bez zápisu.
+    Výhra uvnitř HT Fight ticketu = povýšení + oznámení pending, ticket
+    zůstává OTEVŘENÝ a cooldown se nenastavuje. Prohra = žádné povýšení,
+    ale ticket se zavře + HT3+ cooldown vlastníka + událost v logu.
+    Konflikt identity (IGN patří jinému Discord ID) se odmítá bez zápisu.
     """
 
     COOLDOWN_MS = 604_800_000  # 7 dní, jako HT3_COOLDOWN_MS
@@ -601,27 +603,22 @@ class RecordHTFightPromotionTests(unittest.TestCase):
             self.assertEqual(data["announcement"], "pending")
         asyncio.run(main())
 
-    def test_win_in_ticket_promotes_closes_and_sets_cooldown(self):
+    def test_win_in_ticket_promotes_keeps_ticket_open(self):
         async def main():
             rec = await self._record(ticket_id=2001)
             self.assertEqual(rec["result"], "created")
             self.assertEqual(rec["record"]["newTier"], "HT3")
-            # ticket zavřený
+            # výhra nechává ticket OTEVŘENÝ
             ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "closed")
-            # HT3+ cooldown vlastníka (klíč: diskord ID + kit ticketu)
-            cds = storage.load_data(tickets.HT3_COOLDOWNS_FILE, {})
-            self.assertEqual(cds["1"]["MolePVP"], NOW + self.COOLDOWN_MS)
-            # událost v logu ticketu
-            logs = storage.load_data(tickets.HT_TICKET_LOGS_FILE, {})["2001"]
-            self.assertEqual(logs[-1]["action"], "ht_fight")
-            self.assertEqual(logs[-1]["details"], "LT3 → HT3")
-            self.assertEqual(logs[-1]["actorId"], "9")
+            self.assertEqual(ticket["status"], "open")
+            # žádný cooldown, žádná událost v logu (zavírá až prohra / /result)
+            self.assertEqual(storage.load_data(tickets.HT3_COOLDOWNS_FILE, {}), {})
+            self.assertEqual(storage.load_data(tickets.HT_TICKET_LOGS_FILE, {}), {})
             # oznámení pending na záznamu
             self.assertEqual(rec["record"]["announcement"], "pending")
         asyncio.run(main())
 
-    def test_loss_keeps_ticket_open_and_does_not_promote(self):
+    def test_loss_closes_ticket_and_sets_cooldown_no_promote(self):
         async def main():
             rec = await self._record(
                 ticket_id=2001, outcome="Lost", score="0-4",
@@ -630,12 +627,18 @@ class RecordHTFightPromotionTests(unittest.TestCase):
             self.assertEqual(rec["result"], "created")
             self.assertEqual(rec["previous_tier"], "LT3")
             self.assertEqual(rec["record"]["newTier"], "")
-            # prohra nechává ticket OTEVŘENÝ
+            # prohra zavírá ticket
             ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "open")
-            # žádný cooldown, žádný log, hráč se nemění
-            self.assertEqual(storage.load_data(tickets.HT3_COOLDOWNS_FILE, {}), {})
-            self.assertEqual(storage.load_data(tickets.HT_TICKET_LOGS_FILE, {}), {})
+            self.assertEqual(ticket["status"], "closed")
+            # HT3+ cooldown vlastníka (klíč: diskord ID + kit ticketu)
+            cds = storage.load_data(tickets.HT3_COOLDOWNS_FILE, {})
+            self.assertEqual(cds["1"]["MolePVP"], NOW + self.COOLDOWN_MS)
+            # událost v logu ticketu
+            logs = storage.load_data(tickets.HT_TICKET_LOGS_FILE, {})["2001"]
+            self.assertEqual(logs[-1]["action"], "ht_fight")
+            self.assertEqual(logs[-1]["details"], "LT3 (prohra)")
+            self.assertEqual(logs[-1]["actorId"], "9")
+            # hráč se nemění
             players = storage.load_data("players.json", [])
             self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
         asyncio.run(main())

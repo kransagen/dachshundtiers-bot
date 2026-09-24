@@ -45,6 +45,10 @@ async def auto_grant_kit_role(
     Vrací krátkou poznámku pro potvrzovací zprávu `/result` (``""`` = nic).
     Zápis výsledku nikdy nenaruší – všechny chyby se jen zalogují.
     """
+    # Klíče v kit_roles.json jsou vždy lowercase (ukládá je /setkitrole);
+    # volající (/result i /topresult) sem ale můžou poslat display-case název
+    # kitu (např. "MolePVP") – sjednocení na jednom místě.
+    kit_key = (kit_key or "").strip().lower()
     roles_map = load_data(KIT_ROLES_FILE, {})
     kit_map = roles_map.get(kit_key)
     if not kit_map:

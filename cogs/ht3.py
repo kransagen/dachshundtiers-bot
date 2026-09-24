@@ -22,7 +22,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import HT3_PANEL_CHANNEL_ID
+from config import HT3_PANEL_CHANNEL_ID, PLAYER_COOLDOWN_MS
+from services.queue_service import cooldown_remaining
 from services.tickets import (
     add_member,
     claim_ticket,
@@ -459,10 +460,13 @@ class HT3(commands.Cog):
 
         text = f"**Cooldowny pro {target.name}**\n\n"
 
-        # Waitlist (queue) cooldown – 4 dny mezi testy
-        queue_expiry = queue_cooldowns.get(target_id)
-        if queue_expiry and queue_expiry > now:
-            remaining = queue_expiry - now
+        # Waitlist (queue) cooldown – 4 dny mezi testy. cooldowns.json
+        # ukládá čas POSLEDNÍHO testu (ne expiry) – zbývající čas dopočítá
+        # kanonický cooldown_remaining (stejná logika jako u joinů).
+        remaining = cooldown_remaining(
+            queue_cooldowns, target_id, now, PLAYER_COOLDOWN_MS
+        )
+        if remaining is not None:
             days = remaining // (24 * 60 * 60 * 1000)
             hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
             minutes = (remaining % (60 * 60 * 1000)) // (60 * 1000)

@@ -416,13 +416,18 @@ async def _send_embed_pack(target, embeds, *, view=None, ephemeral=True) -> None
     Pokud pack nesedí do jedné zprávy, pokračování jde další zprávou –
     diagnostika se nikdy neztrácí a odpověď zůstává ephemeral. HTTPException
     se tu NELOVÍ – chyba odeslání musí propadnout nahoru.
+
+    Volitelné parametry se předávají jen když nejsou None – novější discord.py
+    odmítá explicitní ``view=None`` (TypeError).
     """
     for i in range(0, len(embeds), 10):
         chunk = embeds[i : i + 10]
-        if i == 0:
-            await target.send(embeds=chunk, view=view, ephemeral=ephemeral)
-        else:
-            await target.send(embeds=chunk, ephemeral=ephemeral)
+        kwargs = {"embeds": chunk}
+        if ephemeral is not None:
+            kwargs["ephemeral"] = ephemeral
+        if i == 0 and view is not None:
+            kwargs["view"] = view
+        await target.send(**kwargs)
 
 
 async def _edit_embed_pack(interaction, embeds) -> None:

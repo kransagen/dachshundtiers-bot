@@ -62,6 +62,24 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   zvlášť – chyba (Forbidden) = PARTIAL, nikdy crash. Audit
   v `data/playersync_log.json`.
 
+- **`/sync discord-rollback [mode] [target_ts]` – bezpečný rollback posledního
+  aplikovaného `/sync discord`** – vrátí Discord do stavu, v jakém byl PŘED
+  cílovým syncem. Je to **transakční inverze auditního záznamu**
+  (`data/playersync_log.json`, mode=apply): každá úspěšně aplikovaná akce se
+  otočí **ADD ↔ REMOVE** a identita jde **výhradně přes `memberId` / `roleId`
+  z auditu** (nikdy přes jména ani odvozené mapování z players.json /
+  kit_roles.json); akce, které sync neaplikoval (`ok=false`), se **nikdy
+  nevrací** a běžná synchronizace se **nikdy** nespouští. **Výchozí je DRY
+  RUN** (`mode:preview` – nic nemění); `mode:apply` vyžaduje **explicitní
+  potvrzení** tlačítkem. Cíl = poslední apply záznam s úspěšnými akcemi,
+  nebo konkrétní `target_ts` (ms epoch); preview záznamy se nevyberou nikdy.
+  Před spuštěním se znovu ověří cílový záznam + otisk plánu (změnil-li se,
+  nic se nevrátí). Každá akce běží zvlášť a rozlišuje se **aplikováno /
+  už správně (idempotentní, bez volání API) / chyba** – rollback lze bezpečně
+  spustit dvakrát. Vlastní audit (timestamp, cíl, výsledek každé akce) jde do
+  separátního `data/playersync_rollback_log.json`, původní audit syncu se
+  nikdy nepřepisuje.
+
 - **`/sync web mode:preview|apply` – synchronizace webu s kanonickou `players.json`** –
   web (players.json na GitHubu) je jen kopie, jediný zdroj pravdy zůstává
   lokální kanonická DB. `preview` stáhne web a detekuje chybějící hráče,
@@ -369,7 +387,10 @@ tak `/topresult` s `resultType=ht_fight`) je v `data/ht_results.json`
 v `data/playersync_log.json` (tier role), `data/websync_log.json` (web),
 `data/checkweb_log.json` (porovnání Discord × DB × web) a
 `data/datacheck_log.json` (kontrola integrity; **necommitují se**; zapisují je
-podpříkazy `/sync discord | web | check | data`). Server-specific mapování rolí je
+podpříkazy `/sync discord | web | check | data`). Rollbacky
+(`/sync discord-rollback`) se zapisují separátně do
+`data/playersync_rollback_log.json` (původní audit syncu se nemění).
+Server-specific mapování rolí je
 v `data/kit_roles.json` (spravuje `/setkitrole`; **necommituje se** – obsahuje
 ID rolí daného serveru).
 

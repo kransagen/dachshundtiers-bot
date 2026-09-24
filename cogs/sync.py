@@ -33,6 +33,7 @@ services/datacheck) – NEVYTVÁŘÍME žádné nové služby.
 """
 
 import logging
+from datetime import datetime
 
 import discord
 from discord import app_commands
@@ -42,6 +43,7 @@ import github_sync
 from cogs._shared import (
     admin_gate_error,
     apply_role_actions,
+    apply_rollback_actions,
     guild_members,
     kit_display_map,
     member_to_dict,
@@ -66,8 +68,12 @@ from services.role_sync import (
     KIND_LABELS as PS_KIND_LABELS,
     KINDS as PS_KINDS,
     analyze_role_sync,
+    build_rollback_plan,
+    find_rollback_target,
     fingerprint,
+    get_playersync_log,
     log_playersync_event,
+    log_playersync_rollback_event,
 )
 from services.websync import (
     KIND_LABELS as WS_KIND_LABELS,
@@ -244,81 +250,283 @@ def _append_note(embed: discord.Embed, note: str) -> None:
     embed.set_footer(text=(note + "\n" + current).strip())
 
 
-def _field_value(lines: list, limit: int = 1024) -> str:
-    """Hodnota pole embedu z řádků – NIKDY nepřesáhne Discord limit (1024).
+# ---------------------------------------------------------------------------
+# Bezpečné formátování diagnostických výpisů (embed pack)
+#
+# Discord limity: název pole <= 256, hodnota pole <= 1024, <= 25 polí na
+# embed, celkem <= 6000 znaků na embed. Dlouhé seznamy se NIKDY nezkracují –
+# rozdělují se na víc polí / embedů (na hranicích řádků), takže žádná
+# diagnostika se neztrácí a odpověď nemůže spadnout na API 400.
+# ---------------------------------------------------------------------------
+EMBED_TITLE_LIMIT = 256
+EMBED_FIELD_NAME_LIMIT = 256
+EMBED_FIELD_VALUE_LIMIT = 1024
+EMBED_FIELD_COUNT_LIMIT = 25
+EMBED_DESCRIPTION_LIMIT = 4096
+EMBED_FOOTER_LIMIT = 2048
+EMBED_TOTAL_LIMIT = 6000
+_EMBED_TOTAL_BUDGET = EMBED_TOTAL_LIMIT - 200  # rezerva na overhead embedu
+_CONTINUATION_PREFIX = "» "
 
-    Dlouhé nálezy se neposílají celé: poslední odeslaný řádek se zkrátí a
-    doplní se poznámka o zkrácení. Embed tak nemůže spadnout na API 400
-    („field value must be 1024 or fewer in length").
+
+def _clip(text: str, limit: int) -> str:
+    """Defenzivní ořez syntetického textu (title/description/footer/název).
+
+    Používá se JEN na texty, které samy o sobě nejsou diagnostikou (county,
+    popisy, názvy sekcí) – ty jsou vždy krátké a ořez je pojistka.
+    Diagnostické řádky se NIKDY neořezávají (řeší to _pack_section).
     """
-    rendered = [str(x) for x in lines]
-    joined = "\n".join(rendered)
-    if not joined:
-        return "_žádné_"
-    if len(joined) <= limit:
-        return joined
-    suffix = f"… (zkráceno; {len(rendered)} záznamů – viz audit log)"
-    room = limit - len(suffix) - 1
-    if room <= 0:
-        return suffix[:limit]
-    out = ""
-    for line in rendered:
-        if room <= 0:
+    if len(text) <= limit:
+        return text
+    if limit <= 1:
+        return "…"
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _split_long_line(line: str, limit: int, prefix: str) -> list:
+    """Rozdělí jeden příliš dlouhý řádek na kusy <= ``limit``.
+
+    Dělí se na hranicích slov (jinak tvrdý řez). Pokračování dostává prefix
+    ``prefix`` (čtenář pozná, že řádek pokračuje) – VŠECHNY znaky původního
+    řádku zůstávají zachované (žádné zkrácení ani ztráta mezer).
+    """
+    if len(line) <= limit:
+        return [line]
+    budget = limit - len(prefix)
+    out = []
+    rest = line
+    while len(rest) > budget:
+        cut = rest.rfind(" ", len(prefix), budget)
+        if cut < len(prefix):
+            cut = budget
+        out.append(rest[:cut])
+        rest = rest[cut:]
+        if rest:
+            rest = prefix + rest
+    if rest:
+        out.append(rest)
+    return out
+
+
+def _pack_section(name: str, lines) -> list:
+    """Rozdělí řádky sekce na pole ``(name, value)`` do limitu 1024 znaků.
+
+    Dělí se na hranicích řádků; řádek delší než limit se rozdělí na
+    pokračování (prefix „» ") bez ztráty znaků. Vrací alespoň jedno pole
+    (prázdná sekce → „_žádné_"), nikdy nepřesahující Discord limity.
+    """
+    limit = EMBED_FIELD_VALUE_LIMIT
+    name = _clip(str(name), EMBED_FIELD_NAME_LIMIT)
+    fields = []
+    current = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if current:
+            fields.append((name, "\n".join(current)))
+            current = []
+            current_len = 0
+
+    for raw in lines:
+        for chunk in _split_long_line(str(raw), limit, _CONTINUATION_PREFIX):
+            add = len(chunk) + (1 if current else 0)
+            if current and current_len + add > limit:
+                flush()
+            if not current:
+                current.append(chunk)
+                current_len = len(chunk)
+            else:
+                current.append(chunk)
+                current_len += add
+
+    flush()
+    if not fields:
+        fields.append((name, "_žádné_"))
+    return fields
+
+
+def build_embed_pack(
+    *,
+    title: str,
+    description: str = "",
+    color: int = 0xF59E0B,
+    footer: str = "",
+    sections=(),
+    continuation_title: str = "…pokračování",
+    continuation_footer_suffix: str = " · …pokračování",
+) -> list:
+    """Postaví embed pack z diagnostických sekcí; VŠECHNY informace zůstanou.
+
+    ``sections``: [(název, [řádky, …]), …] – každá sekce se rozdělí na pole
+    (<=1024 znaků) a příp. víc embedů (<=25 polí, celkem <=6000 znaků).
+    Pokračování se pozná podle titulku „…pokračování". Vrací >= 1 embed.
+    title/description/footer jsou syntetické texty (jen defenzivně oříznuté
+    na Discord limity, nikdy neobsahují samotné nálezy).
+    """
+    title = _clip(str(title), EMBED_TITLE_LIMIT)
+    description = _clip(str(description), EMBED_DESCRIPTION_LIMIT)
+    footer = _clip(str(footer), EMBED_FOOTER_LIMIT)
+
+    records = []
+    for name, lines in sections:
+        records.extend(_pack_section(name, lines))
+
+    embeds = []
+    page = 0
+    idx = 0
+    while True:
+        if page == 0:
+            embed = discord.Embed(title=title, description=description, color=color)
+            if footer:
+                embed.set_footer(text=footer)
+        else:
+            embed = discord.Embed(
+                title=continuation_title,
+                description=f"…pokračování přehledu (část {page + 1}).",
+                color=color,
+            )
+            if footer:
+                embed.set_footer(text=footer + continuation_footer_suffix)
+        used = (
+            len(embed.title or "")
+            + len(embed.description or "")
+            + len(embed.footer.text if embed.footer else "")
+            + 40  # overhead embedu (barva, timestamp, …)
+        )
+        while idx < len(records) and len(embed.fields) < EMBED_FIELD_COUNT_LIMIT:
+            name, value = records[idx]
+            cost = len(name) + len(value) + 2  # název + hodnota + oddělovač
+            if used + cost > _EMBED_TOTAL_BUDGET and len(embed.fields) > 0:
+                break
+            embed.add_field(name=name, value=value, inline=False)
+            used += cost
+            idx += 1
+        embeds.append(embed)
+        if idx >= len(records):
             break
-        piece = line[:room] if len(line) <= room else line[: room - 1] + "…"
-        out += piece + "\n"
-        room -= len(piece) + 1
-    return out.rstrip("\n") + "\n" + suffix
+        page += 1
+    return embeds
 
 
-def _playersync_embed(analysis: dict, *, mode: str, note: str = "") -> discord.Embed:
-    """Embed s přehledem rozdílů (preview / apply)."""
+async def _send_embed_pack(target, embeds, *, view=None, ephemeral=True) -> None:
+    """Odešle embed pack (max 10 embedů na zprávu; view jen u první zprávy).
+
+    Pokud pack nesedí do jedné zprávy, pokračování jde další zprávou –
+    diagnostika se nikdy neztrácí a odpověď zůstává ephemeral. HTTPException
+    se tu NELOVÍ – chyba odeslání musí propadnout nahoru.
+    """
+    for i in range(0, len(embeds), 10):
+        chunk = embeds[i : i + 10]
+        if i == 0:
+            await target.send(embeds=chunk, view=view, ephemeral=ephemeral)
+        else:
+            await target.send(embeds=chunk, ephemeral=ephemeral)
+
+
+async def _edit_embed_pack(interaction, embeds) -> None:
+    """Nahradí embedy stávající zprávy packem (edit = max 10 embedů).
+
+    Selhání editu se jen zaloguje – výsledek stejně dorazí followup.em
+    (odpověď uživatele se tím nikdy neztratí).
+    """
+    try:
+        if interaction.message is not None:
+            await interaction.message.edit(embeds=embeds[:10], view=None)
+    except (discord.HTTPException, discord.Forbidden) as err:
+        log.warning("Nelze upravit potvrzovací zprávu: %s", err)
+
+
+def _playersync_embed(analysis: dict, *, mode: str, note: str = "") -> list:
+    """Embed pack s přehledem rozdílů (preview / apply) – VŠECHNY nálezy."""
+    if mode == "apply":
+        if analysis["has_actions"]:
+            footer = (
+                f"Navržených změn: {len(analysis['actions'])} – pro aplikaci "
+                "potvrď tlačítkem níže."
+            )
+        else:
+            footer = (
+                "Žádné změny nelze aplikovat automaticky – viz nálezy "
+                "(oprava je ruční)."
+            )
+    else:
+        footer = (
+            "Náhled – žádné změny neaplikovány. Pro aplikaci použij "
+            "/sync discord mode:apply."
+        )
+
     if not analysis["findings"]:
         embed = discord.Embed(
             title="✅ /sync discord – vše v pořádku",
             description="Role tierů odpovídají players.json. Nemám co opravovat.",
             color=0x10B981,
         )
-    else:
-        embed = discord.Embed(
-            title=f"🔎 /sync discord – {'potvrzení změn' if mode == 'apply' else 'náhled'}",
-            description=(
-                f"Zkontrolováno párů (člen × kit): **{analysis['checked']}** "
-                f"(beze změny: **{analysis.get('unchanged', 0)}**)\n\n"
-                + "\n".join(
-                    f"{PS_KIND_LABELS[k]}: **{analysis['summary'].get(k, 0)}**"
-                    for k in PS_KINDS
-                )
-            ),
-            color=0xF59E0B,
-        )
-        lines = [f["message"] for f in analysis["findings"]]
-        shown = lines[:15]
-        if len(lines) > 15:
-            shown.append(f"…a dalších {len(lines) - 15} nálezů")
-        embed.add_field(name="Zjištěné rozdíly", value=_field_value(shown), inline=False)
+        embed.set_footer(text=footer)
+        _append_note(embed, note)
+        return [embed]
 
+    embeds = build_embed_pack(
+        title=f"🔎 /sync discord – {'potvrzení změn' if mode == 'apply' else 'náhled'}",
+        description=(
+            f"Zkontrolováno párů (člen × kit): **{analysis['checked']}** "
+            f"(beze změny: **{analysis.get('unchanged', 0)}**)\n\n"
+            + "\n".join(
+                f"{PS_KIND_LABELS[k]}: **{analysis['summary'].get(k, 0)}**"
+                for k in PS_KINDS
+            )
+        ),
+        color=0xF59E0B,
+        footer=footer,
+        sections=[("Zjištěné rozdíly", [f["message"] for f in analysis["findings"]])],
+    )
+    _append_note(embeds[0], note)
+    return embeds
+
+
+def _fmt_ts(ts_ms) -> str:
+    """Čitelný formát času z auditního ts (ms epoch)."""
+    try:
+        return datetime.fromtimestamp(int(ts_ms) / 1000).strftime(
+            "%d.%m.%Y %H:%M:%S"
+        )
+    except (TypeError, ValueError, OSError):
+        return str(ts_ms)
+
+
+def _rollback_embed(plan: dict, *, mode: str, note: str = "") -> list:
+    """Shrnutí rollbacku /sync discord (dry run / potvrzení) – nic nemění."""
+    adds = sum(1 for a in plan["actions"] if a.get("op") == "add")
+    removes = sum(1 for a in plan["actions"] if a.get("op") == "remove")
     if mode == "apply":
-        if analysis["has_actions"]:
-            embed.set_footer(
-                text=f"Navržených změn: {len(analysis['actions'])} – pro aplikaci "
-                "potvrď tlačítkem níže."
-            )
-        else:
-            embed.set_footer(
-                text="Žádné změny nelze aplikovat automaticky – viz nálezy "
-                "(oprava je ruční)."
-            )
-    else:
-        embed.set_footer(
-            text="Náhled – žádné změny neaplikovány. Pro aplikaci použij /sync discord mode:apply."
+        footer = (
+            "Rollback se spustí JEN po potvrzení tlačítkem níže – inverze "
+            "přesně těch akcí, které cílový sync úspěšně aplikoval."
         )
+    else:
+        footer = "Dry run – žádné Discord změny neprovedeny."
+    embed = discord.Embed(
+        title="🔄 /sync discord-rollback",
+        description=(
+            "**Cílový sync:**\n"
+            f"• Čas: **{_fmt_ts(plan['target_ts'])}** (`{plan['target_ts']}`)\n"
+            f"• Kdo: **{plan['target_actor_name']}** (ID `{plan['target_actor_id']}`)\n"
+            f"• Úspěšně aplikováno: **{plan['original_applied']} / "
+            f"{plan['total_logged']}** akcí\n\n"
+            "**Rollback (inverze akcí z auditu):**\n"
+            f"• AJ přidat roli (ADD): **{adds}**\n"
+            f"• AJ odebrat roli (REMOVE): **{removes}**\n"
+            f"• Celkem: **{len(plan['actions'])}**"
+        ),
+        color=0xF59E0B,
+    )
+    embed.set_footer(text=footer)
     _append_note(embed, note)
-    return embed
+    return [embed]
 
 
-def _websync_embed(result: dict, *, mode: str, note: str = "") -> discord.Embed:
-    """Embed s přehledem rozdílů / výsledkem (preview / apply)."""
+def _websync_embed(result: dict, *, mode: str, note: str = "") -> list:
+    """Embed pack s přehledem rozdílů / výsledkem (preview / apply)."""
     if not result["ok"]:
         embed = discord.Embed(
             title="⚠️ /sync web – nelze pokračovat",
@@ -328,12 +536,39 @@ def _websync_embed(result: dict, *, mode: str, note: str = "") -> discord.Embed:
         if mode == "apply":
             embed.set_footer(text="Nic se na web neposílalo.")
         _append_note(embed, note)
-        return embed
+        return [embed]
 
     analysis = result["analysis"] or {}
     if analysis.get("has_issues"):
-        embed = discord.Embed(
-            title=f"🔎 /sync web – {'potvrzení synchronizace' if mode == 'apply' else 'náhled'}",
+        sections = [
+            ("Rozdíly oproti webu", [f["message"] for f in analysis["findings"]])
+        ]
+        if analysis.get("website_only"):
+            extra = [str(u) for u in analysis["website_only"]]
+            sections.append(
+                (
+                    "Hráči jen na webu (ne v kanonické DB)",
+                    [
+                        "Synchronizace web přepíše kanonickou DB – tito hráči "
+                        "z webu zmizí: " + ", ".join(extra)
+                    ],
+                )
+            )
+        if mode == "apply":
+            footer = (
+                f"Synchronizace NAHRADÍ players.json na webu kanonickou DB "
+                f"({analysis['canonical_count']} záznamů) – potvrď tlačítkem níže."
+            )
+        else:
+            footer = (
+                "Náhled – nic se neposílalo. Pro potvrzení použij "
+                "/sync web mode:apply."
+            )
+        embeds = build_embed_pack(
+            title=(
+                f"🔎 /sync web – "
+                f"{'potvrzení synchronizace' if mode == 'apply' else 'náhled'}"
+            ),
             description=(
                 f"Kanonická DB: **{analysis['canonical_count']}** hráčů · "
                 f"Web: **{analysis['website_count']}** hráčů\n\n"
@@ -343,50 +578,26 @@ def _websync_embed(result: dict, *, mode: str, note: str = "") -> discord.Embed:
                 )
             ),
             color=0xF59E0B,
+            footer=footer,
+            sections=sections,
         )
-        lines = [f["message"] for f in analysis["findings"]]
-        shown = lines[:15]
-        if len(lines) > 15:
-            shown.append(f"…a dalších {len(lines) - 15} nálezů")
-        embed.add_field(name="Rozdíly oproti webu", value=_field_value(shown), inline=False)
+        _append_note(embeds[0], note)
+        return embeds
 
-        if analysis.get("website_only"):
-            extra = [u for u in analysis["website_only"][:15]]
-            embed.add_field(
-                name="Hráči jen na webu (ne v kanonické DB)",
-                value=(
-                    "Synchronizace web přepíše kanonickou DB – tito hráči z webu "
-                    f"zmizí: {', '.join(extra)}"
-                    f"{'…' if len(analysis['website_only']) > 15 else ''}"
-                ),
-                inline=False,
-            )
-
-        if mode == "apply":
-            embed.set_footer(
-                text=(
-                    f"Synchronizace NAHRADÍ players.json na webu kanonickou DB "
-                    f"({analysis['canonical_count']} záznamů) – potvrď tlačítkem níže."
-                )
-            )
-        else:
-            embed.set_footer(
-                text="Náhled – nic se neposílalo. Pro potvrzení použij /sync web mode:apply."
-            )
-    else:
-        embed = discord.Embed(
-            title="✅ /sync web – web je v synchronizaci",
-            description=(
-                f"Kanonická DB (**{analysis['canonical_count']}** hráčů) odpovídá "
-                "webu – nemám co opravovat."
-            ),
-            color=0x10B981,
-        )
+    embed = discord.Embed(
+        title="✅ /sync web – web je v synchronizaci",
+        description=(
+            f"Kanonická DB (**{analysis['canonical_count']}** hráčů) odpovídá "
+            "webu – nemám co opravovat."
+        ),
+        color=0x10B981,
+    )
     _append_note(embed, note)
-    return embed
+    return [embed]
 
 
-def _datacheck_embed(report: dict, *, note: str = "") -> discord.Embed:
+def _datacheck_embed(report: dict, *, note: str = "") -> list:
+    """Embed pack /sync data – VŠECHNY nálezy (rozdělené, nezkrácené)."""
     if not report["has_issues"]:
         embed = discord.Embed(
             title="✅ /sync data – vše v pořádku",
@@ -394,25 +605,17 @@ def _datacheck_embed(report: dict, *, note: str = "") -> discord.Embed:
             color=0x10B981,
         )
         _append_note(embed, note)
-        return embed
+        return [embed]
 
     summary_text = "\n".join(
         f"{DC_KIND_LABELS[k]}: **{report['summary'].get(k, 0)}**" for k in DC_KINDS
     ) or "_žádné nálezy_"
-    embed = discord.Embed(
-        title="🔍 /sync data – kontrola integrity",
-        description=summary_text,
-        color=0xEF4444,
-    )
-    findings = report["findings"]
-    lines = [f["message"] for f in findings[:12]]
-    if len(findings) > 12:
-        lines.append(f"…a dalších {len(findings) - 12} nálezů")
-    embed.add_field(
-        name=f"Nálezů celkem: {report['total_findings']}",
-        value="\n".join(lines) or "_nic_",
-        inline=False,
-    )
+    sections = [
+        (
+            f"Nálezů celkem: {report['total_findings']}",
+            [f["message"] for f in report["findings"]],
+        )
+    ]
 
     r = report["repairable"]
     if report["repairable_count"]:
@@ -421,25 +624,36 @@ def _datacheck_embed(report: dict, *, note: str = "") -> discord.Embed:
             parts.append(f"zavřít **{len(r['close_ticket'])}** osamocených ticketů")
         if r["normalize_tier"]:
             parts.append(f"normalizovat **{len(r['normalize_tier'])}** tierů")
-        embed.add_field(
-            name="🔧 Bezpečné opravy (nic se nemaže)",
-            value=(
-                f"Po potvrzení tlačítkem: {', '.join(parts)}. "
-                "Záznamy zůstávají, audit se zapíše."
-            ),
-            inline=False,
+        sections.append(
+            (
+                "🔧 Bezpečné opravy (nic se nemaže)",
+                [
+                    f"Po potvrzení tlačítkem: {', '.join(parts)}. "
+                    "Záznamy zůstávají, audit se zapíše."
+                ],
+            )
         )
-    embed.set_footer(
-        text="Nic se nemění automaticky – opravy jen po potvrzení. "
-        f"Audit: data/{DATACHECK_LOG_FILE}."
+    embeds = build_embed_pack(
+        title="🔍 /sync data – kontrola integrity",
+        description=summary_text,
+        color=0xEF4444,
+        footer=(
+            "Nic se nemění automaticky – opravy jen po potvrzení. "
+            f"Audit: data/{DATACHECK_LOG_FILE}."
+        ),
+        sections=sections,
     )
-    _append_note(embed, note)
-    return embed
+    _append_note(embeds[0], note)
+    return embeds
 
 
-def _repair_result_embed(result: dict) -> discord.Embed:
+def _repair_result_embed(result: dict) -> list:
+    """Embed pack s výsledkem bezpečných oprav (chyby VŠECHNY, nezkrácené)."""
     ok = bool(result.get("ok"))
-    embed = discord.Embed(
+    sections = []
+    if result["errors"]:
+        sections.append(("Chyby", [str(e) for e in result["errors"]]))
+    return build_embed_pack(
         title="🔧 /sync data – bezpečné opravy",
         description=(
             f"{result['message']}\n"
@@ -449,15 +663,9 @@ def _repair_result_embed(result: dict) -> discord.Embed:
             f"- chyb: **{len(result['errors'])}**"
         ),
         color=0x10B981 if ok else 0xEF4444,
+        footer=f"Zapsáno do data/{DATACHECK_LOG_FILE} (audit).",
+        sections=sections,
     )
-    if result["errors"]:
-        embed.add_field(
-            name="Chyby",
-            value=_field_value(str(e) for e in result["errors"][:15]),
-            inline=False,
-        )
-    embed.set_footer(text=f"Zapsáno do data/{DATACHECK_LOG_FILE} (audit).")
-    return embed
 
 
 def _checkweb_compact(record: dict) -> str:
@@ -488,26 +696,44 @@ def _checkweb_compact(record: dict) -> str:
     )
 
 
-def _checkweb_embed(analysis: dict, *, mode: str, note: str = "") -> discord.Embed:
-    """Embed s přehledem (preview / apply)."""
+def _checkweb_embed(analysis: dict, *, mode: str, note: str = "") -> list:
+    """Embed pack s přehledem (preview / apply) – VŠECHNY nálezy."""
     records = analysis["records"]
     summary = analysis["summary"]
     source = analysis.get("website_source", "")
 
     if not records:
-        embed = discord.Embed(
-            title="✅ /checkweb – vše v pořádku",
-            description=(
-                "Discord role odpovídají players.json a webu – nemám co "
-                f"opravovat.\nWeb: {source}."
-            ),
-            color=0x10B981,
-        )
+        embeds = [
+            discord.Embed(
+                title="✅ /checkweb – vše v pořádku",
+                description=(
+                    "Discord role odpovídají players.json a webu – nemám co "
+                    f"opravovat.\nWeb: {source}."
+                ),
+                color=0x10B981,
+            )
+        ]
     else:
         summary_text = "\n".join(
             f"{STATUS_LABELS[s]}: **{summary.get(s, 0)}**" for s in STATUSES
         )
-        embed = discord.Embed(
+        sections = [
+            (
+                "Nálezy",
+                [_checkweb_compact(r) for r in records if r["status"] != "MATCH"],
+            )
+        ]
+        if summary.get("MATCH"):
+            sections.append(
+                (
+                    "✅ Shoda",
+                    [
+                        f"**{summary['MATCH']}** záznamů odpovídá ve všech "
+                        "zdrojích."
+                    ],
+                )
+            )
+        embeds = build_embed_pack(
             title=f"🔎 /checkweb – {'potvrzení' if mode == 'apply' else 'náhled'}",
             description=(
                 f"Zkontrolováno záznamů (hráč × kit): **{analysis['checked']}**\n"
@@ -515,38 +741,29 @@ def _checkweb_embed(analysis: dict, *, mode: str, note: str = "") -> discord.Emb
                 + summary_text
             ),
             color=0xF59E0B,
+            sections=sections,
         )
-        lines = [_checkweb_compact(r) for r in records if r["status"] != "MATCH"]
-        shown = lines[:12]
-        if len(lines) > 12:
-            shown.append(f"…a dalších {len(lines) - 12} nálezů")
-        embed.add_field(name="Nálezy", value=_field_value(shown), inline=False)
-        if summary.get("MATCH"):
-            embed.add_field(
-                name="✅ Shoda",
-                value=f"**{summary['MATCH']}** záznamů odpovídá ve všech zdrojích.",
-                inline=False,
-            )
 
     if mode == "apply":
         resolvable = analysis.get("resolvable") or []
         if resolvable:
-            embed.set_footer(
-                text=f"{len(resolvable)} záznamů k řešení – vyber rozhodnutí "
+            footer = (
+                f"{len(resolvable)} záznamů k řešení – vyber rozhodnutí "
                 "a potvrď tlačítkem. Web se nemění (na to je /sync web)."
             )
         else:
-            embed.set_footer(
-                text="Žádný záznam nevyžaduje rozhodnutí – opravy jsou ruční "
+            footer = (
+                "Žádný záznam nevyžaduje rozhodnutí – opravy jsou ruční "
                 "(viz nálezy) nebo přes /sync web apply."
             )
     else:
-        embed.set_footer(
-            text="Náhled – žádné změny neaplikovány. JEDINÝ zapisovatel je "
+        footer = (
+            "Náhled – žádné změny neaplikovány. JEDINÝ zapisovatel je "
             "/checkweb apply s potvrzením."
         )
-    _append_note(embed, note)
-    return embed
+    embeds[0].set_footer(text=footer)
+    _append_note(embeds[0], note)
+    return embeds
 
 
 def _check_embed(
@@ -558,8 +775,8 @@ def _check_embed(
     corrupt: list,
     repairable_count: int,
     note: str = "",
-) -> discord.Embed:
-    """Embed /sync check – nálezy seskupené podle severity."""
+) -> list:
+    """Embed pack /sync check – nálezy podle severity, VŠECHNY bez zkrácení."""
     if corrupt:
         embed = discord.Embed(
             title="❌ /sync check – poškozená data",
@@ -572,7 +789,7 @@ def _check_embed(
             color=0xEF4444,
         )
         embed.set_footer(text="DataCorruptionError – bezpečný abort.")
-        return embed
+        return [embed]
 
     total = sum(counts.values())
     if total == 0:
@@ -588,47 +805,45 @@ def _check_embed(
             "a data/datacheck_log.json."
         )
         _append_note(embed, note)
-        return embed
+        return [embed]
 
     severity_lines = "\n".join(
         f"{SEVERITY_LABELS[s]}: **{counts.get(s, 0)}**" for s in SEVERITY_ORDER
     )
     title_suffix = f" ({AREA_LABELS.get(area, area)})" if area != "all" else ""
-    embed = discord.Embed(
+    sections = []
+    for sev in SEVERITY_ORDER:
+        group = [i for i in items if i["severity"] == sev]
+        if not group:
+            continue
+        sections.append(
+            (f"{SEVERITY_LABELS[sev]} ({len(group)})", [i["message"] for i in group])
+        )
+    if repairable_count:
+        sections.append(
+            (
+                "🔧 Bezpečné opravy",
+                [
+                    f"{repairable_count} oprav je dostupných přes **/sync data** "
+                    "(potvrzení tlačítkem)."
+                ],
+            )
+        )
+    embeds = build_embed_pack(
         title=f"🔎 /sync check – náhled stavu{title_suffix}",
         description=(
             f"Zdroj dat webu: **{website_source}**\nNálezů celkem: **{total}**\n\n"
             + severity_lines
         ),
         color=0xEF4444 if counts.get("error") else 0xF59E0B,
+        footer=(
+            "Read-only – nic se nemění. Audit: data/checkweb_log.json "
+            "a data/datacheck_log.json."
+        ),
+        sections=sections,
     )
-    for sev in SEVERITY_ORDER:
-        group = [i for i in items if i["severity"] == sev]
-        if not group:
-            continue
-        lines = [i["message"] for i in group[:10]]
-        if len(group) > 10:
-            lines.append(f"…a dalších {len(group) - 10} nálezů")
-        embed.add_field(
-            name=f"{SEVERITY_LABELS[sev]} ({len(group)})",
-            value=_field_value(lines),
-            inline=False,
-        )
-    if repairable_count:
-        embed.add_field(
-            name="🔧 Bezpečné opravy",
-            value=(
-                f"{repairable_count} oprav je dostupných přes **/sync data** "
-                "(potvrzení tlačítkem)."
-            ),
-            inline=False,
-        )
-    embed.set_footer(
-        text="Read-only – nic se nemění. Audit: data/checkweb_log.json "
-        "a data/datacheck_log.json."
-    )
-    _append_note(embed, note)
-    return embed
+    _append_note(embeds[0], note)
+    return embeds
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +929,148 @@ class SyncDiscordConfirmView(SafeView):
                 color=0x10B981 if ok == len(applied) and applied else 0xF59E0B,
             )
             embed.set_footer(text="Zapsáno do data/playersync_log.json (audit).")
+
+        try:
+            if interaction.message is not None:
+                await interaction.message.edit(embed=embed, view=None)
+        except (discord.HTTPException, discord.Forbidden) as err:
+            log.warning("Nelze upravit potvrzovací zprávu: %s", err)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class SyncDiscordRollbackView(SafeView):
+    """Tlačítko „Potvrdit a vrátit změny" pro /sync discord-rollback apply.
+
+    Před spuštěním znovu ověří cílový auditní záznam + otisk plánu – změnil-li
+    se mezi náhledem a potvrzením, rollback se NESPUSTÍ (stale). Po dokončení
+    zapíše rollback audit do data/playersync_rollback_log.json.
+    """
+
+    def __init__(self, *, plan: dict):
+        super().__init__(timeout=120)
+        self.plan = plan
+        self.fingerprint = fingerprint(plan["actions"])
+        self.finished = False
+
+    @discord.ui.button(
+        label="↩️ Potvrdit a vrátit změny",
+        style=discord.ButtonStyle.danger,
+        custom_id="sync_discord_rollback_confirm",
+    )
+    async def confirm(self, interaction: discord.Interaction, button) -> None:
+        if (msg := admin_gate_error(interaction)) is not None:
+            return await interaction.response.send_message(msg, ephemeral=True)
+        if self.finished:
+            return await interaction.response.send_message(
+                "✅ Rollback už proběhl.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        # 1) Ověření, že se audit od náhledu nezměnil → vrátíme PŘESNĚ to,
+        #    co admin potvrdil (nikdy nic automaticky navíc).
+        entries = await get_playersync_log()
+        fresh_entry, _warnings = find_rollback_target(
+            entries, target_ts=self.plan["target_ts"]
+        )
+        if fresh_entry is None:
+            self.finished = True
+            await self._finish(interaction, results=None, stale=True)
+            return
+        fresh_plan = build_rollback_plan(fresh_entry)
+        if (
+            not fresh_plan["ok"]
+            or fingerprint(fresh_plan["actions"]) != self.fingerprint
+        ):
+            self.finished = True
+            await self._finish(interaction, results=None, stale=True)
+            return
+
+        # 2) Aplikace rollback akcí – každá zvlášť, chyby se nešíří dál.
+        results = await apply_rollback_actions(interaction.guild, fresh_plan["actions"])
+
+        # 3) Rollback audit (separátní soubor; původní audit syncu se nemění).
+        summary = {
+            "applied": sum(1 for r in results if r.get("status") == "applied"),
+            "already_correct": sum(
+                1 for r in results if r.get("status") == "already_correct"
+            ),
+            "failed": sum(1 for r in results if r.get("status") == "failed"),
+            "total": len(results),
+        }
+        try:
+            await log_playersync_rollback_event(
+                actor_id=interaction.user.id,
+                actor_name=str(interaction.user),
+                mode="apply",
+                target_ts=fresh_plan["target_ts"],
+                target_actor_id=fresh_plan["target_actor_id"],
+                target_actor_name=fresh_plan["target_actor_name"],
+                original_applied=fresh_plan["original_applied"],
+                total_logged=fresh_plan["total_logged"],
+                results=results,
+                summary=summary,
+            )
+        except Exception:  # noqa: BLE001 – audit nesmí shodit aplikaci
+            log.exception("Rollback audit (apply) selhal")
+
+        self.finished = True
+        await self._finish(interaction, results=results, stale=False)
+
+    async def _finish(self, interaction, *, results, stale) -> None:
+        if stale:
+            embed = discord.Embed(
+                title="🔄 /sync discord-rollback – audit se změnil",
+                description=(
+                    "Mezitím se změnil cílový auditní záznam – **nic jsem "
+                    "nevrátil**. Spusť **/sync discord-rollback mode:apply** "
+                    "znovu."
+                ),
+                color=0xEF4444,
+            )
+        else:
+            applied = sum(1 for r in results if r.get("status") == "applied")
+            already = sum(
+                1 for r in results if r.get("status") == "already_correct"
+            )
+            failed = sum(1 for r in results if r.get("status") == "failed")
+            lines = []
+            for r in results[:15]:
+                mark = {
+                    "applied": "✅",
+                    "already_correct": "🟢",
+                    "failed": "❌",
+                }.get(r.get("status"), "❓")
+                op = "přidána" if r.get("op") == "add" else "odebrána"
+                line = (
+                    f"{mark} <@{r.get('memberId')}> – {op} role "
+                    f"<@&{r.get('roleId')}>"
+                )
+                if r.get("status") == "failed":
+                    line += f" (chyba: {r.get('error')})"
+                elif r.get("status") == "already_correct":
+                    line += " (už ve stavu po rollbacku)"
+                lines.append(line)
+            if len(results) > 15:
+                lines.append(f"…a dalších {len(results) - 15} akcí")
+            embed = discord.Embed(
+                title="↩️ /sync discord-rollback – dokončeno",
+                description=(
+                    f"Aplikováno: **{applied}** · Už správně: **{already}** · "
+                    f"Chyby: **{failed}** / {len(results)}\n\n"
+                    + "\n".join(lines)
+                ),
+                color=(
+                    0x10B981
+                    if failed == 0 and results
+                    else 0xEF4444
+                    if failed
+                    else 0xF59E0B
+                ),
+            )
+            embed.set_footer(
+                text="Zapsáno do data/playersync_rollback_log.json (audit)."
+            )
 
         try:
             if interaction.message is not None:
@@ -832,30 +1189,30 @@ class SyncDataRepairView(SafeView):
                 actor_name=str(interaction.user),
             )
         except DataCorruptionError as err:
-            embed = discord.Embed(
-                title="❌ /sync data – poškozená data",
-                description=(
-                    "Opravy se NEPROVEDLY – soubor není platný JSON "
-                    f"(`{err}`). Poškozené soubory se nikdy automaticky "
-                    "nepřepisují."
-                ),
-                color=0xEF4444,
-            )
-            try:
-                if interaction.message is not None:
-                    await interaction.message.edit(embed=embed, view=None)
-            except (discord.HTTPException, discord.Forbidden) as err2:
-                log.warning("Nelze upravit zprávu /sync data: %s", err2)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            embeds = [
+                discord.Embed(
+                    title="❌ /sync data – poškozená data",
+                    description=(
+                        "Opravy se NEPROVEDLY – soubor není platný JSON "
+                        f"(`{err}`). Poškozené soubory se nikdy automaticky "
+                        "nepřepisují."
+                    ),
+                    color=0xEF4444,
+                )
+            ]
+            await _edit_embed_pack(interaction, embeds)
+            await _send_embed_pack(interaction.followup, embeds)
             return
 
         r = report["repairable"]
         if not r["close_ticket"] and not r["normalize_tier"]:
-            embed = discord.Embed(
-                title="✅ /sync data – už není co opravit",
-                description="Kontrola po náhledu nehlásí žádné bezpečné opravy.",
-                color=0x10B981,
-            )
+            embeds = [
+                discord.Embed(
+                    title="✅ /sync data – už není co opravit",
+                    description="Kontrola po náhledu nehlásí žádné bezpečné opravy.",
+                    color=0x10B981,
+                )
+            ]
         else:
             try:
                 result = await perform_repairs(
@@ -865,24 +1222,22 @@ class SyncDataRepairView(SafeView):
                     actor_name=str(interaction.user),
                 )
             except DataCorruptionError as err:
-                embed = discord.Embed(
-                    title="❌ /sync data – poškozená data",
-                    description=(
-                        "Opravy se NEPROVEDLY – soubor není platný JSON "
-                        f"(`{err}`). Poškozené soubory se nikdy automaticky "
-                        "nepřepisují."
-                    ),
-                    color=0xEF4444,
-                )
+                embeds = [
+                    discord.Embed(
+                        title="❌ /sync data – poškozená data",
+                        description=(
+                            "Opravy se NEPROVEDLY – soubor není platný JSON "
+                            f"(`{err}`). Poškozené soubory se nikdy automaticky "
+                            "nepřepisují."
+                        ),
+                        color=0xEF4444,
+                    )
+                ]
             else:
-                embed = _repair_result_embed(result)
+                embeds = _repair_result_embed(result)
 
-        try:
-            if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=None)
-        except (discord.HTTPException, discord.Forbidden) as err:
-            log.warning("Nelze upravit zprávu /sync data: %s", err)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await _edit_embed_pack(interaction, embeds)
+        await _send_embed_pack(interaction.followup, embeds)
 
 
 class CheckWebApplyView(SafeView):
@@ -1161,12 +1516,12 @@ class Sync(commands.Cog):
 
         corrupt = _corrupt_data_files()
         if corrupt:
-            embed = _check_embed(
+            embeds = _check_embed(
                 [], counts={"ok": 0, "warning": 0, "conflict": 0, "error": 0},
                 website_source="n/a", area=area, corrupt=corrupt,
                 repairable_count=0, note=note,
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds)
             return
 
         players = load_data("players.json", []) or []
@@ -1252,7 +1607,7 @@ class Sync(commands.Cog):
         for i in items:
             counts[i["severity"]] += 1
 
-        embed = _check_embed(
+        embeds = _check_embed(
             items,
             counts=counts,
             website_source=website_source,
@@ -1261,7 +1616,7 @@ class Sync(commands.Cog):
             repairable_count=dc["repairable_count"],
             note=note,
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await _send_embed_pack(interaction.followup, embeds)
 
     # ------------------------------------------------------------------
     # /sync discord
@@ -1299,24 +1654,141 @@ class Sync(commands.Cog):
                 )
             except Exception:  # noqa: BLE001 – audit nesmí shodit výpis
                 log.exception("Auditní zápis (preview) selhal")
-            embed = _playersync_embed(analysis, mode="preview", note=note)
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            embeds = _playersync_embed(analysis, mode="preview", note=note)
+            await _send_embed_pack(interaction.followup, embeds)
             return
 
-        embed = _playersync_embed(analysis, mode="apply", note=note)
+        embeds = _playersync_embed(analysis, mode="apply", note=note)
         if not analysis["findings"]:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds)
             return
         if not analysis["has_actions"]:
-            embed.set_footer(
+            embeds[0].set_footer(
                 text="Žádné změny nelze aplikovat automaticky – viz nálezy "
                 "(oprava je ruční)."
+            )
+            await _send_embed_pack(interaction.followup, embeds)
+            return
+
+        view = SyncDiscordConfirmView(analysis=analysis)
+        await _send_embed_pack(interaction.followup, embeds, view=view)
+
+    # ------------------------------------------------------------------
+    # /sync discord-rollback
+    # ------------------------------------------------------------------
+    @sync.command(
+        name="discord-rollback",
+        description="Vrátí poslední aplikovaný /sync discord (dry run defaultně)",
+    )
+    @app_commands.describe(
+        mode="preview = dry run (nic nemění) · apply = po potvrzení vrátí",
+        target_ts="ts cílového syncu v ms (výchozí: poslední aplikovaný)",
+    )
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="preview", value="preview"),
+            app_commands.Choice(name="apply", value="apply"),
+        ]
+    )
+    async def sync_discord_rollback(
+        self,
+        interaction: discord.Interaction,
+        mode: str = "preview",
+        target_ts: int | None = None,
+    ) -> None:
+        await self._run_discord_rollback(
+            interaction, mode=mode, target_ts=target_ts
+        )
+
+    async def _run_discord_rollback(
+        self,
+        interaction: discord.Interaction,
+        mode: str = "preview",
+        target_ts: int | None = None,
+        *,
+        note: str = "",
+    ) -> None:
+        if (msg := admin_gate_error(interaction)) is not None:
+            return await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+
+        # 1) Cílový aplikovaný sync z auditu (nikdy preview / bez applied).
+        entries = await get_playersync_log()
+        entry, warnings = find_rollback_target(entries, target_ts=target_ts)
+        if entry is None:
+            embed = discord.Embed(
+                title="❌ /sync discord-rollback – nelze",
+                description="\n".join(warnings or ["Žádný vhodný záznam."]),
+                color=0xEF4444,
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        view = SyncDiscordConfirmView(analysis=analysis)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        # 2) Invertovaný plán – chybějící členId/roleId = bezpečný abort.
+        plan = build_rollback_plan(entry)
+        if not plan["ok"]:
+            missing_lines = [
+                f"• member `{m.get('memberId')}` · role `{m.get('roleId')}` "
+                f"({m.get('reason')})"
+                for m in plan["missing"]
+            ]
+            embed = discord.Embed(
+                title="❌ /sync discord-rollback – chybí informace",
+                description=(
+                    "Rollback se NESPUSTÍ, dokud cílový audit neobsahuje "
+                    "memberId a roleId pro každou akci:\n\n"
+                    + "\n".join(missing_lines)
+                ),
+                color=0xEF4444,
+            )
+            embed.set_footer(
+                text=f"Cílový sync: {_fmt_ts(plan['target_ts'])} "
+                f"({plan['target_ts']})."
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+        if not plan["actions"]:
+            embed = discord.Embed(
+                title="ℹ️ /sync discord-rollback – není co vracet",
+                description=(
+                    "Cílový sync nemá žádné úspěšně aplikované akce "
+                    "(či všechny selhaly)."
+                ),
+                color=0x10B981,
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        # 3) Rollback audit (preview i apply – dry run se taky zaznamenává).
+        summary = {
+            "add": sum(1 for a in plan["actions"] if a.get("op") == "add"),
+            "remove": sum(1 for a in plan["actions"] if a.get("op") == "remove"),
+            "total": len(plan["actions"]),
+        }
+        try:
+            await log_playersync_rollback_event(
+                actor_id=interaction.user.id,
+                actor_name=str(interaction.user),
+                mode="preview",
+                target_ts=plan["target_ts"],
+                target_actor_id=plan["target_actor_id"],
+                target_actor_name=plan["target_actor_name"],
+                original_applied=plan["original_applied"],
+                total_logged=plan["total_logged"],
+                plan=plan["actions"],
+                summary=summary,
+            )
+        except Exception:  # noqa: BLE001 – audit nesmí shodit výpis
+            log.exception("Rollback audit (preview) selhal")
+
+        embeds = _rollback_embed(plan, mode=mode, note=note)
+        if mode != "apply":
+            # Dry run – NIKDY nemění Discord.
+            await _send_embed_pack(interaction.followup, embeds)
+            return
+
+        view = SyncDiscordRollbackView(plan=plan)
+        await _send_embed_pack(interaction.followup, embeds, view=view)
 
     # ------------------------------------------------------------------
     # /sync web
@@ -1348,21 +1820,21 @@ class Sync(commands.Cog):
             actor_id=interaction.user.id,
             actor_name=str(interaction.user),
         )
-        embed = _websync_embed(result, mode=mode, note=note)
+        embeds = _websync_embed(result, mode=mode, note=note)
 
         if not result["ok"]:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds)
             return
         if not result["analysis"]["has_issues"] or mode != "apply":
             # preview = read-only náhled (věrné chování /websync): view jen
             # při mode:"apply" s rozdíly
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds)
             return
 
         view = SyncWebConfirmView(
             canonical_fingerprint=result["fingerprint"]
         )
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        await _send_embed_pack(interaction.followup, embeds, view=view)
 
     # ------------------------------------------------------------------
     # /sync data
@@ -1413,12 +1885,12 @@ class Sync(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        embed = _datacheck_embed(report, note=note)
+        embeds = _datacheck_embed(report, note=note)
         if report["repairable_count"]:
             view = SyncDataRepairView()
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds, view=view)
         else:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds)
 
     # ------------------------------------------------------------------
     # /checkweb apply – per-záznamová rozhodnutí (přesunuto beze změny)
@@ -1431,11 +1903,11 @@ class Sync(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         analysis = await _gather_checkweb(interaction.guild)
-        embed = _checkweb_embed(analysis, mode="apply", note=note)
+        embeds = _checkweb_embed(analysis, mode="apply", note=note)
 
         resolvable = analysis.get("resolvable") or []
         if not resolvable:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await _send_embed_pack(interaction.followup, embeds)
             return
 
         view = CheckWebApplyView(
@@ -1443,7 +1915,7 @@ class Sync(commands.Cog):
             records=resolvable,
             fingerprint=analysis["fingerprint"],
         )
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        await _send_embed_pack(interaction.followup, embeds, view=view)
 
     # ------------------------------------------------------------------
     # Deprecated aliasy (funkční, chovají se identicky jako /sync)

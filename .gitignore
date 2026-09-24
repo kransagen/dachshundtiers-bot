@@ -22,6 +22,7 @@ data/ht_tickets.json
 data/ht_ticket_logs.json
 data/ht_results.json
 data/playersync_log.json
+data/playersync_rollback_log.json
 data/websync_log.json
 data/datacheck_log.json
 data/checkweb_log.json

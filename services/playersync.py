@@ -608,3 +608,205 @@ async def get_playersync_log() -> list:
     """Všechny záznamy auditu v pořadí zápisu (chronologicky)."""
     entries = await store_read(PLAYERSYNC_LOG_FILE, [])
     return [e for e in entries if isinstance(e, dict)]
+
+
+# ---------------------------------------------------------------------------
+# Rollback /sync discord – inverze JEN úspěšně aplikovaných akcí z auditu
+#
+# Rollback je transakční inverze konkrétního „/sync discord apply" z
+# ``playersync_log.json``: ADD → REMOVE, REMOVE → ADD. Používá se VÝHRADNĚ
+# ``memberId`` / ``roleId`` zaznamenané v auditu (nikdy ne jména, nikdy ne
+# odvozené mapování z players.json / kit_roles.json). Nikdy se nerollbackují
+# akce s ``ok`` False a nikdy se nespouští běžná synchronizace.
+# ---------------------------------------------------------------------------
+PLAYERSYNC_ROLLBACK_LOG_FILE = "playersync_rollback_log.json"
+
+
+def _invert_op(op) -> str | None:
+    """Inverze operace role: add ↔ remove (cokoliv jiného → None = neplatné)."""
+    if op == "add":
+        return "remove"
+    if op == "remove":
+        return "add"
+    return None
+
+
+def _entry_has_success(entry) -> bool:
+    """Má apply záznam alespoň jednu ÚSPĚŠNĚ aplikovanou akci (ok=True)?"""
+    return any(
+        isinstance(a, dict) and a.get("ok")
+        for a in (entry.get("applied") or [])
+        if isinstance(entry.get("applied"), list)
+    )
+
+
+def find_rollback_target(entries, *, target_ts=None) -> tuple:
+    """Vybere cílový „/sync discord apply" z auditního logu.
+
+    - ``target_ts`` None → POSLEDNÍ aplikovaný sync (mode=apply se záznamem
+      ``applied`` a alespoň jednou úspěšně aplikovanou akcí); preview záznamy
+      a apply záznamy bez jediného úspěchu se ignorují,
+    - ``target_ts`` int  → záznam přesně podle ts (ms epoch).
+
+    Preview / rozeznatelná „suchá" volání se nikdy nevyberou. Vrací
+    ``(entry, warnings)`` – bez vhodného záznamu je entry None a warnings
+    obsahují důvod (bezpečný abort před jakýmkoliv zásahem).
+    """
+    applied = [
+        e
+        for e in (entries or [])
+        if isinstance(e, dict)
+        and e.get("mode") == "apply"
+        and isinstance(e.get("applied"), list)
+        and _entry_has_success(e)
+    ]
+    if target_ts is None:
+        if applied:
+            return applied[-1], []
+        return None, [
+            "V auditním logu není žádný aplikovaný /sync discord "
+            "(mode=apply s úspěšně aplikovanými akcemi)."
+        ]
+    try:
+        target_ts = int(target_ts)
+    except (TypeError, ValueError):
+        return None, [f"Neplatné target_ts: {target_ts!r} (očekávám ms epoch)."]
+    for e in (entries or []):
+        if (
+            isinstance(e, dict)
+            and e.get("ts") == target_ts
+            and e.get("mode") == "apply"
+            and isinstance(e.get("applied"), list)
+        ):
+            if not _entry_has_success(e):
+                return None, [
+                    f"Záznam s ts={target_ts} nemá žádné úspěšně aplikované "
+                    "akce – není co vracet."
+                ]
+            return e, []
+    return None, [f"Nebyl nalezen aplikovaný /sync discord s ts={target_ts}."]
+
+
+def build_rollback_plan(entry) -> dict:
+    """Sestaví invertovaný rollback plán z apply záznamu auditu.
+
+    - bere JEN akce s ``ok`` True (úspěšně aplikované – chyby se NEVRACEJÍ),
+    - invertuje operaci: add → remove, remove → add,
+    - identita výhradně přes ``memberId`` / ``roleId`` z auditu (nikdy jména),
+    - záznam bez povinných ID / neplatným op je odmítnut (``missing``;
+      plán pak má ``ok`` False → rollback se NESPUSTÍ).
+
+    Vrací plán s metadaty cíle (ts, aktor), počty a invertovanými akcemi.
+    """
+    applied = [
+        a
+        for a in (entry.get("applied") or [])
+        if isinstance(a, dict) and a.get("ok")
+    ]
+    actions = []
+    missing = []
+    for a in applied:
+        member_id = str(a.get("memberId") or "").strip()
+        role_id = str(a.get("roleId") or "").strip()
+        op = _invert_op(a.get("op"))
+        if (
+            not member_id
+            or not role_id
+            or not op
+            or not member_id.isdigit()
+            or not role_id.isdigit()
+        ):
+            missing.append(
+                {
+                    "memberId": a.get("memberId"),
+                    "roleId": a.get("roleId"),
+                    "op": a.get("op"),
+                    "reason": (
+                        "chybí memberId / roleId nebo neplatný op "
+                        "(vyžadováno pro bezpečný rollback)"
+                    ),
+                }
+            )
+            continue
+        actions.append(
+            {
+                "op": op,                     # rollback operace (inverze)
+                "original_op": a.get("op"),   # původní operace syncu
+                "member_id": member_id,
+                "member_name": a.get("memberName") or "",
+                "role_id": role_id,
+                "kit": a.get("kit") or "",
+                "tier": a.get("tier") or "",
+            }
+        )
+    return {
+        "target_ts": entry.get("ts"),
+        "target_actor_id": str(entry.get("actorId") or ""),
+        "target_actor_name": entry.get("actorName") or "",
+        "original_applied": len(applied),
+        "total_logged": len(entry.get("applied") or []),
+        "actions": actions,
+        "missing": missing,
+        "ok": not missing,
+    }
+
+
+async def log_playersync_rollback_event(
+    *,
+    actor_id,
+    actor_name,
+    mode: str,
+    target_ts,
+    target_actor_id,
+    target_actor_name,
+    original_applied: int,
+    total_logged: int,
+    plan=None,
+    results=None,
+    summary=None,
+    ts: int = None,
+) -> dict:
+    """Přidá záznam do rollback auditu (``playersync_rollback_log.json``).
+
+    Append-only, restart-safe a SEPARÁTNÍ od ``playersync_log.json`` –
+    původní audit syncu se nikdy nepřepisuje ani nemění.
+
+    - ``mode`` ``preview`` → uloží ``plan`` (co by se vrátilo; dry run),
+    - ``mode`` ``apply``   → uloží ``results`` (výsledek každé akce:
+                             applied / already_correct / failed + error).
+    Vrací záznam.
+    """
+    if ts is None:
+        ts = _now_ms()
+    entry: dict = {
+        "ts": ts,
+        "mode": mode,
+        "actorId": str(actor_id),
+        "actorName": actor_name or "",
+        "targetTs": target_ts,
+        "targetActorId": str(target_actor_id or ""),
+        "targetActorName": target_actor_name or "",
+        "originalApplied": int(original_applied or 0),
+        "totalLogged": int(total_logged or 0),
+        "summary": dict(summary or {}),
+    }
+    if mode == "apply":
+        entry["results"] = list(results or [])
+    else:
+        entry["plan"] = list(plan or [])
+
+    async def _run(tx):
+        entries = tx.get(PLAYERSYNC_ROLLBACK_LOG_FILE, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries.append(entry)
+        tx.set(PLAYERSYNC_ROLLBACK_LOG_FILE, entries)
+        return entry
+
+    return await transaction((PLAYERSYNC_ROLLBACK_LOG_FILE,), _run)
+
+
+async def get_playersync_rollback_log() -> list:
+    """Všechny záznamy rollback auditu v pořadí zápisu (chronologicky)."""
+    entries = await store_read(PLAYERSYNC_ROLLBACK_LOG_FILE, [])
+    return [e for e in entries if isinstance(e, dict)]

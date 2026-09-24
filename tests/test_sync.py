@@ -49,7 +49,9 @@ from cogs.sync import (
     SyncDiscordConfirmView,
     SyncWebConfirmView,
     _check_embed,
-    _field_value,
+    _datacheck_embed,
+    _send_embed_pack,
+    build_embed_pack,
 )
 
 
@@ -146,10 +148,22 @@ def _player(username, modes, discord_id=None, history=None):
 
 
 def _sent(inter):
-    """(embed, kwargs) z jediného followup.send volání."""
+    """(první embed, kwargs) z jediného followup.send volání.
+
+    Podporuje ``embed=`` i ``embeds=`` (embed pack) – vrací PRVNÍ embed packu,
+    takže staré testy (titulky, description, pole) fungují beze změny.
+    """
     args, kwargs = inter.followup.send.call_args
-    embed = args[0] if args else kwargs.get("embed")
-    return embed, kwargs
+    if "embeds" in kwargs:
+        embeds = kwargs["embeds"]
+    elif "embed" in kwargs:
+        embeds = [kwargs["embed"]]
+    elif args:
+        first = args[0]
+        embeds = first if isinstance(first, list) else [first]
+    else:
+        embeds = []
+    return (embeds[0] if embeds else None), kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -982,38 +996,163 @@ class DeprecatedAliasTests(unittest.TestCase):
         )
 
 
-class CheckEmbedLimitTests(unittest.TestCase):
-    """item 3: embed pole má limit 1024 znaků – pole se nikdy neplní delší.
+class SyncEmbedPackTests(unittest.TestCase):
+    """Embed pack (/sync check • data • discord • web • checkweb).
 
-    Před fixem šel ``"\\n".join(lines)`` přímo do ``add_field(value=…)`` –
-    s dlouhými nálezy (např. seznam hráčů nebo chyb) spadla odpověď na
-    Discord API 400 („field value must be 1024 or fewer in length").
+    Regresní testy pro produkční bug „In embeds.0.fields.0.value: Must be
+    1024 or fewer in length": diagnostika se NIKDY nezkracuje ani nedělá
+    útržky „… a dalších N" – dlouhé seznamy se rozdělí na víc polí / embedů
+    (na hranicích řádků), vše zůstává a Discord limity se nikdy nepřekročí.
     """
 
-    def test_field_value_short_list_passthrough(self):
-        self.assertEqual(_field_value(["a", "b"]), "a\nb")
-        self.assertEqual(_field_value([]), "_žádné_")
+    @staticmethod
+    def _field_lines(embeds):
+        """Všechny řádky všech polí všech embedů v pořadí."""
+        out = []
+        for embed in embeds:
+            for field in embed.fields:
+                out.extend(field.value.split("\n"))
+        return out
 
-    def test_field_value_truncates_long_lines(self):
-        out = _field_value(["X" * 600, "Y" * 600])  # 1201 znaků → nad limit
-        self.assertLessEqual(len(out), 1024)
-        self.assertIn("zkráceno", out)
+    @staticmethod
+    def _reconstruct(embeds):
+        """Rekonstrukce původních řádků z packu (odstraní „» " pokračování).
 
-    def test_field_value_many_lines_never_exceed_limit(self):
-        out = _field_value([f"řádek {i}: " + "d" * 200 for i in range(40)])
-        self.assertLessEqual(len(out), 1024)
-        self.assertIn("zkráceno", out)
+        Každý řádek začínající „» " je pokračováním předchozího řádku –
+        připojí se bez prefixu, takže porovnání s originálem ověří, že se
+        ŽÁDNÝ znak diagnostiky neztratil.
+        """
+        result = []
+        for line in SyncEmbedPackTests._field_lines(embeds):
+            if line.startswith("» ") and result:
+                result[-1] += line[len("» "):]
+            else:
+                result.append(line)
+        return result
 
-    def test_field_value_single_line_longer_than_limit(self):
-        out = _field_value(["Z" * 5000])
-        self.assertLessEqual(len(out), 1024)
+    @staticmethod
+    def _embed_total(embed):
+        """Počet znaků embedu (title + description + pole + footer)."""
+        return (
+            len(embed.title or "")
+            + len(embed.description or "")
+            + sum(len(f.name) + len(f.value) + 2 for f in embed.fields)
+            + len(embed.footer.text if embed.footer else "")
+        )
 
-    def test_check_embed_fields_never_exceed_1024(self):
+    def test_field_value_exactly_1024_stays_single_field(self):
+        line = "x" * 1024  # přesně na limitu – nesmí se rozdělit ani zkrátit
+        embeds = build_embed_pack(
+            title="t", description="d", color=0, sections=[("Pole", [line])]
+        )
+        self.assertEqual(len(embeds), 1)
+        self.assertEqual(len(embeds[0].fields), 1)
+        self.assertEqual(embeds[0].fields[0].value, line)
+
+    def test_field_value_over_1024_split_without_loss(self):
+        line = "slovo " * 400  # 2400 znaků > 1024
+        embeds = build_embed_pack(
+            title="t", description="d", color=0, sections=[("Pole", [line])]
+        )
+        for embed in embeds:
+            for field in embed.fields:
+                self.assertLessEqual(len(field.value), 1024)
+        self.assertEqual(self._reconstruct(embeds), [line])
+
+    def test_field_value_many_long_lines_no_truncation_marker(self):
+        lines = [f"nález {i}: " + "d" * 120 for i in range(60)]
+        embeds = build_embed_pack(
+            title="t", description="d", color=0, sections=[("Pole", lines)]
+        )
+        blob = "\n".join(self._field_lines(embeds))
+        self.assertNotIn("zkráceno", blob)
+        self.assertNotIn("a dalších", blob)
+        self.assertEqual(self._reconstruct(embeds), lines)
+
+    def test_many_long_lines_span_multiple_embeds_within_limits(self):
+        lines = [f"nález {i}: " + "x" * 200 for i in range(200)]
+        embeds = build_embed_pack(
+            title="t",
+            description="d",
+            color=0,
+            footer="audit",
+            sections=[("Pole", lines)],
+        )
+        self.assertGreater(len(embeds), 1)
+        for embed in embeds:
+            self.assertLessEqual(len(embed.fields), 25)
+            self.assertLessEqual(len(embed.title or ""), 256)
+            self.assertLessEqual(len(embed.description or ""), 4096)
+            for field in embed.fields:
+                self.assertLessEqual(len(field.name), 256)
+                self.assertLessEqual(len(field.value), 1024)
+            self.assertLessEqual(self._embed_total(embed), 6000)
+            self.assertTrue(embed.fields)  # žádný prázdný embed
+        self.assertEqual(self._reconstruct(embeds), lines)
+
+    def test_field_count_limited_to_25_per_embed(self):
+        sections = [(f"sekce {i}", [f"řádek {i}"]) for i in range(30)]
+        embeds = build_embed_pack(
+            title="t", description="d", color=0, sections=sections
+        )
+        self.assertGreater(len(embeds), 1)
+        for embed in embeds:
+            self.assertLessEqual(len(embed.fields), 25)
+        total_fields = sum(len(e.fields) for e in embeds)
+        self.assertEqual(total_fields, 30)  # žádná sekce se neztratila
+
+    def test_empty_sections_render_placeholder_single_embed(self):
+        embeds = build_embed_pack(
+            title="✅ /sync check – vše v pořádku",
+            description="Nalezeno **0** problémů.",
+            color=0x10B981,
+            sections=[("Nálezů celkem: 0", [])],
+        )
+        self.assertEqual(len(embeds), 1)
+        self.assertEqual(embeds[0].fields[0].value, "_žádné_")
+
+    def test_datacheck_embed_many_findings_preserved(self):
+        # Přesně scénář produkčního bugu: /sync data s hromadou nálezů.
+        findings = [
+            {"kind": "orphan_ticket", "message": f"ticket {i}: " + "t" * 100}
+            for i in range(200)
+        ]
+        report = {
+            "has_issues": True,
+            "total_findings": len(findings),
+            "summary": {"orphan_ticket": len(findings)},
+            "findings": findings,
+            "repairable": {"close_ticket": [], "normalize_tier": []},
+            "repairable_count": 0,
+        }
+        embeds = _datacheck_embed(report)
+        self.assertGreater(len(embeds), 1)
+        for embed in embeds:
+            self.assertLessEqual(len(embed.fields), 25)
+            for field in embed.fields:
+                self.assertLessEqual(len(field.value), 1024)
+            self.assertLessEqual(self._embed_total(embed), 6000)
+        self.assertEqual(self._reconstruct(embeds), [f["message"] for f in findings])
+
+    def test_datacheck_embed_no_issues_single_embed(self):
+        embeds = _datacheck_embed(
+            {
+                "has_issues": False,
+                "summary": {},
+                "findings": [],
+                "repairable": {"close_ticket": [], "normalize_tier": []},
+                "repairable_count": 0,
+            }
+        )
+        self.assertEqual(len(embeds), 1)
+        self.assertEqual(embeds[0].fields, [])
+
+    def test_check_embed_many_long_findings_no_silent_loss(self):
         items = [
             {"severity": "warning", "kind": "k", "message": f"nález {i} " + "x" * 300}
             for i in range(40)
         ]
-        embed = _check_embed(
+        embeds = _check_embed(
             items,
             counts={"error": 0, "conflict": 0, "warning": len(items)},
             website_source="GitHub",
@@ -1021,26 +1160,33 @@ class CheckEmbedLimitTests(unittest.TestCase):
             corrupt=[],
             repairable_count=0,
         )
-        for field in embed.fields:
-            self.assertLessEqual(len(field.value), 1024)
-        # poslední severity pole nese poznámku o zkrácení
-        self.assertIn("zkráceno", embed.fields[-1].value)
+        self.assertGreater(len(embeds), 1)
+        for embed in embeds:
+            for field in embed.fields:
+                self.assertLessEqual(len(field.value), 1024)
+            self.assertLessEqual(self._embed_total(embed), 6000)
+        self.assertEqual(self._reconstruct(embeds), [i["message"] for i in items])
 
-    def test_check_embed_many_long_errors_also_truncated(self):
-        items = [
-            {"severity": "error", "kind": "k", "message": "chyba " + "e" * 250}
-            for _ in range(30)
-        ]
-        embed = _check_embed(
-            items,
-            counts={"error": 30, "conflict": 0, "warning": 0},
-            website_source="GitHub",
-            area="all",
-            corrupt=[],
-            repairable_count=3,
-        )
-        for field in embed.fields:
-            self.assertLessEqual(len(field.value), 1024)
+    def test_send_embed_pack_splits_messages_of_ten_keeps_ephemeral_and_view(self):
+        followup = mock.MagicMock()
+        followup.send = mock.AsyncMock()
+        view = object()
+        embeds = [discord.Embed(title=f"e{i}") for i in range(23)]
+
+        async def main():
+            await _send_embed_pack(followup, embeds, view=view)
+
+        asyncio.run(main())
+        self.assertEqual(followup.send.await_count, 3)
+        for call in followup.send.await_args_list:
+            self.assertLessEqual(len(call.kwargs["embeds"]), 10)
+            self.assertEqual(call.kwargs["ephemeral"], True)
+        first = followup.send.await_args_list[0].kwargs
+        self.assertEqual(len(first["embeds"]), 10)
+        self.assertIs(first["view"], view)
+        # view jen u první zprávy, pokračování čistá
+        for call in followup.send.await_args_list[1:]:
+            self.assertNotIn("view", call.kwargs)
 
 
 if __name__ == "__main__":

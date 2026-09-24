@@ -103,6 +103,71 @@ async def apply_role_actions(guild: discord.Guild, actions: list) -> list:
     return applied
 
 
+async def apply_rollback_actions(guild: discord.Guild, actions: list) -> list:
+    """Aplikuje rollback akce (inverze provedeného syncu); každá zvlášť.
+
+    Oproti ``apply_role_actions`` navíc rozlišuje idempotentní stavy
+    (``already_correct``), takže rollback se dá bezpečně spustit dvakrát:
+
+    - op ``add`` a role už je přítomná  → ``already_correct``, bez volání API,
+    - op ``remove`` a role nepřítomná   → ``already_correct``, bez volání API,
+    - jinak provede zásah (``applied``) / selže (``failed`` + error).
+
+    Identita je výhradně přes ``member_id`` / ``role_id`` z auditního logu.
+    Chyby (člen/role nenalezen, Forbidden, HTTP) se nikdy nešíří dál.
+    """
+    results = []
+    for action in actions:
+        member_id = str(action.get("member_id") or "")
+        role_id = str(action.get("role_id") or "")
+        op = action.get("op")
+        record = {
+            "op": op,
+            "original_op": action.get("original_op") or "",
+            "memberId": member_id,
+            "memberName": action.get("member_name") or "",
+            "roleId": role_id,
+            "kit": action.get("kit") or "",
+            "tier": action.get("tier") or "",
+            "status": "failed",  # nezdar je implicitní – vždy se přepíše
+            "error": None,
+        }
+        member = None
+        if member_id.isdigit():
+            member = guild.get_member(int(member_id))
+            if member is None:
+                try:
+                    member = await guild.fetch_member(int(member_id))
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ):
+                    member = None
+        role = guild.get_role(int(role_id)) if role_id.isdigit() else None
+        if member is None:
+            record["error"] = "člen není na serveru"
+        elif role is None:
+            record["error"] = "role neexistuje"
+        else:
+            held = {str(r.id) for r in (getattr(member, "roles", None) or [])}
+            if op == "add" and role_id in held:
+                record["status"] = "already_correct"
+            elif op == "remove" and role_id not in held:
+                record["status"] = "already_correct"
+            else:
+                try:
+                    if op == "add":
+                        await member.add_roles(role)
+                    else:
+                        await member.remove_roles(role)
+                    record["status"] = "applied"
+                except (discord.Forbidden, discord.HTTPException) as err:
+                    record["error"] = str(err)
+        results.append(record)
+    return results
+
+
 def admin_gate_error(interaction) -> str | None:
     """Vrátí hlášku, když interakce neprošla gate (guild + admin), jinak None."""
     if interaction.guild is None:

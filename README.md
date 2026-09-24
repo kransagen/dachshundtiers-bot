@@ -238,7 +238,7 @@ např. `{"randompot":"...","ironaxe":"..."}`. Priorita: kit → tier
 | Příkaz | Popis |
 |---|---|
 | `/createturnaj role skupiny hodiny kit tier` | Vytvoří turnaj (kategorie + přihlašovací kanál s tlačítkem). |
-| `/turnajresult kit hrac z_tieru na_tier` | Pošle výsledek turnaje do určeného kanálu. |
+| `/turnajresult kit hrac z_tieru na_tier` | Pošle výsledek turnaje do určeného kanálu (`TOURNAMENT_RESULT_CHANNEL_ID`). Zapinguje **jen** `TOP_RESULT_ROLE_ID` (jako `/topresult`) – nikdy `@everyone`. |
 | `/deleteturnaj kit` | Smaže turnaj i všechny jeho kanály. |
 
 Po uplynutí deadlinu se přihlašování automaticky ukončí, hráči se zamíchají,

@@ -16,7 +16,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import TOURNAMENT_RESULT_CHANNEL_ID
+from config import TOP_RESULT_ROLE_ID, TOURNAMENT_RESULT_CHANNEL_ID
 from storage import load_data, save_data
 from utils import DEFAULT_KITS, get_kits, kit_autocomplete
 from views import TournamentSignupView
@@ -282,6 +282,20 @@ class Tournaments(commands.Cog):
                 ephemeral=True,
             )
 
+        # Ping jde POUZE na nakonfigurovanou TOP_RESULT_ROLE_ID (jako /topresult),
+        # nikdy na @everyone – role se nebere od uživatele.
+        target_role = (
+            interaction.guild.get_role(TOP_RESULT_ROLE_ID)
+            if interaction.guild is not None
+            else None
+        )
+        if target_role is None:
+            return await interaction.response.send_message(
+                f"❌ Role pro turnajový ping (ID `{TOP_RESULT_ROLE_ID}`) nebyla "
+                "na serveru nalezena – zkontroluj `TOP_RESULT_ROLE_ID`.",
+                ephemeral=True,
+            )
+
         embed = discord.Embed(
             title=f"🏆 {kit.upper()} TURNAJ",
             description=f"**Získává:**\n> <@{hrac.id}> — {z_tieru} ➔ **{na_tier}**",
@@ -290,7 +304,10 @@ class Tournaments(commands.Cog):
         )
         embed.set_footer(text=f"Zapisovatel: {interaction.user.name}")
 
-        await target_channel.send(content="@everyone", embed=embed)
+        allowed = discord.AllowedMentions(everyone=False, users=True, roles=[target_role])
+        await target_channel.send(
+            content=f"<@&{TOP_RESULT_ROLE_ID}>", embed=embed, allowed_mentions=allowed
+        )
         await interaction.response.send_message(
             f"Výsledek byl úspěšně odeslán do <#{TOURNAMENT_RESULT_CHANNEL_ID}>.",
             ephemeral=True,

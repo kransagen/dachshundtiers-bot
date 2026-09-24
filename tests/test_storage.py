@@ -34,6 +34,19 @@ class StorageTests(unittest.TestCase):
         with self.assertLogs("dachshundtiers", level="ERROR"):
             self.assertEqual(storage.load_data("bad.json", []), [])
 
+    def test_strict_mode_raises_on_corrupt(self):
+        with open(os.path.join(self._tmp, "bad.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        with self.assertRaises(storage.DataCorruptionError):
+            storage.load_data("bad.json", [], strict=True)
+        # soubor se nikdy nepřepíše defaultními daty
+        with open(os.path.join(self._tmp, "bad.json"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{not json")
+
+    def test_strict_mode_missing_file_returns_default(self):
+        # strict řeší POŠKOZENÝ soubor; chybějící soubor je v pořádku (default)
+        self.assertEqual(storage.load_data("nope.json", [], strict=True), [])
+
     def test_save_failure_raises_and_keeps_original(self):
         storage.save_data("x.json", {"v": 1})
         with mock.patch.object(storage.os, "replace", side_effect=OSError("disk full")):

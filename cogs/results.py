@@ -294,6 +294,15 @@ class Results(commands.Cog):
             return await interaction.followup.send(
                 record.get("message", "❌ Neplatný výsledek."), ephemeral=True
             )
+        if r == "identity_conflict":
+            return await interaction.followup.send(
+                record.get(
+                    "message",
+                    "❌ Zadané IGN patří jinému hráči (jinému Discord ID) – "
+                    "výsledek se nezapsal. Identitu hráče uprav ručně.",
+                ),
+                ephemeral=True,
+            )
         if r != "created":
             return await interaction.followup.send(
                 "❌ Výsledek se nepodařilo uložit.", ephemeral=True

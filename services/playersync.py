@@ -200,6 +200,7 @@ def analyze_sync(
         {
           "summary":        {kind: počet},  # všechny kategorie, i 0
           "checked":        počet zkontrolovaných párů (člen × kit),
+          "unchanged":      počet párů beze změny (role přesně odpovídá DB),
           "findings":       [nález, ...],   # viz _finding
           "actions":        [akce, ...]     # deduplikované = to, co by se potvrdilo,
           "has_actions":    bool,
@@ -228,6 +229,7 @@ def analyze_sync(
     findings: list = []
     summary = {kind: 0 for kind in KINDS}
     checked = 0
+    unchanged = 0
 
     for kit_key, kit_map in sorted(
         (roles_map or {}).items(), key=lambda kv: str(kv[0])
@@ -505,10 +507,14 @@ def analyze_sync(
                 )
                 summary["wrong_role"] += 1
 
+            if exp is not None and held_ids == [expected_role]:
+                unchanged += 1
+
     actions = build_actions(findings)
     return {
         "summary": summary,
         "checked": checked,
+        "unchanged": unchanged,
         "findings": findings,
         "actions": actions,
         "has_actions": bool(actions),

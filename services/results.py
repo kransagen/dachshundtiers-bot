@@ -33,6 +33,7 @@ Vlastnosti:
 import logging
 import time
 
+from services.player_identity import PlayerIdentityConflict, claim_ign
 from services.store import read as store_read, transaction
 from services.tickets import (
     HT3_COOLDOWNS_FILE,
@@ -54,9 +55,21 @@ EVAL_TIER = "LT3E"
 
 # Typ výsledku v kanonické historii (data/ht_results.json):
 #   normal   – klasický /result (queue nebo HT3+ eval ticket),
-#   ht_fight – HT Fight výsledek (/topresult) – zapisuje se do STEJNÉ historie,
-#              jen se nikdy NEDOTÝKÁ players.json (žádná změna tieru).
+#   ht_fight – HT Fight výsledek (/topresult) – zapisuje se do STEJNÉ historie;
+#              výhra povyšuje hráče na další tier (players.json),
+#              prohra tier nemění.
 RESULT_TYPES = ("normal", "ht_fight")
+
+# Stav odeslání oznámení výsledku do kanálu (/topresult announcement):
+#   pending – záznam vznikl, oznámení se ještě neodeslalo,
+#   sent    – zpráva je v kanálu (messageId),
+#   failed  – odeslání selhalo (retry tlačítkem v UI).
+ANNOUNCEMENT_PENDING = "pending"
+ANNOUNCEMENT_SENT = "sent"
+ANNOUNCEMENT_FAILED = "failed"
+ANNOUNCEMENT_STATUSES = frozenset(
+    {ANNOUNCEMENT_PENDING, ANNOUNCEMENT_SENT, ANNOUNCEMENT_FAILED}
+)
 
 HT_RESULTS_FILE = "ht_results.json"
 QUEUE_RESULT_PREFIX = "queue-"
@@ -137,6 +150,8 @@ def apply_result_to_players(
     kit: str,
     new_tier: str,
     current_date: str,
+    *,
+    player_id: str | None = None,
 ) -> tuple[list, str]:
     """Aplikuje výsledek na seznam hráčů (kanonická players.json).
 
@@ -144,39 +159,52 @@ def apply_result_to_players(
     PŘED zápisem („N/A", když hráč záznam nemá). Čistá funkce: vstupní seznam
     se nikdy nemutuje (kopie), idempotentní aplikace – stejná volání na
     stejném stavu dávají stejný výsledek.
+
+    ``player_id`` (Discord ID) = primární identita (services/player_identity):
+    hráč se najde podle Discord ID, IGN se případně přejmenuje / adopuje
+    historický záznam bez Discord ID. IGN patřící JINÉMU Discord ID zvedá
+    ``PlayerIdentityConflict`` (operaci odmítnout, nikdy neslučovat).
+    Bez ``player_id`` = legacy chování (čistá case-insensitive shoda IGN).
     """
-    players = [
-        {
-            **p,
-            "modes": dict(p.get("modes") or {}),
-            "history": {
-                k: list(v) for k, v in (p.get("history") or {}).items()
-            },
-        }
-        for p in (players or [])
-    ]
+    players = _copy_players_from(players)
     ign_clean = (ign or "").strip()
-    player = next(
-        (
-            p
-            for p in players
-            if str(p.get("username", "")).strip().lower() == ign_clean.lower()
-        ),
-        None,
-    )
-    previous = "N/A"
-    if player is None:
-        player = {"username": ign_clean, "modes": {}, "history": {}}
-        players.append(player)
+    if player_id:
+        players, player, _outcome = claim_ign(
+            players, discord_id=player_id, ign=ign_clean
+        )
     else:
-        player.setdefault("modes", {})
-        player.setdefault("history", {})
-        if player["modes"].get(kit):
-            previous = str(player["modes"][kit]).upper()
+        player = next(
+            (
+                p
+                for p in players
+                if str(p.get("username", "")).strip().lower() == ign_clean.lower()
+            ),
+            None,
+        )
+        if player is None:
+            player = {"username": ign_clean, "modes": {}, "history": {}}
+            players.append(player)
+    previous = "N/A"
+    player.setdefault("modes", {})
+    player.setdefault("history", {})
+    if player["modes"].get(kit):
+        previous = str(player["modes"][kit]).upper()
     player["history"].setdefault(kit, [])
     player["modes"][kit] = new_tier
     player["history"][kit].append({"date": current_date, "tier": new_tier})
     return players, previous
+
+
+def _copy_players_from(players) -> list:
+    """Hluboká kopie hráčských záznamů (modes/history) – nemutuje vstup."""
+    return [
+        {
+            **p,
+            "modes": dict(p.get("modes") or {}),
+            "history": {k: list(v) for k, v in (p.get("history") or {}).items()},
+        }
+        for p in (players or [])
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +240,8 @@ def make_result(
 
     ``result_type`` (``normal`` | ``ht_fight``) rozlišuje klasický /result od
     HT Fight výsledku (/topresult). HT Fight záznam navíc nese ``fightTier``,
-    ``tierStatus`` a ``opponentId``/``opponentName`` – tier hráče (players.json)
-    se při něm nikdy nemění.
+    ``tierStatus``, ``opponentId``/``opponentName`` a stav oznámení
+    ``announcement`` – povýšení hráče řeší services/topresult.py.
     """
     record = {
         "id": result_id,
@@ -241,6 +269,7 @@ def make_result(
         record["tierStatus"] = (tier_status or "").strip()
         record["opponentId"] = str(opponent_id) if opponent_id else None
         record["opponentName"] = opponent_name or ""
+        record["announcement"] = ANNOUNCEMENT_PENDING
     return record
 
 
@@ -250,6 +279,59 @@ def get_result_type(record: dict) -> str:
         return "normal"
     rt = record.get("resultType")
     return rt if rt in RESULT_TYPES else "normal"
+
+
+def get_result_announcement(record: dict) -> str:
+    """Stav oznámení výsledku; staré záznamy bez pole = ``pending``."""
+    if not isinstance(record, dict):
+        return ANNOUNCEMENT_PENDING
+    status = record.get("announcement")
+    return status if status in ANNOUNCEMENT_STATUSES else ANNOUNCEMENT_PENDING
+
+
+def close_ticket_in_tx(
+    tx,
+    tickets: dict,
+    ticket: dict,
+    ticket_id,
+    *,
+    now: int,
+    actor_id: str,
+    actor_name: str = "",
+    ht3_cooldown_ms: int = 0,
+    log_action: str = "result",
+    log_details: str | None = None,
+) -> None:
+    """Uzavře HT ticket uvnitř otevřené transakce (sdílené /result a /topresult).
+
+    Zavře ticket (status + closedAt), nastaví HT3+ cooldown vlastníkovi na
+    klíč kitu a připíše událost do logu ticketu. Předpokládá, že transaction
+    má v ``files`` HT_TICKETS_FILE, HT3_COOLDOWNS_FILE a HT_TICKET_LOGS_FILE.
+    """
+    ticket["status"] = STATUS_CLOSED
+    ticket["closedAt"] = now
+    tx.set(HT_TICKETS_FILE, tickets)
+
+    if ht3_cooldown_ms > 0:
+        owner_id = str(ticket.get("ownerId", ""))
+        if owner_id:
+            ht3_cd = tx.get(HT3_COOLDOWNS_FILE, {})
+            ht3_cd.setdefault(owner_id, {})[str(ticket.get("kit", ""))] = (
+                now + ht3_cooldown_ms
+            )
+            tx.set(HT3_COOLDOWNS_FILE, ht3_cd)
+
+    logs = tx.get(HT_TICKET_LOGS_FILE, {})
+    logs.setdefault(str(ticket_id), []).append(
+        {
+            "ts": now,
+            "action": log_action,
+            "actorId": str(actor_id),
+            "actorName": actor_name or "",
+            "details": log_details,
+        }
+    )
+    tx.set(HT_TICKET_LOGS_FILE, logs)
 
 
 def _latest_player_result(results: dict, player_id: str) -> dict | None:
@@ -304,6 +386,7 @@ async def record_result(
       - ``{"result": "not_found"}`` / ``{"result": "ticket_closed", "ticket"}``
       - ``{"result": "wrong_player", "ticket"}`` / ``{"result": "wrong_kit", "ticket"}``
       - ``{"result": "invalid_tier", "message"}``
+      - ``{"result": "identity_conflict", "message"}`` (IGN patří jinému Diskordu)
     """
     if now is None:
         now = _now_ms()
@@ -364,9 +447,12 @@ async def record_result(
 
         # --- Kanonická databáze hráčů (players.json) ---
         players = tx.get("players.json", [])
-        players, previous = apply_result_to_players(
-            players, ign, kit, stored_tier, date
-        )
+        try:
+            players, previous = apply_result_to_players(
+                players, ign, kit, stored_tier, date, player_id=player_id
+            )
+        except PlayerIdentityConflict as exc:
+            return {"result": "identity_conflict", "message": str(exc)}
         tx.set("players.json", players)
 
         # --- Historie výsledků (append-only, nikdy se nemaže) ---
@@ -400,30 +486,18 @@ async def record_result(
 
         # --- Ticket: zavření + HT3+ cooldown + event log (atomicky) ---
         if ticket_id is not None:
-            ticket["status"] = STATUS_CLOSED
-            ticket["closedAt"] = now
-            tx.set(HT_TICKETS_FILE, tickets)
-
-            if ht3_cooldown_ms > 0:
-                owner_id = str(ticket.get("ownerId", ""))
-                if owner_id:
-                    ht3_cd = tx.get(HT3_COOLDOWNS_FILE, {})
-                    ht3_cd.setdefault(owner_id, {})[
-                        str(ticket.get("kit", ""))
-                    ] = now + ht3_cooldown_ms
-                    tx.set(HT3_COOLDOWNS_FILE, ht3_cd)
-
-            logs = tx.get(HT_TICKET_LOGS_FILE, {})
-            logs.setdefault(tid, []).append(
-                {
-                    "ts": now,
-                    "action": "result",
-                    "actorId": evaluator_id,
-                    "actorName": evaluator_name or "",
-                    "details": f"{previous} → {normalize_tier(new_tier)}",
-                }
+            close_ticket_in_tx(
+                tx,
+                tickets,
+                ticket,
+                tid,
+                now=now,
+                actor_id=evaluator_id,
+                actor_name=evaluator_name,
+                ht3_cooldown_ms=ht3_cooldown_ms,
+                log_action="result",
+                log_details=f"{previous} → {normalize_tier(new_tier)}",
             )
-            tx.set(HT_TICKET_LOGS_FILE, logs)
 
         return {
             "result": "created",

@@ -72,6 +72,22 @@ class AnalyzeSyncTests(unittest.TestCase):
         self.assertFalse(analysis["has_actions"])
         self.assertFalse(analysis["has_issues"])
         self.assertEqual(analysis["checked"], 1)
+        self.assertEqual(analysis["unchanged"], 1)
+
+    def test_retired_tier_in_db_reported(self):
+        players = [{"username": "AliceMC", "modes": {"AnchorPvP": "RLT2"}}]
+        members = [_member("1", "AliceMC", {})]
+        analysis = _analyze(
+            players, members, {"anchorpvp": {"HT3": "102"}},
+            {"anchorpvp": "AnchorPvP"},
+        )
+        self.assertEqual(analysis["summary"]["retired_tier_in_db"], 1)
+        f = analysis["findings"][0]
+        self.assertEqual(f["kind"], "retired_tier_in_db")
+        self.assertIsNone(f["action"])
+        # retired tier je archivovaná historie – role se neřeší, nic se nenavrhuje
+        self.assertFalse(analysis["has_actions"])
+        self.assertEqual(analysis["actions"], [])
 
     def test_wrong_role_and_missing_role(self):
         players = [{"username": "AliceMC", "modes": {"AnchorPvP": "HT3"}}]

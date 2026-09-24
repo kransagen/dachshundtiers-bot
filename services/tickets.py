@@ -117,20 +117,44 @@ def effective_ticket_tier(current_tier: str | None, eval_ok: bool) -> str | None
     return cur if HT3_TIER_LADDER.index(cur) >= eval_idx else "LT3E"
 
 
-def find_player_tier(ign: str, kit: str) -> str | None:
-    """Najde hráče v players.json a vrátí jeho aktuální tier pro daný kit."""
+def find_player_tier(ign: str, kit: str, discord_id=None) -> str | None:
+    """Aktuální tier hráče pro daný kit; Discord ID má přednost před IGN.
+
+    ``discord_id`` je primární identita (services/player_identity.py) – když
+    hráče podle Discord ID najdeme, IGN se ignoruje. Bez Discord ID klasická
+    case-insensitive shoda podle IGN (legacy chování).
+    """
     try:
         players = load_data("players.json", []) or []
     except Exception:
         return None
-    for p in players:
-        if not isinstance(p, dict):
-            continue  # poškozená data – přeskakujeme
-        if str(p.get("username", "")).strip().lower() == ign.strip().lower():
-            modes = p.get("modes") or {}
-            tier = modes.get(kit)
-            return str(tier).strip().upper() if tier else None
-    return None
+    player = None
+    if discord_id:
+        did = str(discord_id)
+        player = next(
+            (
+                p
+                for p in players
+                if isinstance(p, dict) and str(p.get("discordId") or "") == did
+            ),
+            None,
+        )
+    if player is None:
+        player = next(
+            (
+                p
+                for p in players
+                if isinstance(p, dict)
+                and str(p.get("username", "")).strip().lower()
+                == (ign or "").strip().lower()
+            ),
+            None,
+        )
+    if player is None:
+        return None
+    modes = player.get("modes") or {}
+    tier = modes.get(kit)
+    return str(tier).strip().upper() if tier else None
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +439,33 @@ async def close_ticket(
     )
 
 
-async def reopen_ticket(channel_id, actor_id: str) -> dict:
-    """Znovu otevře zavřený ticket (Reopen)."""
+def _cooldown_remaining_ms(
+    cooldowns: dict, owner_id: str, kit_key: str, now: int
+) -> int | None:
+    """Zbývající HT3+ cooldown hráče na kit (ms); None = žádný/vypršel."""
+    if not owner_id or not kit_key:
+        return None
+    expires = (cooldowns.get(owner_id) or {}).get(kit_key)
+    if not expires:
+        return None
+    remaining = int(expires) - now
+    return remaining if remaining > 0 else None
+
+
+async def reopen_ticket(
+    channel_id, actor_id: str, *, cooldown_ms: int = 0, now: int = None
+) -> dict:
+    """Znovu otevře zavřený ticket (Reopen).
+
+    ``cooldown_ms`` > 0 – pokud má vlastník ticketu na daný kit ještě aktivní
+    HT3+ cooldown (data/ht3_cooldowns.json), ticket se NEOTEVŘE a vrátí
+    ``{"result": "cooldown", "remaining_ms", "kit", "ticket"}``. Výchozí 0
+    zachovává původní chování bez cooldown kontroly.
+    """
     channel_id = str(channel_id)
     actor_id = str(actor_id)
+    if now is None:
+        now = _now_ms()
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -427,12 +474,34 @@ async def reopen_ticket(channel_id, actor_id: str) -> dict:
             return {"result": "not_found"}
         if ticket.get("status") != STATUS_CLOSED:
             return {"result": "not_closed", "ticket": ticket}
+
+        if cooldown_ms > 0:
+            cooldowns = tx.get(HT3_COOLDOWNS_FILE, {})
+            remaining = _cooldown_remaining_ms(
+                cooldowns,
+                str(ticket.get("ownerId", "")),
+                str(ticket.get("kit", "")),
+                now,
+            )
+            if remaining is not None:
+                return {
+                    "result": "cooldown",
+                    "remaining_ms": remaining,
+                    "kit": ticket.get("kit", ""),
+                    "ticket": ticket,
+                }
+
         ticket["status"] = STATUS_OPEN
         ticket["closedAt"] = None
         tx.set(HT_TICKETS_FILE, tickets)
         return {"result": "reopened", "ticket": ticket}
 
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    files = (
+        (HT_TICKETS_FILE, HT3_COOLDOWNS_FILE)
+        if cooldown_ms > 0
+        else (HT_TICKETS_FILE,)
+    )
+    return await store.transaction(files, _run)
 
 
 # ---------------------------------------------------------------------------

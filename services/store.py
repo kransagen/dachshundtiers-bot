@@ -22,7 +22,7 @@ funkce fungují jak v běžícím botovi (jeden loop), tak v testech.
 import asyncio
 import logging
 
-from storage import load_data, save_data
+from storage import DataCorruptionError, load_data, save_data
 
 log = logging.getLogger("dachshundtiers")
 
@@ -77,7 +77,8 @@ class Transaction:
         if name not in self._names:
             raise ValueError(f"Transakce nepokrývá soubor {name!r} (pokrývá: {self._names})")
         if name not in self._data:
-            self._data[name] = load_data(name, default)
+            # strict=True zamezí přepsání poškozeného souboru odvozenými defaulty.
+            self._data[name] = load_data(name, default, strict=True)
         return self._data[name]
 
     def set(self, name: str, data) -> None:

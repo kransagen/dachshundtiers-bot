@@ -1,6 +1,7 @@
 """Testy transakčního úložiště services/store.py (bez discord.py)."""
 
 import asyncio
+import os
 import tempfile
 import unittest
 from unittest import mock
@@ -60,6 +61,26 @@ class StoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 await store.transaction(("a.json",), fn)
             self.assertEqual(storage.load_data("a.json"), {"v": 1})
+
+        asyncio.run(main())
+
+    def test_transaction_aborts_on_corrupt_file(self):
+        async def main():
+            with open(
+                os.path.join(self._tmp, "f.json"), "w", encoding="utf-8"
+            ) as f:
+                f.write("{not json")
+
+            async def fn(tx):
+                data = tx.get("f.json", {})
+                tx.set("f.json", dict(data, written=True))
+                return "never"
+
+            # korupce se NIKDY neopraví přepsáním – transakce se přeruší
+            with self.assertRaises(storage.DataCorruptionError):
+                await store.transaction(("f.json",), fn)
+            with open(os.path.join(self._tmp, "f.json"), encoding="utf-8") as f:
+                self.assertEqual(f.read(), "{not json")
 
         asyncio.run(main())
 

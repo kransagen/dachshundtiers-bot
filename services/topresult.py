@@ -8,13 +8,15 @@ Klíčové vlastnosti:
   - záznam jde do STEJNÉ kanonické historie výsledků jako /result
     (``data/ht_results.json``, append-only) s ``resultType: "ht_fight"`` —
     žádná samostatná databáze (žádný topresults.json),
-  - **nikdy nemění tier hráče** (players.json se nedotýká): /topresult výsledek
-    jen zaznamenává a publikuje, změna tieru jde vždy přes /result a HT Fight
-    pravidla, která definují změnu tieru, zatím v projektu neexistují,
+  - **výhra povyšuje hráče** na další tier v players.json (canonické pravidlo:
+    ``next_ticket_tier`` ze žebříčku bez virtuálního LT3E), **prohra tier
+    nemění**; neznámý/nečitelný tier → žádné povýšení (nikdy se nehádá),
+  - výhra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
+    vlastníkovi a připíše událost do logu ticketu (sdílené zavírání s /result),
   - idempotence pro HT Fight ticket: klíč ``{ticketId}:ht_fight`` — druhé
     odeslání vrátí ``duplicate`` a nic nepošle dvakrát,
   - validace: HT tier ze žebříčku (bez virtuálního LT3E), skóre ``0-4``
-    (``^\d+-\d+$``), status tieru neprázdný, kit registrovaný,
+    (``^\\d+-\\d+$``), status tieru neprázdný, kit registrovaný,
   - formát zprávy přesně zachovává styl používaný na serveru:
 
         <@HRAC> - <IGN> - **<STATUS>** - <KIT>
@@ -31,17 +33,24 @@ import logging
 import re
 import time
 
+from services.player_identity import PlayerIdentityConflict
 from services.results import (
+    ANNOUNCEMENT_STATUSES,
     HT_RESULTS_FILE,
+    apply_result_to_players,
+    close_ticket_in_tx,
     make_result,
     normalize_tier,
 )
 from services.store import read as store_read, transaction
 from services.tickets import (
+    HT3_COOLDOWNS_FILE,
     HT3_TIER_LADDER,
     HT_TICKETS_FILE,
+    HT_TICKET_LOGS_FILE,
     STATUS_OPEN,
     is_ht_fight_ticket,
+    next_ticket_tier,
 )
 
 log = logging.getLogger("dachshundtiers")
@@ -155,49 +164,70 @@ def format_topresult_message(
     outcome: str,
     score: str,
     opponent_id,
+    previous_tier: str = "",
+    new_tier: str = "",
     role_id,
 ) -> str:
     """Sestaví text HT Fight výsledku (včetně role mentionu ``<@&id>``).
 
+    Řádek povýšení ``**Postup: prev → new**`` se přidá jen když hráč
+    postoupil (``new_tier`` je neprázdné a různé od ``previous_tier``).
+
     Příklad:
 
-        <@1419031701920940163> - mendu__ - **Zůstává Low Tier 3** - MolePVP
+        <@1419031701920940163> - mendu__ - **Povýšen na HT3** - MolePVP
 
         **HT3 Fighty:**
-        > prohrál 0-4 <@1018169843347882076>
+        > vyhrál 4-1 <@1018169843347882076>
+
+        **Postup: LT3 → HT3**
 
         <@&1523984977371594772>
     """
-    return "\n".join(
-        [
-            f"<@{player_id}> - {ign} - **{tier_status}** - {kit}",
+    parts = [
+        f"<@{player_id}> - {ign} - **{tier_status}** - {kit}",
+        "",
+        f"**{normalize_tier(fight_tier)} Fighty:**",
+        f"> {ht_fight_outcome_display(outcome)} {score} <@{opponent_id}>",
+    ]
+    if new_tier and normalize_tier(new_tier) != normalize_tier(previous_tier):
+        parts += [
             "",
-            f"**{normalize_tier(fight_tier)} Fighty:**",
-            f"> {ht_fight_outcome_display(outcome)} {score} <@{opponent_id}>",
-            "",
-            f"<@&{role_id}>",
+            f"**Postup: {normalize_tier(previous_tier)} → {normalize_tier(new_tier)}**",
         ]
-    )
+    parts += ["", f"<@&{role_id}>"]
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
-# Čtení aktuálního tieru hráče (jen pro kontext záznamu, nikdy se nemění)
+# Čtení aktuálního tieru hráče (kontext záznamu + základ povýšení)
 # ---------------------------------------------------------------------------
-def find_player_tier_in(players, ign: str, kit: str) -> str | None:
-    """Tier hráče (IGN+kit) v daném seznamu hráčů, nebo None."""
+def find_player_tier_in(players, ign: str, kit: str, discord_id=None) -> str | None:
+    """Tier hráče (kit) v daném seznamu; Discord ID má přednost před IGN."""
+
+    def _tier_of(player):
+        if not isinstance(player, dict):
+            return None
+        modes = player.get("modes")
+        if not isinstance(modes, dict):
+            return None
+        tier = modes.get(kit)
+        return normalize_tier(tier) if tier else None
+
     if not isinstance(players, list):
         return None
+    if discord_id:
+        did = str(discord_id)
+        for p in players:
+            if isinstance(p, dict) and str(p.get("discordId") or "") == did:
+                return _tier_of(p)
     ign_key = (ign or "").strip().lower()
     for p in players:
         if not isinstance(p, dict):
             continue
         if str(p.get("username", "")).strip().lower() != ign_key:
             continue
-        modes = p.get("modes")
-        if not isinstance(modes, dict):
-            return None
-        tier = modes.get(kit)
-        return normalize_tier(tier) if tier else None
+        return _tier_of(p)
     return None
 
 
@@ -222,13 +252,15 @@ async def record_ht_fight(
     notes: str = None,
     now: int = None,
     date: str = "",
+    ht3_cooldown_ms: int = 0,
 ) -> dict:
     """Zapíše HT Fight výsledek atomicky do ``data/ht_results.json``.
 
-    Na rozdíl od ``record_result`` (z /result) se při /topresult **nikdy**
-    nemění players.json, cooldowny ani se nezavírá ticket – jde čistě o záznam
-    + publikaci. Tier změna HT Fightu by musela projít kanonickou logikou
-    /result (v projektu zatím neexistuje, viz README).
+    Povýšení: **výhra** posune hráče na další tier v players.json
+    (``next_ticket_tier`` – žebříček bez virtuálního LT3E), **prohra** tier
+    nemění. Neznámý/nečitelný aktuální tier → žádné povýšení (nikdy se nehádá).
+    Výhra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
+    vlastníkovi (``ht3_cooldown_ms``) a připíše událost do logu ticketu.
 
     ``ticket_id`` (ID kanálu HT Fight ticketu) → výsledek se propojí
     s ticketem a idempotentně klíčuje jako ``{ticketId}:ht_fight``:
@@ -242,6 +274,7 @@ async def record_ht_fight(
     Vrací:
       - ``{"result": "created", "record": {...}, "previous_tier": ...}``
       - ``{"result": "duplicate", "existing": {...}}``
+      - ``{"result": "identity_conflict", "message"}`` (IGN patří jinému Diskordu)
       - ``{"result": "not_found"}`` / ``{"result": "not_fight_ticket", "ticket"}``
       - ``{"result": "ticket_closed", "ticket"}``
       - ``{"result": "wrong_player", "ticket"}`` / ``{"result": "wrong_kit", "ticket"}``
@@ -276,7 +309,7 @@ async def record_ht_fight(
 
     files = [HT_RESULTS_FILE, "players.json"]
     if ticket_id is not None:
-        files.append(HT_TICKETS_FILE)
+        files += [HT_TICKETS_FILE, HT3_COOLDOWNS_FILE, HT_TICKET_LOGS_FILE]
 
     async def _run(tx):
         results = tx.get(HT_RESULTS_FILE, {})
@@ -304,10 +337,26 @@ async def record_ht_fight(
         else:
             result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
 
-        # Tier hráče v čase zápasu – JEN kontext záznamu (players.json se
-        # nezmění – /topresult žádnou změnu tieru nedělá).
         players = tx.get("players.json", [])
-        previous = find_player_tier_in(players, ign, kit) or "N/A"
+        previous = (
+            find_player_tier_in(players, ign, kit, discord_id=player_id) or "N/A"
+        )
+
+        promoted = None
+        if outcome_clean == "Won":
+            current = find_player_tier_in(players, ign, kit, discord_id=player_id)
+            if current:
+                promoted = next_ticket_tier(current)
+        new_tier = promoted if promoted else ""
+
+        if outcome_clean == "Won" and promoted is not None:
+            try:
+                players, _ = apply_result_to_players(
+                    players, ign, kit, promoted, date, player_id=player_id
+                )
+            except PlayerIdentityConflict as exc:
+                return {"result": "identity_conflict", "message": str(exc)}
+            tx.set("players.json", players)
 
         record = make_result(
             result_id=result_id,
@@ -320,7 +369,7 @@ async def record_ht_fight(
             evaluator_name=evaluator_name,
             kit=kit,
             previous_tier=previous,
-            new_tier="",  # žádná změna tieru
+            new_tier=new_tier,
             display_tier="",
             score=score_clean,
             outcome=outcome_clean,
@@ -337,9 +386,56 @@ async def record_ht_fight(
         results[result_id] = record
         tx.set(HT_RESULTS_FILE, results)
 
+        # Výhra uvnitř HT Fight ticketu = vyřešený ticket → zavření + HT3+
+        # cooldown vlastníka + událost v logu (sdílené zavírání s /result).
+        if ticket_id is not None and outcome_clean == "Won":
+            close_ticket_in_tx(
+                tx,
+                tickets,
+                ticket,
+                tid,
+                now=now,
+                actor_id=evaluator_id,
+                actor_name=evaluator_name,
+                ht3_cooldown_ms=ht3_cooldown_ms,
+                log_action="ht_fight",
+                log_details=f"{previous} → {new_tier}",
+            )
+
         return {"result": "created", "record": record, "previous_tier": previous}
 
     return await transaction(tuple(files), _run)
+
+
+# ---------------------------------------------------------------------------
+# Oznámení výsledku do kanálu (pending → sent/failed + messageId)
+# ---------------------------------------------------------------------------
+async def set_ht_fight_announcement(
+    result_id: str, status: str, message_id=None
+) -> dict:
+    """Aktualizuje stav oznámení HT Fight výsledku (``sent``/``failed``).
+
+    Stav se mění NA MÍSTĚ v záznamu (operativní pole, ne historie) – historie
+    zůstává append-only. ``message_id`` = ID odeslané zprávy v kanálu.
+    Vrací ``{"result": "ok", "record"}``, ``{"result": "not_found"}`` nebo
+    ``{"result": "invalid_status"}``.
+    """
+    status = (status or "").strip()
+    if status not in ANNOUNCEMENT_STATUSES:
+        return {"result": "invalid_status"}
+
+    async def _run(tx):
+        results = tx.get(HT_RESULTS_FILE, {})
+        record = results.get(str(result_id))
+        if record is None:
+            return {"result": "not_found"}
+        record["announcement"] = status
+        if message_id is not None:
+            record["messageId"] = str(message_id)
+        tx.set(HT_RESULTS_FILE, results)
+        return {"result": "ok", "record": record}
+
+    return await transaction((HT_RESULTS_FILE,), _run)
 
 
 # ---------------------------------------------------------------------------

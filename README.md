@@ -38,9 +38,12 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
 
 - **`/playersync` – synchronizace tier rolí s players.json** – porovná Discord
   tier role (`/setkitrole`) s kanonickou `players.json` a detekuje chybějící
-  role, špatné role, víc tier rolí, neznámé hráče, chybějící hráče a neplatné
-  tiery. **Nikdy neřeší konflikty automaticky** – `/playersync preview` ukáže
-  rozdíly, `/playersync apply` vyžaduje explicitní potvrzení tlačítkem.
+  role, špatné role, víc tier rolí, neznámé hráče, chybějící hráče, neplatné
+  tiery a retired tiery v DB (R-prefix – jen report, role se neřeší).
+  Dvojice člen × kit, které přesně sedí, se počítají jako **beze změny**
+  (`analysis["unchanged"]`, zobrazeno v embedu). **Nikdy neřeší konflikty
+  automaticky** – `/playersync preview` ukáže rozdíly, `/playersync apply`
+  vyžaduje explicitní potvrzení tlačítkem.
   Každé použití se zapisuje do `data/playersync_log.json` (audit).
 
 - **`/websync` – synchronizace webu s kanonickou `players.json`** – web
@@ -56,12 +59,16 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   to žebříček**: vytvoří veřejný výsledek HT Fightu přesně ve stylu serveru do
   vyhrazeného kanálu (`TOP_RESULT_CHANNEL_ID`) a zapinguje nakonfigurovanou
   roli (`TOP_RESULT_ROLE_ID`, `<@&ID>`). Záznam jde do **stejné** kanonické
-  historie jako `/result` (`data/ht_results.json`, `resultType: "ht_fight"`)
-  a **nikdy nemění tier hráče** (players.json se nedotýká) – změna tieru po HT
-  Fightu by musela projít kanonickou logikou `/result`, která v projektu zatím
-  není definovaná. V kanálu HT Fight ticketu se hráč/IGN/kit berou z ticketu
-  (autoritativně) a druhé odeslání se zablokuje (idempotence
-  `ticketId + result_type`). Validuje skóre `0-4`.
+  historie jako `/result` (`data/ht_results.json`, `resultType: "ht_fight"`).
+  **Výhra povyšuje hráče** v `players.json` (canonické `next_ticket_tier` ze
+  žebříčku bez LT3E), **prohra tier nemění**; neznámý/retired aktuální tier se
+  nikdy nehádá. **Výhra uvnitř HT Fight ticketu** ticket zavře + nastaví HT3+
+  cooldown vlastníka a připíše událost do logu ticketu (sdílené zavírání
+  s `/result`); prohra nechává ticket otevřený. V kanálu HT Fight ticketu se
+  hráč/IGN/kit berou z ticketu (autoritativně) a druhé odeslání se zablokuje
+  (idempotence `ticketId + result_type`). Odeslání zprávy do kanálu se sleduje
+  přes stavy `pending → sent/failed` na záznamu (selhání nabídne opakování
+  tlačítkem). Validuje skóre `0-4`.
 
 - **`/datacheck` – kontrola integrity dat** – projede všechny místní databáze
   a hlásí duplicitní hráče / Discord ID / IGN, neplatné tiery, konfliktní
@@ -96,7 +103,11 @@ Pravidla z auditu (kodifikovaná v `services/role_sync.py` + `services/datacheck
   zapomenuté v `modes` („🧓 Retired tiery v modes") – jen report, žádná oprava.
 - **`discordId` = permanentní identita** – hráč s polem `discordId` se páruje
   s Discord členem podle ID (přes změnu IGN); jméno je jen fallback.
-  Duplicitní `discordId` napříč hráči detekuje datacheck
+  Záznam BEZ `discordId`, který odpovídá zadanému IGN, se **adoptuje**
+  (připojí Discord ID, historie zůstává – nikdy se neslučuje). IGN patřící
+  záznamu s JINÝM `discordId` = **konflikt**, operace se odmítá bez zápisu
+  (konflikt se nikdy nehádá ani neslučuje automaticky). Duplicitní
+  `discordId` napříč hráči detekuje datacheck
   („🆔 Duplicitní discordId hráčů").
 - **`/removeplayertiers`** odebírá jen aktuální tiery (`modes`); záznam hráče
   i historie zůstávají.
@@ -147,7 +158,7 @@ příchody/odchody).
 | `/playersync apply` *(admin)* | Ukáže stejný přehled a vyžaduje **explicitní potvrzení** (tlačítko) před aplikací změn. Stav se mezi náhledem a potvrzením ověřuje. Každé použití se zapisuje do `data/playersync_log.json`. |
 | `/websync preview` *(admin)* | Stáhne players.json z webu (GitHub) a porovná ho s kanonickou `players.json` – detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče a neplatné záznamy. **Nic neposílá.** |
 | `/websync apply` *(admin)* | Ukáže stejný přehled a po **explicitním potvrzení** (tlačítko) nahradí players.json na webu kanonickou databází. Kanonická DB se mezi náhledem a potvrzením ověřuje; čtení i zápis mají retry. Výsledek se zapisuje do `data/websync_log.json` (timestamp, počet záznamů, úspěch/selhání a chyby). |
-| `/topresult hrac ign kit fight_tier outcome score opponent tier_status` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json` (players.json se **nemění**) a pošle zprávu ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`. V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
+| `/topresult hrac ign kit fight_tier outcome score opponent tier_status` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json`. **Výhra povyšuje hráče** (`players.json`, `next_ticket_tier` bez LT3E; v ticketu navíc zavře ticket + nastaví HT3+ cooldown + událost do logu ticketu), **prohra tier nemění a ticket nechává otevřený**; neznámý/retired tier se nehádá. Zprávu pošle ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID` (stav odeslání `pending → sent/failed`, selhání nabízí opakování tlačítkem). V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
 | `/datacheck` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky, **retired tiery v modes** a **duplicitní discordId hráčů**. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, vše se auditlugguje do `data/datacheck_log.json`. |
 
 `/result`:
@@ -183,6 +194,12 @@ příchody/odchody).
 
 Výběr kitu → kontrola 7denního cooldownu → modál (IGN + cílový tier) →
 vytvoření ticket roomky → tlačítko **🔒 Close Ticket** (nastaví cooldown a za 3 s smaže roomku).
+
+**Žádný bypass cooldownu přes reopen:** zavřený ticket zároveň chrání HT3+
+cooldown – znovuotevření ticketu se kontrolou cooldownu **zablokuje**, dokud
+7denní HT3+ cooldown neskončí (chyba ukáže zbývající čas a kit; stejná
+kontrola jako u vytvoření nového ticketu). Výjimky (delegated admin zákrok)
+zůstávají na ruční úpravě vlastníka ticketu.
 
 **Automatická kontrola limitu tieru:** při odeslání modálu bot najde hráče podle IGN
 v `players.json`, vezme jeho aktuální tier pro daný kit a spočítá „další tier“
@@ -328,3 +345,10 @@ v `data/playersync_log.json` (tier role), `data/websync_log.json` (web),
 `data/datacheck_log.json` (kontrola integrity; **necommitují se**). Server-specific mapování rolí je
 v `data/kit_roles.json` (spravuje `/setkitrole`; **necommituje se** – obsahuje
 ID rolí daného serveru).
+
+**Odolnost proti poškozeným souborům:** čtení přes `storage.load_data`
+vrací default a zaloguje chybu; **transakce** (zápisy/povýšení – `/result`,
+`/topresult`, tickety, sync) čtou v **strict režimu** a poškozený/nečitelný
+JSON soubor **nikdy nepřepíšou defaultními daty** – operace se přeruší
+(`DataCorruptionError`), původní soubor zůstává nedotčený. Zápis je atomický
+(dočasný soubor + `os.replace`).

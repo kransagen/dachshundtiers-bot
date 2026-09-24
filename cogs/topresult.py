@@ -5,22 +5,28 @@
 přesně ve stylu serveru do vyhrazeného kanálu (``TOP_RESULT_CHANNEL_ID``) a
 zapinguje nakonfigurovanou roli (``TOP_RESULT_ROLE_ID``, pouze ta!):
 
-    <@1419031701920940163> - mendu__ - **Zůstává Low Tier 3** - MolePVP
+    <@1419031701920940163> - mendu__ - **Povýšen na HT3** - MolePVP
 
     **HT3 Fighty:**
-    > prohrál 0-4 <@1018169843347882076>
+    > vyhrál 4-1 <@1018169843347882076>
+
+    **Postup: LT3 → HT3**
 
     <@&1523984977371594772>
 
 Behavior:
 - záznam jde do STEJNÉ kanonické historie jako /result (``data/ht_results.json``)
   s ``resultType: "ht_fight"`` – žádná samostatná databáze,
-- **nikdy nemění tier hráče** (players.json se nedotýká; změna tieru po HT
-  Fightu by musela projít kanonickou logikou /result – ta v projektu zatím
-  není definovaná),
+- **výhra povyšuje hráče** na další tier (services/topresult.py – kanonické
+  pravidlo next_ticket_tier); výhra udělí i novou tier roli (stejná logika
+  jako /result – auto_grant_kit_role); prohra tier ani roli nemění,
+- výhra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown,
+- oznámení má stav pending → sent/failed (retry tlačítkem po selhání –
+  záznam v historii zůstává append-only, mění se jen stav oznámení),
 - příkaz NIKDY nepoužije ``RESULT_CHANNEL_LOWER`` / ``RESULT_CHANNEL_UPPER``,
-- v kanálu HT Fight ticketu se hráč/IGN/kit berou z ticketu (autoritativní),
-  idempotence = ``ticketId + result_type`` (druhé odeslání → jasná chyba),
+- v kanálu HT Fight ticketu se hráč/IGN/kit berou z ticketu (autoritativní);
+  mimo ticket jsou volitelné parametry hrac/ign/kit povinné,
+- idempotence = ``ticketId + result_type`` (druhé odeslání → jasná chyba),
 - oprávnění: stejný model jako /result (tester role).
 """
 
@@ -30,13 +36,20 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import TOP_RESULT_CHANNEL_ID, TOP_RESULT_ROLE_ID
+from config import (
+    HT3_COOLDOWN_MS,
+    TOP_RESULT_CHANNEL_ID,
+    TOP_RESULT_ROLE_ID,
+)
+from cogs.roles import auto_grant_kit_role
+from services.results import ANNOUNCEMENT_FAILED, ANNOUNCEMENT_SENT
 from services.tickets import get_ticket, is_ht_fight_ticket
 from services.topresult import (
     HT_FIGHT_TIERS,
     format_topresult_message,
     is_registered_kit,
     record_ht_fight,
+    set_ht_fight_announcement,
     validate_ht_fight_score,
     validate_ht_fight_status,
     validate_ht_fight_tier,
@@ -59,6 +72,41 @@ async def fight_tier_autocomplete(
     return out[:25]
 
 
+class HTFightRetryView(discord.ui.View):
+    """Retry odeslání HT Fight oznámení po selhání (záznam zůstal v historii)."""
+
+    def __init__(self, *, result_id, result_channel, content, allowed_mentions):
+        super().__init__(timeout=300)
+        self.result_id = result_id
+        self.result_channel = result_channel
+        self.content = content
+        self.allowed_mentions = allowed_mentions
+
+    @discord.ui.button(label="🔄 Zkusit odeslat znovu", style=discord.ButtonStyle.primary)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro testery.", ephemeral=True
+            )
+        try:
+            sent = await self.result_channel.send(
+                content=self.content, allowed_mentions=self.allowed_mentions
+            )
+        except (discord.Forbidden, discord.HTTPException) as err:
+            log.warning("Retry HT Fight oznámení selhalo: %s", err)
+            return await interaction.response.send_message(
+                "❌ Odeslání stále selhává – zkontroluj `TOP_RESULT_CHANNEL_ID`.",
+                ephemeral=True,
+            )
+        await set_ht_fight_announcement(
+            self.result_id, ANNOUNCEMENT_SENT, message_id=sent.id
+        )
+        button.disabled = True
+        await interaction.response.edit_message(
+            content="✅ Oznámení odesláno.", view=self
+        )
+
+
 class TopResult(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -79,14 +127,14 @@ class TopResult(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(name="topresult", description="HT Fight výsledek – veřejná zpráva + role ping")
     @app_commands.describe(
-        hrac="Testovaný hráč",
-        ign="Minecraft IGN hráče",
-        kit="Kit (v HT Fight ticketu se použije z ticketu)",
         fight_tier="HT Fight tier (např. HT3)",
         outcome="Výsledek hráče (vyhrál / prohrál)",
         score="Skóre ve formátu 0-4",
         opponent="Soupeř / tester",
         tier_status="Text stavu tieru (např. Zůstává Low Tier 3)",
+        hrac="Testovaný hráč (v HT Fight ticketu se bere z ticketu)",
+        ign="Minecraft IGN hráče (v HT Fight ticketu se bere z ticketu)",
+        kit="Kit (v HT Fight ticketu se bere z ticketu)",
     )
     @app_commands.choices(
         outcome=[
@@ -98,14 +146,14 @@ class TopResult(commands.Cog):
     async def topresult(
         self,
         interaction: discord.Interaction,
-        hrac: discord.User,
-        ign: str,
-        kit: str,
         fight_tier: str,
         outcome: str,
         score: str,
         opponent: discord.User,
         tier_status: str,
+        hrac: discord.User | None = None,
+        ign: str | None = None,
+        kit: str | None = None,
     ) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
@@ -143,16 +191,12 @@ class TopResult(commands.Cog):
                 ephemeral=True,
             )
 
-        # 0b) HT Fight ticket? V kanálu ticketu jsou metadata ticketu
-        #     autoritativní (hráč, IGN, kit) – uživatelské hodnoty se nepřepisují.
+        # 0b) Identita hráče: v HT Fight ticketu jsou metadata ticketu
+        #     autoritativní (hráč, IGN, kit) a volitelné parametry se ignorují;
+        #     mimo ticket musí být hrac/ign/kit zadány.
         ticket = None
         if isinstance(interaction.channel, discord.TextChannel):
             ticket = await get_ticket(interaction.channel_id)
-
-        player_id = str(hrac.id)
-        player_name = hrac.display_name or hrac.name
-        ign_clean = ign.strip()
-        kit_clean = kit.strip()
 
         if ticket is not None:
             if not is_ht_fight_ticket(ticket):
@@ -166,27 +210,40 @@ class TopResult(commands.Cog):
                 return await interaction.followup.send(
                     "❌ HT Fight ticket je zavřený.", ephemeral=True
                 )
-            if str(ticket.get("ownerId", "")) != player_id:
-                owner = ticket.get("ownerId")
+            player_id = str(ticket.get("ownerId", ""))
+            if hrac is not None and str(hrac.id) != player_id:
                 return await interaction.followup.send(
                     "❌ V HT Fight ticketu se zadává výsledek VLASTNÍKA ticketu. "
-                    f"Tento ticket patří <@{owner}> – hráč v příkazu se neshoduje.",
+                    f"Tento ticket patří <@{player_id}> – hráč v příkazu se neshoduje.",
                     ephemeral=True,
                 )
-            # Autoritativní data z ticketu.
-            ign_clean = (ticket.get("ign") or ign_clean).strip()
-            kit_clean = (ticket.get("kit") or kit_clean).strip()
+            player_name = (
+                hrac.display_name or hrac.name if hrac is not None else ""
+            ) or ticket.get("ownerName") or ""
+            ign_clean = (ticket.get("ign") or "").strip()
+            kit_clean = (ticket.get("kit") or "").strip()
         else:
-            if not ign_clean:
+            if hrac is None or not (ign or "").strip() or not (kit or "").strip():
                 return await interaction.followup.send(
-                    "❌ IGN hráče je povinné.", ephemeral=True
+                    "❌ Mimo HT Fight ticket jsou povinné hrac, IGN a kit.",
+                    ephemeral=True,
                 )
+            player_id = str(hrac.id)
+            player_name = hrac.display_name or hrac.name
+            ign_clean = (ign or "").strip()
+            kit_clean = (kit or "").strip()
             if not is_registered_kit(kit_clean, get_kits()):
                 return await interaction.followup.send(
                     f"❌ Neznámý kit `{kit_clean}` – registruj ho přes `/addkit` "
                     "(nebo první `/result`).",
                     ephemeral=True,
                 )
+
+        if not ign_clean or not kit_clean:
+            return await interaction.followup.send(
+                "❌ Ticket nemá IGN/kit hráče – doplň je přes parametry.",
+                ephemeral=True,
+            )
 
         # 0c) Validace vstupů (skóre, HT tier, status).
         ok, msg = validate_ht_fight_tier(fight_tier)
@@ -198,14 +255,13 @@ class TopResult(commands.Cog):
         ok, msg = validate_ht_fight_status(tier_status)
         if not ok:
             return await interaction.followup.send(msg, ephemeral=True)
-        if opponent.id == hrac.id:
+        if str(opponent.id) == player_id:
             return await interaction.followup.send(
                 "❌ Soupeř nemůže být stejný hráč jako testovaný.", ephemeral=True
             )
 
-        # 1) Zápis do kanonické historie (ht_results.json, resultType=ht_fight).
-        #    Idempotence u ticketu (ticketId + result_type) se hlídá atomicky
-        #    uvnitř record_ht_fight – opakované odeslání nic nepošle dvakrát.
+        # 1) Zápis do kanonické historie (ht_results.json, resultType=ht_fight):
+        #    výhra = povýšení hráče + zavření ticketu; prohra = beze změny.
         record = await record_ht_fight(
             ticket_id=ticket["id"] if ticket is not None else None,
             player_id=player_id,
@@ -222,6 +278,7 @@ class TopResult(commands.Cog):
             tier_status=tier_status,
             now=now_ms(),
             date=today_cz(),
+            ht3_cooldown_ms=HT3_COOLDOWN_MS,
         )
         r = record["result"]
         if r == "duplicate":
@@ -259,6 +316,15 @@ class TopResult(commands.Cog):
                 f"❌ Kit neodpovídá ticketu – ticket je na kit **{kit_of}**.",
                 ephemeral=True,
             )
+        if r == "identity_conflict":
+            return await interaction.followup.send(
+                record.get(
+                    "message",
+                    "❌ Zadané IGN patří jinému hráči (jinému Discord ID) – "
+                    "výsledek se nezapsal. Identitu hráče uprav ručně.",
+                ),
+                ephemeral=True,
+            )
         if r in (
             "invalid_argument",
             "invalid_tier",
@@ -274,6 +340,37 @@ class TopResult(commands.Cog):
                 "❌ Výsledek se nepodařilo uložit.", ephemeral=True
             )
 
+        rec = record["record"]
+        previous_tier = rec.get("previousTier") or ""
+        new_tier = rec.get("newTier") or ""
+        promoted = bool(new_tier) and new_tier != previous_tier
+
+        # 1a) Výhra = povýšení → udělení nové tier role (stejná centrální
+        #     synchronizační logika jako /result, NENÍ to druhý role systém).
+        grant_note = ""
+        if promoted:
+            try:
+                grant_note = await auto_grant_kit_role(
+                    interaction.guild, player_id, kit_clean, tier_up=new_tier
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("Nelze udělit tier roli po HT Fightu (%s)", kit_clean)
+                grant_note = "⚠️ Tier roli se nepodařilo udělit – oprav ji manuálně."
+
+        # 1b) Výhra v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
+        if ticket is not None:
+            try:
+                fresh_ticket = await get_ticket(ticket["id"])
+                if fresh_ticket and fresh_ticket.get("panelMessageId"):
+                    from views import ticket_embed
+
+                    tch = self.bot.get_channel(int(ticket["id"]))
+                    if tch is not None:
+                        tmsg = await tch.fetch_message(int(fresh_ticket["panelMessageId"]))
+                        await tmsg.edit(embed=ticket_embed(fresh_ticket))
+            except Exception:  # noqa: BLE001
+                log.exception("Nelze obnovit embed ticketu po /topresult")
+
         # 2) Sestavení zprávy ve stylu serveru + odeslání do TOP_RESULT kanálu.
         #    Role ping jde POUZE na nakonfigurovanou TOP_RESULT_ROLE_ID
         #    (allowed_mentions.roles) – žádná uživatelská role se nepřijímá.
@@ -286,27 +383,49 @@ class TopResult(commands.Cog):
             outcome=outcome,
             score=score.strip(),
             opponent_id=str(opponent.id),
+            previous_tier=previous_tier,
+            new_tier=new_tier,
             role_id=TOP_RESULT_ROLE_ID,
         )
         allowed = discord.AllowedMentions(everyone=False, users=True, roles=[target_role])
+        announce_result_id = rec.get("id")
         try:
-            await result_channel.send(content=message, allowed_mentions=allowed)
+            sent = await result_channel.send(content=message, allowed_mentions=allowed)
         except (discord.Forbidden, discord.HTTPException) as err:
             log.warning(
                 "Nelze poslat HT Fight výsledek do %s: %s", TOP_RESULT_CHANNEL_ID, err
             )
+            try:
+                await set_ht_fight_announcement(announce_result_id, ANNOUNCEMENT_FAILED)
+            except Exception:  # noqa: BLE001
+                log.exception("Nelze označit oznámení jako failed")
+            view = HTFightRetryView(
+                result_id=announce_result_id,
+                result_channel=result_channel,
+                content=message,
+                allowed_mentions=allowed,
+            )
             return await interaction.followup.send(
                 f"❌ HT Fight výsledek se nepodařilo odeslat do <#{TOP_RESULT_CHANNEL_ID}> "
-                "(záznam ale zůstal v historii `ht_results.json`).",
+                "(záznam zůstal v historii `ht_results.json`, oznámení je ve stavu "
+                "**failed**) – můžeš to zkusit znovu tlačítkem.",
                 ephemeral=True,
+                view=view,
             )
+        await set_ht_fight_announcement(
+            announce_result_id, ANNOUNCEMENT_SENT, message_id=sent.id
+        )
 
-        await interaction.followup.send(
+        reply = (
             f"✅ Výsledek HT Fightu (`{ign_clean}` · {kit_clean} · "
             f"**{fight_tier.strip().upper()} Fighty:** {score.strip()}) byl "
-            f"zaznamenán a odeslán do <#{TOP_RESULT_CHANNEL_ID}>.",
-            ephemeral=True,
+            f"zaznamenán a odeslán do <#{TOP_RESULT_CHANNEL_ID}>."
         )
+        if promoted:
+            reply += f"\n**Povýšení: {previous_tier} → {new_tier}**"
+            if grant_note:
+                reply += f"\n{grant_note}"
+        await interaction.followup.send(reply, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

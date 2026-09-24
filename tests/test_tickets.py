@@ -378,6 +378,46 @@ class TicketServiceTests(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_reopen_blocked_by_active_cooldown(self):
+        async def main():
+            await self._open_ticket()
+            await tickets.close_ticket("1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW)
+            result = await tickets.reopen_ticket(
+                "1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW + 1000
+            )
+            self.assertEqual(result["result"], "cooldown")
+            self.assertEqual(result["kit"], "AnchorPvP")
+            self.assertEqual(result["remaining_ms"], COOLDOWN_MS - 1000)
+            # ticket zůstává zavřený
+            t = storage.load_data(tickets.HT_TICKETS_FILE, {})["1001"]
+            self.assertEqual(t["status"], "closed")
+            self.assertEqual(t["closedAt"], NOW)
+
+        asyncio.run(main())
+
+    def test_reopen_allowed_after_cooldown_expires(self):
+        async def main():
+            await self._open_ticket()
+            await tickets.close_ticket("1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW)
+            result = await tickets.reopen_ticket(
+                "1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW + COOLDOWN_MS + 1
+            )
+            self.assertEqual(result["result"], "reopened")
+            t = storage.load_data(tickets.HT_TICKETS_FILE, {})["1001"]
+            self.assertEqual(t["status"], "open")
+
+        asyncio.run(main())
+
+    def test_reopen_without_cooldown_preserves_legacy_behavior(self):
+        # default cooldown_ms=0 = původní chování, žádná cooldown kontrola
+        async def main():
+            await self._open_ticket()
+            await tickets.close_ticket("1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW)
+            result = await tickets.reopen_ticket("1001", "9")
+            self.assertEqual(result["result"], "reopened")
+
+        asyncio.run(main())
+
     def test_ticket_not_found_operations(self):
         async def main():
             self.assertEqual((await tickets.claim_ticket("9999", "9", "t"))["result"], "not_found")
@@ -466,15 +506,11 @@ class TicketServiceTests(unittest.TestCase):
         storage.save_data(
             "players.json",
             [
-                {
-                    "username": "AliceMC",
-                    "modes": {"AnchorPvP": "LT3", "MolePVP": "RT1"},
-                },
-                {"username": "bobmc", "modes": {"AnchorPvP": "HT2"}},
+                {"username": "aliceMC", "modes": {"AnchorPvP": "LT3", "MolePVP": "RT1"}},
+                {"username": "BOBMC", "modes": {"AnchorPvP": "HT2"}},
             ],
         )
         self.assertEqual(tickets.find_player_tier("aliceMC", "AnchorPvP"), "LT3")
-        # case-insensitive IGN
         self.assertEqual(tickets.find_player_tier("BOBMC", "AnchorPvP"), "HT2")
         # hráč bez záznamu
         self.assertIsNone(tickets.find_player_tier("nobody", "AnchorPvP"))
@@ -483,6 +519,28 @@ class TicketServiceTests(unittest.TestCase):
         # poškozená data nespadnou
         storage.save_data("players.json", "not-a-list")
         self.assertIsNone(tickets.find_player_tier("aliceMC", "AnchorPvP"))
+
+    def test_find_player_tier_prefers_discord_id(self):
+        storage.save_data(
+            "players.json",
+            [
+                {"username": "AliceMC", "discordId": "111", "modes": {"AnchorPvP": "LT3"}},
+                {"username": "BOBMC", "discordId": "222", "modes": {"AnchorPvP": "HT2"}},
+                {"username": "unowned", "modes": {"AnchorPvP": "LT2"}},
+            ],
+        )
+        # Discord ID má přednost: IGN "AliceMC" s cizím ID = tier VLASTNÍKA ID
+        self.assertEqual(
+            tickets.find_player_tier("AliceMC", "AnchorPvP", discord_id="222"), "HT2"
+        )
+        # neexistující IGN + existující Discord ID stále funguje
+        self.assertEqual(
+            tickets.find_player_tier("X", "AnchorPvP", discord_id="222"), "HT2"
+        )
+        self.assertIsNone(tickets.find_player_tier("X", "AnchorPvP", discord_id="999"))
+        # bez Discord ID → klasická case-insensitive IGN shoda (legacy)
+        self.assertEqual(tickets.find_player_tier("AliceMC", "AnchorPvP"), "LT3")
+        self.assertEqual(tickets.find_player_tier("unowned", "AnchorPvP"), "LT2")
 
 
 if __name__ == "__main__":

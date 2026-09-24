@@ -514,8 +514,11 @@ class HT3Modal(SafeModal):
             )
 
         # Kontrola limitu: ticket nesmí být na lepší tier, než hráč může.
-        # Hráč je hledaný podle IGN v players.json (stejná data, co posílá /result).
-        current_tier = find_player_tier(ign, kit)
+        # Hráč je hledaný primárně podle Discord ID (až fallback IGN)
+        # v players.json (stejná data, co posílá /result).
+        current_tier = find_player_tier(
+            ign, kit, discord_id=str(interaction.user.id)
+        )
         eval_ok = has_eval(ign, kit)
 
         # Brána: HT3+ ticket otevřou jen hráči s „LT3+eval" (nebo HT3 a výš).
@@ -814,10 +817,32 @@ class HTTicketView(SafeView):
         ticket = await self._active_ticket(interaction)
         if ticket is None:
             return
-        result = await reopen_ticket(interaction.channel_id, str(interaction.user.id))
+        result = await reopen_ticket(
+            interaction.channel_id,
+            str(interaction.user.id),
+            cooldown_ms=HT3_COOLDOWN_MS,
+        )
         if result["result"] == "not_closed":
             return await interaction.response.send_message(
                 "❌ Ticket už je otevřený.", ephemeral=True
+            )
+        if result["result"] == "cooldown":
+            remaining = int(result.get("remaining_ms") or 0)
+            days, rem = divmod(remaining, 86_400_000)
+            hours, rem = divmod(rem, 3_600_000)
+            mins = rem // 60_000
+            bits = []
+            if days:
+                bits.append(f"{days} d")
+            if hours:
+                bits.append(f"{hours} h")
+            if mins:
+                bits.append(f"{mins} min")
+            duration = " ".join(bits) or "méně než minutu"
+            return await interaction.response.send_message(
+                "❌ **HT3+ cooldown ještě neskončil** – ticket lze znovu "
+                f"otevřít za **{duration}** (kit `{result.get('kit') or '?'}`).",
+                ephemeral=True,
             )
         if result["result"] != "reopened":
             return await interaction.response.send_message(

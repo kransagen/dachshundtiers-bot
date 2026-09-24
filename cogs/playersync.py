@@ -79,7 +79,8 @@ def _playersync_embed(analysis: dict, *, mode: str) -> discord.Embed:
         embed = discord.Embed(
             title=f"🔎 /playersync – {'potvrzení změn' if mode == 'apply' else 'náhled'}",
             description=(
-                f"Zkontrolováno párů (člen × kit): **{analysis['checked']}**\n\n"
+                f"Zkontrolováno párů (člen × kit): **{analysis['checked']}** "
+                f"(beze změny: **{analysis.get('unchanged', 0)}**)\n\n"
                 + _summary_text(analysis["summary"])
             ),
             color=0xF59E0B,

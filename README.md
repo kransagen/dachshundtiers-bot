@@ -383,6 +383,9 @@ DATABASE_URL='postgresql://user:heslo@host:5432/dachshundtiers' \
   python migrate_json_to_postgres.py
 ```
 
+Skript načítá i `.env`, takže místo `DATABASE_URL` můžeš použít samostatné
+`DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER` a `DB_PASSWORD`.
+
 Po úspěšné migraci nastav stejnou proměnnou v hostingu a restartuj bota.
 Při prvním připojení bot sám vytvoří tabulku `dachshundtiers_data`; admin pak
 může příkazem `/dbstatus` ověřit dostupnost PostgreSQL a počet datových

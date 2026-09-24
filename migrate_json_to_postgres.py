@@ -12,7 +12,14 @@ import json
 import sys
 from pathlib import Path
 
-import storage
+# Skript se spouští samostatně (bez bot.py/config.py), proto musí .env načíst
+# sám. Jinak by viděl jen systémové env proměnné a chybně hlásil, že
+# DATABASE_URL / DB_HOST nejsou nastavené.
+from dotenv import load_dotenv
+
+load_dotenv()
+
+import storage  # noqa: E402 – musí být až po load_dotenv()
 
 
 def main() -> int:

@@ -94,6 +94,14 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(status["ok"])
         self.assertIsNone(status["records"])
 
+    def test_explicit_ipv4_hostaddr_has_precedence(self):
+        with mock.patch.dict(
+            storage.os.environ,
+            {"DB_HOSTADDR": "203.0.113.10", "DB_HOST": "db.example.test"},
+            clear=True,
+        ):
+            self.assertEqual(storage._ipv4_hostaddr(), "203.0.113.10")
+
 
 if __name__ == "__main__":
     unittest.main()

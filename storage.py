@@ -3,8 +3,9 @@
 import json
 import logging
 import os
+import socket
 from contextlib import contextmanager
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 log = logging.getLogger("dachshundtiers")
 
@@ -106,6 +107,46 @@ def _psycopg():
     return psycopg
 
 
+def _postgres_host() -> str:
+    """Host z DB_HOST nebo DATABASE_URL; nikdy se nevypisuje do Discordu."""
+    configured = os.getenv("DB_HOST", "").strip()
+    if configured:
+        return configured
+    try:
+        return urlparse(DATABASE_URL).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _ipv4_hostaddr() -> str:
+    """Najde IPv4 pro DB host, když Docker/hosting nemá IPv6 konektivitu."""
+    explicit = os.getenv("DB_HOSTADDR", "").strip()
+    if explicit:
+        return explicit
+    host = _postgres_host()
+    if not host:
+        return ""
+    try:
+        addresses = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return ""
+    return addresses[0][4][0] if addresses else ""
+
+
+def _connect_postgres(psycopg, *, autocommit: bool):
+    """Připojí PostgreSQL a při nedostupném IPv6 jednou zkusí IPv4."""
+    try:
+        return psycopg.connect(DATABASE_URL, autocommit=autocommit)
+    except psycopg.OperationalError:
+        hostaddr = _ipv4_hostaddr()
+        if not hostaddr:
+            raise
+        log.warning("PostgreSQL přes výchozí adresu selhala; zkouším IPv4 fallback.")
+        return psycopg.connect(
+            DATABASE_URL, autocommit=autocommit, hostaddr=hostaddr
+        )
+
+
 def _ensure_postgres_schema() -> None:
     """Vytvoří malé JSONB úložiště jednou za proces.
 
@@ -119,7 +160,7 @@ def _ensure_postgres_schema() -> None:
     # Schéma vzniká ve své vlastní potvrzené transakci. Kdyby se vytvořilo
     # uvnitř následné business transakce a ta rollbackovala, process-level
     # příznak by omylem tvrdil, že tabulka dál existuje.
-    with psycopg.connect(DATABASE_URL, autocommit=True) as schema_conn:
+    with _connect_postgres(psycopg, autocommit=True) as schema_conn:
         with schema_conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -145,7 +186,7 @@ def postgres_connection(*, autocommit: bool = True):
     psycopg = _psycopg()
     try:
         _ensure_postgres_schema()
-        with psycopg.connect(DATABASE_URL, autocommit=autocommit) as conn:
+        with _connect_postgres(psycopg, autocommit=autocommit) as conn:
             yield conn
     except Exception as err:
         raise RuntimeError(f"PostgreSQL úložiště není dostupné: {err}") from err

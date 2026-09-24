@@ -362,6 +362,7 @@ v `.env` (viz `.env.example`):
 | `GITHUB_*` | Volitelná synchronizace `players.json` na GitHub. |
 | `DATABASE_URL` | Volitelný PostgreSQL backend, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Má přednost před jednotlivými `DB_*` hodnotami. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL`: vyplň všech pět hodnot a bot si připojovací URL sestaví automaticky. |
+| `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB. Hodí se, když Docker hosting nemá IPv6 trasu; bot jinak IPv4 zkusí automaticky po selhání výchozího spojení. |
 
 > Kanál panelu fronty pro kit se dá nastavit i za běhu přes `/addqchannel`
 > (ukládá se do `data/queue_channels.json` a má přednost před env i defaulty).

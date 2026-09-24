@@ -25,8 +25,14 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import discord
 import storage
-from cogs.edituser import ConfirmEditView, EditUser, PlayerEditorView
+from cogs.edituser import (
+    ConfirmEditView,
+    EditUser,
+    PlayerEditorView,
+    TierKitSelectView,
+)
 from services import edituser as eu
 from services import permissions
 from services.player_identity import CLAIM_UNCHANGED, PlayerIdentityConflict
@@ -948,6 +954,220 @@ class StaleCheckTests(unittest.TestCase):
         _write("players.json", players)
         msg = self._check({"field": "tier", "kit": "randompot", "old_value": "HT2"})
         self.assertIsNone(msg)
+
+
+class ConfirmViewMechanicsTests(unittest.TestCase):
+    """View mechanika /edituser: tlačítka → modály/selecty → potvrzení.
+
+    Klíčový regresní test: ``on_confirm`` volá ``execute_player_edit`` – dřív
+    chyběl import (NameError → crash tlačítka „Potvrdit a aplikovat"
+    v produkci). Teď se potvrzení aplikuje a zpráva se přepíše reportem.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+        _write("players.json", _players())
+
+    def _inter(self):
+        inter = _interaction(user=_admin_member())
+        inter.user.id = 999
+        inter.message = mock.MagicMock()
+        inter.message.edit = mock.AsyncMock()
+        return inter
+
+    def _payload(self, **overrides):
+        payload = {
+            "player_id": PLAYER_ID,
+            "title": "Změna Discord ID",
+            "lines": ["`old` → `new`"],
+            "edit": {"field": "discord_id", "from": PLAYER_ID, "to": NEW_ID},
+            "stale": None,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_confirm_calls_execute_player_edit_and_finishes(self):
+        """Regrese itemu 1: potvrzení aplikuje změnu a nepřepíše stav."""
+        cog = EditUser.__new__(EditUser)
+        view = ConfirmEditView(cog=cog, payload=self._payload())
+        inter = self._inter()
+
+        report = {
+            "status": eu.STATUS_SUCCESS,
+            "message": "Změny aplikované.",
+            "db": {"status": "ok", "message": "Uloženo"},
+            "roles": {"actions": []},
+            "web": {"status": "ok", "pushed": False},
+            "errors": [],
+        }
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True), \
+                 mock.patch(
+                     "cogs.edituser.execute_player_edit",
+                     new=mock.AsyncMock(return_value=report),
+                 ) as exe:
+                await ConfirmEditView.on_confirm(view, inter, None)
+            return exe
+
+        exe = asyncio.run(main())
+        exe.assert_awaited_once()
+        call_kwargs = exe.await_args.kwargs
+        self.assertEqual(call_kwargs["player_id"], PLAYER_ID)
+        self.assertEqual(call_kwargs["edit"], self._payload()["edit"])
+        self.assertTrue(view.finished)
+        # report se přepíše místo konfirmace + duplikát jako ephemeral message
+        inter.message.edit.assert_awaited_once()
+        inter.followup.send.assert_awaited_once()
+        embed = inter.followup.send.await_args.kwargs["embed"]
+        self.assertIn(eu.STATUS_SUCCESS, embed.title)
+
+    def test_confirm_after_finished_short_circuits(self):
+        cog = EditUser.__new__(EditUser)
+        view = ConfirmEditView(cog=cog, payload=self._payload())
+        view.finished = True
+        inter = self._inter()
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True), \
+                 mock.patch(
+                     "cogs.edituser.execute_player_edit",
+                     new=mock.AsyncMock(return_value={}),
+                 ) as exe:
+                await ConfirmEditView.on_confirm(view, inter, None)
+            return exe
+
+        exe = asyncio.run(main())
+        exe.assert_not_awaited()  # nic se neaplikuje podruhé
+        inter.response.send_message.assert_awaited_once_with(
+            "✅ Změny už byly aplikované.", ephemeral=True
+        )
+
+    def test_confirm_with_stale_aborts_safely(self):
+        """Mezi náhledem a potvrzením se stav změnil → NIC se neaplikuje."""
+        cog = EditUser.__new__(EditUser)
+        view = ConfirmEditView(
+            cog=cog,
+            payload=self._payload(stale={"field": "discord_id", "old_value": "NOPE"}),
+        )
+        inter = self._inter()
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True), \
+                 mock.patch(
+                     "cogs.edituser.execute_player_edit",
+                     new=mock.AsyncMock(return_value={}),
+                 ) as exe:
+                await ConfirmEditView.on_confirm(view, inter, None)
+            return exe
+
+        exe = asyncio.run(main())
+        exe.assert_not_awaited()
+        self.assertTrue(view.finished)
+        inter.followup.send.assert_awaited_once()
+
+    def test_cancel_back_to_main_returns_to_menu(self):
+        cog = EditUser.__new__(EditUser)
+        view = ConfirmEditView(
+            cog=cog, payload=self._payload(back_to_main=True)
+        )
+        inter = self._inter()
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True):
+                await ConfirmEditView.on_cancel(view, inter, None)
+
+        asyncio.run(main())
+        self.assertTrue(view.finished)
+        # vrátilo se do hlavního menu (překreslení) – ne zavření
+        inter.message.edit.assert_awaited_once()
+        _, kwargs = inter.message.edit.await_args
+        self.assertIsInstance(kwargs["view"], PlayerEditorView)
+
+
+class EditViewMechanicsTests(unittest.TestCase):
+    """Hlavní menu /edituser: admin gate + překreslení podviewů (swap)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+        _write("players.json", _players())
+
+    def _inter(self):
+        inter = _interaction(user=_admin_member())
+        inter.message = mock.MagicMock()
+        inter.message.edit = mock.AsyncMock()
+        return inter
+
+    def test_close_button_removes_view(self):
+        cog = EditUser.__new__(EditUser)
+        view = PlayerEditorView(cog=cog, player_id=PLAYER_ID)
+        inter = self._inter()
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True):
+                await PlayerEditorView.on_close(view, inter, None)
+
+        asyncio.run(main())
+        inter.message.edit.assert_awaited_once()
+        self.assertEqual(inter.message.edit.await_args.kwargs["view"], None)
+        inter.response.send_message.assert_awaited_once()
+
+    def test_tiers_button_swaps_to_kit_select(self):
+        cog = EditUser.__new__(EditUser)
+        view = PlayerEditorView(cog=cog, player_id=PLAYER_ID)
+        inter = self._inter()
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True):
+                await PlayerEditorView.on_tiers(view, inter, None)
+
+        asyncio.run(main())
+        inter.message.edit.assert_awaited_once()
+        self.assertIsInstance(
+            inter.message.edit.await_args.kwargs["view"], TierKitSelectView
+        )
+
+    def test_history_button_swaps_to_history(self):
+        from cogs.edituser import HistoryView
+
+        cog = EditUser.__new__(EditUser)
+        view = PlayerEditorView(cog=cog, player_id=PLAYER_ID)
+        inter = self._inter()
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True):
+                await PlayerEditorView.on_history(view, inter, None)
+
+        asyncio.run(main())
+        inter.message.edit.assert_awaited_once()
+        self.assertIsInstance(
+            inter.message.edit.await_args.kwargs["view"], HistoryView
+        )
+
+    def test_swap_followup_when_edit_fails(self):
+        """Selhání překreslení (HTTPException) → fallback přes followup."""
+        cog = EditUser.__new__(EditUser)
+        view = PlayerEditorView(cog=cog, player_id=PLAYER_ID)
+        inter = self._inter()
+        inter.message.edit = mock.AsyncMock(
+            side_effect=discord.HTTPException(mock.MagicMock(), "boom")
+        )
+
+        async def main():
+            with mock.patch("cogs.edituser.has_admin_role", return_value=True):
+                await PlayerEditorView.on_tiers(view, inter, None)
+
+        asyncio.run(main())
+        inter.followup.send.assert_awaited_once()
+        self.assertIsInstance(
+            inter.followup.send.await_args.kwargs["view"], TierKitSelectView
+        )
 
 
 if __name__ == "__main__":

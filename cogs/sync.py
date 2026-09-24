@@ -244,6 +244,33 @@ def _append_note(embed: discord.Embed, note: str) -> None:
     embed.set_footer(text=(note + "\n" + current).strip())
 
 
+def _field_value(lines: list, limit: int = 1024) -> str:
+    """Hodnota pole embedu z řádků – NIKDY nepřesáhne Discord limit (1024).
+
+    Dlouhé nálezy se neposílají celé: poslední odeslaný řádek se zkrátí a
+    doplní se poznámka o zkrácení. Embed tak nemůže spadnout na API 400
+    („field value must be 1024 or fewer in length").
+    """
+    rendered = [str(x) for x in lines]
+    joined = "\n".join(rendered)
+    if not joined:
+        return "_žádné_"
+    if len(joined) <= limit:
+        return joined
+    suffix = f"… (zkráceno; {len(rendered)} záznamů – viz audit log)"
+    room = limit - len(suffix) - 1
+    if room <= 0:
+        return suffix[:limit]
+    out = ""
+    for line in rendered:
+        if room <= 0:
+            break
+        piece = line[:room] if len(line) <= room else line[: room - 1] + "…"
+        out += piece + "\n"
+        room -= len(piece) + 1
+    return out.rstrip("\n") + "\n" + suffix
+
+
 def _playersync_embed(analysis: dict, *, mode: str, note: str = "") -> discord.Embed:
     """Embed s přehledem rozdílů (preview / apply)."""
     if not analysis["findings"]:
@@ -269,7 +296,7 @@ def _playersync_embed(analysis: dict, *, mode: str, note: str = "") -> discord.E
         shown = lines[:15]
         if len(lines) > 15:
             shown.append(f"…a dalších {len(lines) - 15} nálezů")
-        embed.add_field(name="Zjištěné rozdíly", value="\n".join(shown), inline=False)
+        embed.add_field(name="Zjištěné rozdíly", value=_field_value(shown), inline=False)
 
     if mode == "apply":
         if analysis["has_actions"]:
@@ -321,7 +348,7 @@ def _websync_embed(result: dict, *, mode: str, note: str = "") -> discord.Embed:
         shown = lines[:15]
         if len(lines) > 15:
             shown.append(f"…a dalších {len(lines) - 15} nálezů")
-        embed.add_field(name="Rozdíly oproti webu", value="\n".join(shown), inline=False)
+        embed.add_field(name="Rozdíly oproti webu", value=_field_value(shown), inline=False)
 
         if analysis.get("website_only"):
             extra = [u for u in analysis["website_only"][:15]]
@@ -426,7 +453,7 @@ def _repair_result_embed(result: dict) -> discord.Embed:
     if result["errors"]:
         embed.add_field(
             name="Chyby",
-            value="\n".join(str(e) for e in result["errors"][:15]),
+            value=_field_value(str(e) for e in result["errors"][:15]),
             inline=False,
         )
     embed.set_footer(text=f"Zapsáno do data/{DATACHECK_LOG_FILE} (audit).")
@@ -493,7 +520,7 @@ def _checkweb_embed(analysis: dict, *, mode: str, note: str = "") -> discord.Emb
         shown = lines[:12]
         if len(lines) > 12:
             shown.append(f"…a dalších {len(lines) - 12} nálezů")
-        embed.add_field(name="Nálezy", value="\n".join(shown), inline=False)
+        embed.add_field(name="Nálezy", value=_field_value(shown), inline=False)
         if summary.get("MATCH"):
             embed.add_field(
                 name="✅ Shoda",
@@ -584,7 +611,7 @@ def _check_embed(
             lines.append(f"…a dalších {len(group) - 10} nálezů")
         embed.add_field(
             name=f"{SEVERITY_LABELS[sev]} ({len(group)})",
-            value="\n".join(lines),
+            value=_field_value(lines),
             inline=False,
         )
     if repairable_count:

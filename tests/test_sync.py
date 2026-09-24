@@ -48,6 +48,8 @@ from cogs.sync import (
     SyncDataRepairView,
     SyncDiscordConfirmView,
     SyncWebConfirmView,
+    _check_embed,
+    _field_value,
 )
 
 
@@ -978,6 +980,67 @@ class DeprecatedAliasTests(unittest.TestCase):
         inter.response.send_message.assert_awaited_once_with(
             "❌ Pouze pro administrátory.", ephemeral=True
         )
+
+
+class CheckEmbedLimitTests(unittest.TestCase):
+    """item 3: embed pole má limit 1024 znaků – pole se nikdy neplní delší.
+
+    Před fixem šel ``"\\n".join(lines)`` přímo do ``add_field(value=…)`` –
+    s dlouhými nálezy (např. seznam hráčů nebo chyb) spadla odpověď na
+    Discord API 400 („field value must be 1024 or fewer in length").
+    """
+
+    def test_field_value_short_list_passthrough(self):
+        self.assertEqual(_field_value(["a", "b"]), "a\nb")
+        self.assertEqual(_field_value([]), "_žádné_")
+
+    def test_field_value_truncates_long_lines(self):
+        out = _field_value(["X" * 600, "Y" * 600])  # 1201 znaků → nad limit
+        self.assertLessEqual(len(out), 1024)
+        self.assertIn("zkráceno", out)
+
+    def test_field_value_many_lines_never_exceed_limit(self):
+        out = _field_value([f"řádek {i}: " + "d" * 200 for i in range(40)])
+        self.assertLessEqual(len(out), 1024)
+        self.assertIn("zkráceno", out)
+
+    def test_field_value_single_line_longer_than_limit(self):
+        out = _field_value(["Z" * 5000])
+        self.assertLessEqual(len(out), 1024)
+
+    def test_check_embed_fields_never_exceed_1024(self):
+        items = [
+            {"severity": "warning", "kind": "k", "message": f"nález {i} " + "x" * 300}
+            for i in range(40)
+        ]
+        embed = _check_embed(
+            items,
+            counts={"error": 0, "conflict": 0, "warning": len(items)},
+            website_source="GitHub",
+            area="all",
+            corrupt=[],
+            repairable_count=0,
+        )
+        for field in embed.fields:
+            self.assertLessEqual(len(field.value), 1024)
+        # poslední severity pole nese poznámku o zkrácení
+        self.assertIn("zkráceno", embed.fields[-1].value)
+
+    def test_check_embed_many_long_errors_also_truncated(self):
+        items = [
+            {"severity": "error", "kind": "k", "message": "chyba " + "e" * 250}
+            for _ in range(30)
+        ]
+        embed = _check_embed(
+            items,
+            counts={"error": 30, "conflict": 0, "warning": 0},
+            website_source="GitHub",
+            area="all",
+            corrupt=[],
+            repairable_count=3,
+        )
+        for field in embed.fields:
+            self.assertLessEqual(len(field.value), 1024)
 
 
 if __name__ == "__main__":

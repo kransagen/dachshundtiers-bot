@@ -87,6 +87,13 @@ class StorageTests(unittest.TestCase):
                 storage._database_url_from_environment(), "postgresql://explicit/database"
             )
 
+    def test_database_status_reports_json_mode_without_db_connection(self):
+        with mock.patch.object(storage, "DATABASE_URL", ""):
+            status = storage.database_status()
+        self.assertEqual(status["backend"], "json")
+        self.assertTrue(status["ok"])
+        self.assertIsNone(status["records"])
+
 
 if __name__ == "__main__":
     unittest.main()

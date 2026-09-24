@@ -383,6 +383,9 @@ DATABASE_URL='postgresql://user:heslo@host:5432/dachshundtiers' \
 ```
 
 Po úspěšné migraci nastav stejnou proměnnou v hostingu a restartuj bota.
+Při prvním připojení bot sám vytvoří tabulku `dachshundtiers_data`; admin pak
+může příkazem `/dbstatus` ověřit dostupnost PostgreSQL a počet datových
+záznamů. Příkaz nikdy nevypisuje host, uživatele ani heslo.
 
 Datové klíče odpovídají dosavadním souborům:
 `queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`

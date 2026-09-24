@@ -61,6 +61,39 @@ def backend_name() -> str:
     return "postgresql" if using_postgres() else "json"
 
 
+def database_status() -> dict:
+    """Read-only kontrola aktivního úložiště bez vyzrazení přihlašovacích údajů.
+
+    Při PostgreSQL zároveň ověří, že tabulku dokáže vytvořit/číst. Je tedy
+    vhodná pro admin diagnostiku po nastavení DB_HOST/DB_PASSWORD.
+    """
+    if not using_postgres():
+        return {
+            "backend": "json",
+            "ok": True,
+            "records": None,
+            "message": "Používá se lokální JSON úložiště (DATABASE_URL/DB_* nejsou nastavené).",
+        }
+    try:
+        with postgres_connection() as conn, conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {_POSTGRES_TABLE}")
+            records = int(cur.fetchone()[0])
+        return {
+            "backend": "postgresql",
+            "ok": True,
+            "records": records,
+            "message": "PostgreSQL je dostupná a tabulka je připravená.",
+        }
+    except Exception:  # noqa: BLE001 – do Discordu neposíláme detail spojení
+        log.exception("Kontrola PostgreSQL spojení selhala.")
+        return {
+            "backend": "postgresql",
+            "ok": False,
+            "records": None,
+            "message": "PostgreSQL není dostupná; podrobnosti jsou v logu bota.",
+        }
+
+
 def _psycopg():
     """Načte nepovinný driver až při skutečném použití PostgreSQL."""
     try:

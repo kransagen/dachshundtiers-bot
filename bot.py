@@ -15,7 +15,7 @@ import discord
 from discord.ext import commands
 
 from config import DISCORD_TOKEN, GUILD_ID
-from storage import ensure_data_dir, load_data
+from storage import backend_name, ensure_data_dir, load_data
 from views import HT3PanelView, HTTicketView, QueueView, TournamentSignupView
 
 logging.basicConfig(
@@ -315,6 +315,7 @@ class DachshundTiersBot(commands.Bot):
 
 async def main() -> None:
     ensure_data_dir()
+    log.info("Úložiště dat: %s", backend_name())
     bot = DachshundTiersBot()
     await bot.start(DISCORD_TOKEN)
 

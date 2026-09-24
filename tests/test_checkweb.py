@@ -364,6 +364,49 @@ class ApplyCheckWebTests(unittest.TestCase):
         self.assertFalse(applied[0]["ok"])
 
 
+class DiscordImportDecisionTests(unittest.TestCase):
+    def test_imports_only_single_tier_database_mismatches(self):
+        records = [
+            {
+                "status": "DATABASE_MISMATCH",
+                "player": "AliceMC",
+                "kit_key": "anchorpvp",
+                "discord": ["HT3"],
+            },
+            {
+                "status": "MULTIPLE_TIER_ROLES",
+                "player": "Bob",
+                "kit_key": "sword",
+                "discord": ["HT3", "HT4"],
+            },
+            {
+                "status": "UNKNOWN_PLAYER",
+                "player": "DiscordName",
+                "kit_key": "sword",
+                "discord": ["HT3"],
+            },
+            {
+                "status": "MATCH",
+                "player": "Carol",
+                "kit_key": "sword",
+                "discord": ["HT3"],
+            },
+        ]
+        decisions, skipped = checkweb.build_discord_import_decisions(records)
+        self.assertEqual(
+            decisions,
+            [
+                {
+                    "player": "AliceMC",
+                    "kit_key": "anchorpvp",
+                    "decision": "use_discord",
+                    "tier": "HT3",
+                }
+            ],
+        )
+        self.assertEqual([r["player"] for r in skipped], ["Bob", "DiscordName"])
+
+
 class CheckWebAuditLogTests(unittest.TestCase):
     """Auditní log data/checkweb_log.json (append-only, restart-safe)."""
 

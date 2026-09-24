@@ -41,7 +41,12 @@ def get_tester_roles(roles) -> list:
             for r in roles
             if isinstance(getattr(r, "id", None), int) and r.id in allowed
         ]
-    fragment = TESTER_ROLE_FRAGMENT
+    # Název role převádíme na lowercase; stejně musí být normalizovaný i
+    # fragment z prostředí. Jinak např. TESTER_ROLE_FRAGMENT=Tester
+    # neodpovídá roli „Head Tester“, přestože má být shoda case-insensitive.
+    fragment = (TESTER_ROLE_FRAGMENT or "").lower()
+    if not fragment:
+        return []
     return [
         r
         for r in roles
@@ -55,9 +60,12 @@ def has_tester_role(member) -> bool:
         return False
     if TESTER_ROLE_IDS:
         return _has_role_id(member, TESTER_ROLE_IDS)
+    fragment = (TESTER_ROLE_FRAGMENT or "").lower()
+    if not fragment:
+        return False
     roles = getattr(member, "roles", None) or []
     return any(
-        TESTER_ROLE_FRAGMENT in (getattr(role, "name", "") or "").lower()
+        fragment in (getattr(role, "name", "") or "").lower()
         for role in roles
     )
 

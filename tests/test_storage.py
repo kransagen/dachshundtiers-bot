@@ -61,6 +61,47 @@ class StorageTests(unittest.TestCase):
         storage.save_data("x.json", [2, 3])
         self.assertEqual(storage.load_data("x.json"), [2, 3])
 
+    def test_database_url_is_built_from_individual_environment_values(self):
+        env = {
+            "DATABASE_URL": "",
+            "DB_HOST": "db.example.test",
+            "DB_PORT": "5433",
+            "DB_NAME": "tiers data",
+            "DB_USER": "bot@example",
+            "DB_PASSWORD": "secret/@: value",
+        }
+        with mock.patch.dict(storage.os.environ, env, clear=True):
+            self.assertEqual(
+                storage._database_url_from_environment(),
+                "postgresql://bot%40example:secret%2F%40%3A%20value@"
+                "db.example.test:5433/tiers%20data",
+            )
+
+    def test_explicit_database_url_has_precedence(self):
+        with mock.patch.dict(
+            storage.os.environ,
+            {"DATABASE_URL": "postgresql://explicit/database", "DB_HOST": "ignored"},
+            clear=True,
+        ):
+            self.assertEqual(
+                storage._database_url_from_environment(), "postgresql://explicit/database"
+            )
+
+    def test_database_status_reports_json_mode_without_db_connection(self):
+        with mock.patch.object(storage, "DATABASE_URL", ""):
+            status = storage.database_status()
+        self.assertEqual(status["backend"], "json")
+        self.assertTrue(status["ok"])
+        self.assertIsNone(status["records"])
+
+    def test_explicit_ipv4_hostaddr_has_precedence(self):
+        with mock.patch.dict(
+            storage.os.environ,
+            {"DB_HOSTADDR": "203.0.113.10", "DB_HOST": "db.example.test"},
+            clear=True,
+        ):
+            self.assertEqual(storage._ipv4_hostaddr(), "203.0.113.10")
+
 
 if __name__ == "__main__":
     unittest.main()

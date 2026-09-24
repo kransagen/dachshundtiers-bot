@@ -22,7 +22,15 @@ funkce fungují jak v běžícím botovi (jeden loop), tak v testech.
 import asyncio
 import logging
 
-from storage import load_data, save_data
+from storage import (
+    load_data,
+    postgres_connection,
+    postgres_lock_keys,
+    postgres_load,
+    postgres_save,
+    save_data,
+    using_postgres,
+)
 
 log = logging.getLogger("dachshundtiers")
 
@@ -68,17 +76,23 @@ class Transaction:
     - ``set(name, data)``    – označí soubor k zápisu.
     """
 
-    def __init__(self, names):
+    def __init__(self, names, postgres_conn=None):
         self._names = tuple(names)
         self._data = {}
         self._dirty = set()
+        self._postgres_conn = postgres_conn
 
     def get(self, name: str, default=None):
         if name not in self._names:
             raise ValueError(f"Transakce nepokrývá soubor {name!r} (pokrývá: {self._names})")
         if name not in self._data:
             # strict=True zamezí přepsání poškozeného souboru odvozenými defaulty.
-            self._data[name] = load_data(name, default, strict=True)
+            if self._postgres_conn is not None:
+                self._data[name] = postgres_load(
+                    self._postgres_conn, name, default, strict=True
+                )
+            else:
+                self._data[name] = load_data(name, default, strict=True)
         return self._data[name]
 
     def set(self, name: str, data) -> None:
@@ -109,14 +123,36 @@ async def transaction(names, fn):
     """
     names = tuple(sorted(set(names)))
     locks = await _acquire(names)
-    tx = Transaction(names)
+    conn = None
     try:
+        if using_postgres():
+            # Jedna DB transakce pokryje všechny JSON-ekvivalentní záznamy;
+            # DB tak nikdy neskončí se změněným players.json a nezměněným
+            # cooldownem/ticketem po pádu uprostřed vícesouborové operace.
+            conn_context = postgres_connection(autocommit=False)
+            conn = conn_context.__enter__()
+            postgres_lock_keys(conn, names)
+            tx = Transaction(names, postgres_conn=conn)
+        else:
+            conn_context = None
+            tx = Transaction(names)
         result = fn(tx)
         if asyncio.iscoroutine(result):
             result = await result
         for name in tx._dirty:
-            save_data(name, tx._data[name])
+            if conn is not None:
+                postgres_save(conn, name, tx._data[name])
+            else:
+                save_data(name, tx._data[name])
+        if conn is not None:
+            conn.commit()
         return result
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
     finally:
+        if conn is not None:
+            conn_context.__exit__(None, None, None)
         for lock in reversed(locks):
             lock.release()

@@ -1,13 +1,12 @@
 """Drobné pomocné funkce sdílené napříč cogami."""
 
-import os
 from datetime import datetime
 
 import discord
 from discord import app_commands
 
 from services.permissions import has_tester_role as _permissions_has_tester_role
-from storage import data_path, load_data, save_data
+from storage import data_exists, load_data, save_data
 
 # Výchozí sada kitů (použije se, dokud neexistuje data/kits.json)
 DEFAULT_KITS = [
@@ -28,7 +27,7 @@ def get_kits():
     („MolePVP" + „molepvp") se sloučí – zůstane první výskyt. Tím se
     sjednotí autocomplete, selecty i ``kit_display_map`` napříč cogami.
     """
-    if not os.path.exists(data_path("kits.json")):
+    if not data_exists("kits.json"):
         return list(DEFAULT_KITS)
     raw = load_data("kits.json", [])
     seen = set()

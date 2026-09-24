@@ -163,6 +163,17 @@ class ValidateInputTests(unittest.TestCase):
         self.assertEqual(topresult.ht_fight_outcome_display("Lost"), "prohrál")
         self.assertEqual(topresult.ht_fight_outcome_display("won"), "vyhrál")
 
+    def test_bridge_valid_tiers(self):
+        for t in topresult.HT_FIGHT_TIERS:
+            ok, _ = topresult.validate_ht_fight_bridge(t)
+            self.assertTrue(ok, t)
+
+    def test_bridge_rejects_unknown_and_lt3e(self):
+        self.assertFalse(topresult.validate_ht_fight_bridge("XYZ")[0])
+        self.assertFalse(topresult.validate_ht_fight_bridge("LT3E")[0])  # eval ≠ reálný tier
+        self.assertFalse(topresult.validate_ht_fight_bridge("")[0])
+        self.assertFalse(topresult.validate_ht_fight_bridge("   ")[0])
+
 
 class FormatMessageTests(unittest.TestCase):
     """Formát zprávy – přesně zachovává styl serveru (sekce 4 zadání)."""
@@ -809,6 +820,236 @@ class AnnouncementStateTests(unittest.TestCase):
                 "pending",
             )
         asyncio.run(main())
+
+
+class RecordHTFightBridgeTests(unittest.TestCase):
+    """Bridge – povýšení přeskočením na zadaný vyšší tier (jen při výhře)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+        for name, default in (
+            (results.HT_RESULTS_FILE, {}),
+            (
+                "players.json",
+                [{"username": "mendu__", "modes": {"MolePVP": "LT3"},
+                  "history": {"MolePVP": [{"date": "01.09.2026", "tier": "LT3"}]}}],
+            ),
+            ("cooldowns.json", {}),
+            (tickets.HT_TICKETS_FILE, {}),
+        ):
+            storage.save_data(name, default)
+
+    async def _record(self, **overrides):
+        kwargs = dict(
+            player_id="1", player_name="mendu__", ign="mendu__",
+            evaluator_id="9", evaluator_name="tester", kit="MolePVP",
+            fight_tier="HT3", score="4-1", outcome="Won", opponent_id="2",
+            opponent_name="souper", tier_status="Povýšen na LT2",
+            now=NOW, date="23.09.2026",
+        )
+        kwargs.update(overrides)
+        return await topresult.record_ht_fight(**kwargs)
+
+    def test_win_bridge_promotes_directly(self):
+        async def main():
+            rec = await self._record(bridge="LT2")
+            self.assertEqual(rec["result"], "created")
+            data = rec["record"]
+            # povýšení přeskočením: LT3 → LT2 (místo standardního HT3 kroku)
+            self.assertEqual(data["previousTier"], "LT3")
+            self.assertEqual(data["newTier"], "LT2")
+            self.assertEqual(data["bridgeTier"], "LT2")
+            # kanonická players.json + historie hráče
+            players = storage.load_data("players.json", [])
+            self.assertEqual(players[0]["modes"]["MolePVP"], "LT2")
+            self.assertEqual(players[0]["history"]["MolePVP"][-1]["tier"], "LT2")
+            # zpráva ukáže „Postup: LT3 → LT2"
+            msg = topresult.format_topresult_message(
+                player_id=1, ign="mendu__", tier_status="Povýšen na LT2",
+                kit="MolePVP", fight_tier="HT3", outcome="Won", score="4-1",
+                opponent_id=2, previous_tier="LT3", new_tier="LT2", role_id=ROLE_ID,
+            )
+            self.assertIn("**Postup: LT3 → LT2**", msg)
+        asyncio.run(main())
+
+    def test_bridge_only_on_win(self):
+        async def main():
+            rec = await self._record(
+                bridge="LT2", outcome="Lost", score="0-4",
+                tier_status="Zůstává Low Tier 3",
+            )
+            self.assertEqual(rec["result"], "invalid_bridge")
+            self.assertIn("výhře", rec["message"])
+            # nic se nezapsalo – žádný záznam, hráč beze změny
+            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
+            players = storage.load_data("players.json", [])
+            self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
+        asyncio.run(main())
+
+    def test_bridge_must_be_valid_real_tier(self):
+        async def main():
+            rec = await self._record(bridge="XYZ")
+            self.assertEqual(rec["result"], "invalid_bridge")
+            self.assertIn("bridge", rec["message"].lower())
+            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
+        asyncio.run(main())
+
+    def test_bridge_lt3e_rejected(self):
+        async def main():
+            # LT3E je virtuální status (eval), ne reálný tier k bridge
+            rec = await self._record(bridge="LT3E")
+            self.assertEqual(rec["result"], "invalid_bridge")
+        asyncio.run(main())
+
+    def test_bridge_same_as_current_rejected(self):
+        async def main():
+            rec = await self._record(bridge="LT3")  # aktuální tier je LT3
+            self.assertEqual(rec["result"], "invalid_bridge")
+            self.assertIn("LT3", rec["message"])
+        asyncio.run(main())
+
+    def test_bridge_lower_than_current_rejected(self):
+        async def main():
+            rec = await self._record(bridge="LT4")  # LT4 < LT3 – dolů
+            self.assertEqual(rec["result"], "invalid_bridge")
+            self.assertIn("vyšší", rec["message"])
+        asyncio.run(main())
+
+    def test_bridge_unknown_current_tier_allowed(self):
+        async def main():
+            storage.save_data("players.json", [])  # nový hráč, tier neznámý
+            rec = await self._record(bridge="LT2")
+            self.assertEqual(rec["result"], "created")
+            self.assertEqual(rec["record"]["newTier"], "LT2")
+            self.assertEqual(rec["record"]["bridgeTier"], "LT2")
+            players = storage.load_data("players.json", [])
+            self.assertEqual(players[0]["modes"]["MolePVP"], "LT2")
+        asyncio.run(main())
+
+    def test_no_bridge_keeps_next_ticket_step(self):
+        async def main():
+            rec = await self._record()
+            self.assertEqual(rec["result"], "created")
+            # standardní krok z žebříčku (LT3 → HT3) – bridge nic nemění
+            self.assertEqual(rec["record"]["newTier"], "HT3")
+            self.assertNotIn("bridgeTier", rec["record"])
+        asyncio.run(main())
+
+    def test_bridge_empty_string_is_no_bridge(self):
+        async def main():
+            rec = await self._record(bridge="")
+            self.assertEqual(rec["result"], "created")
+            self.assertEqual(rec["record"]["newTier"], "HT3")
+            self.assertNotIn("bridgeTier", rec["record"])
+        asyncio.run(main())
+
+
+class TopResultCogBridgeTests(unittest.TestCase):
+    """Plumbing bridge parametru v /topresult (cog, bez sítě)."""
+
+    CHANNEL_ID = 5555
+    ROLE_ID = 6666
+
+    def setUp(self):
+        self.cog_module = __import__("cogs.topresult", fromlist=["TopResult"])
+        cm = self.cog_module
+        self._patches = [
+            mock.patch.object(cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
+            mock.patch.object(cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
+            mock.patch.object(cm, "has_tester_role", return_value=True),
+            mock.patch.object(cm, "validate_topresult_config", return_value=(True, "")),
+            mock.patch.object(cm, "is_registered_kit", return_value=True),
+            mock.patch.object(cm, "validate_ht_fight_tier", return_value=(True, "")),
+            mock.patch.object(cm, "validate_ht_fight_score", return_value=(True, "")),
+            mock.patch.object(cm, "validate_ht_fight_status", return_value=(True, "")),
+        ]
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+    def _call(self, record_result, *, bridge="LT2"):
+        cm = self.cog_module
+        with mock.patch.object(
+            cm, "record_ht_fight", new=mock.AsyncMock(return_value=record_result)
+        ) as rec_mock, mock.patch.object(
+            cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
+        ), mock.patch.object(
+            cm, "auto_grant_kit_role", new=mock.AsyncMock(return_value="")
+        ) as grant_mock, mock.patch.object(
+            cm, "get_ticket", new=mock.AsyncMock(return_value=None)
+        ):
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
+            bot = mock.MagicMock()
+            bot.get_channel.return_value = channel
+            inter = mock.MagicMock()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
+            inter.user.name = "tester"
+            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
+            inter.channel_id = 9999
+
+            cog = cm.TopResult(bot)
+            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
+            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
+            asyncio.run(cog.topresult.callback(
+                cog,
+                interaction=inter,
+                fight_tier="HT3",
+                outcome="Won",
+                score="4-1",
+                opponent=opp,
+                tier_status="Povýšen na LT2",
+                hrac=hrac,
+                ign="mendu__",
+                kit="MolePVP",
+                bridge=bridge,
+            ))
+            return inter, channel, rec_mock, grant_mock
+
+    def test_bridge_param_is_passed_and_promotes(self):
+        record_result = {
+            "result": "created",
+            "record": {
+                "id": "x",
+                "previousTier": "LT3",
+                "newTier": "LT2",
+                "bridgeTier": "LT2",
+            },
+            "previous_tier": "LT3",
+        }
+        inter, channel, rec_mock, grant_mock = self._call(record_result)
+
+        # bridge jde přes službu (a neztratí se v plumbing)
+        self.assertEqual(rec_mock.await_args.kwargs["bridge"], "LT2")
+        # role se udělí pro cílový (bridge) tier
+        self.assertEqual(grant_mock.await_args.kwargs["tier_up"], "LT2")
+        # zpráva do TOP_RESULT kanálu obsahuje postup LT3 → LT2
+        channel.send.assert_awaited_once()
+        content = channel.send.await_args.kwargs["content"]
+        self.assertIn("**Postup: LT3 → LT2**", content)
+        # potvrzení pro testera zmiňuje bridge
+        inter.followup.send.assert_awaited_once()
+        reply = inter.followup.send.await_args.args[0]
+        self.assertIn("Povýšení: LT3 → LT2", reply)
+        self.assertIn("bridge", reply)
+
+    def test_invalid_bridge_shows_clear_message(self):
+        record_result = {
+            "result": "invalid_bridge",
+            "message": "❌ Bridge tier `LT1` není vyšší než aktuální tier hráče `LT3`.",
+        }
+        inter, channel, _, _ = self._call(record_result, bridge="LT1")
+
+        inter.followup.send.assert_awaited_once()
+        msg = inter.followup.send.await_args.args[0]
+        self.assertIn("Bridge tier", msg)
+        self.assertIn("LT3", msg)
+        # nic se neposlalo do kanálu a žádná role se neudělovala
+        channel.send.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -11,6 +11,11 @@ Klíčové vlastnosti:
   - **výhra povyšuje hráče** na další tier v players.json (canonické pravidlo:
     ``next_ticket_tier`` ze žebříčku bez virtuálního LT3E), **prohra tier
     nemění**; neznámý/nečitelný tier → žádné povýšení (nikdy se nehádá),
+  - **bridge** (volitelný, jen při výhře): tester může hráče povýšit
+    PŘESKOČENÍM mezistupňů rovnou na zadaný cílový tier (např. topresult o
+    získání HT3, ale hráč z LT3 bridgne rovnou na LT2) – cíl musí být reálný
+    tier ze žebříčku a **strictly vyšší** než aktuální tier hráče; do záznamu
+    se připíše ``bridgeTier`` (auditní stopa),
   - prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
     vlastníkovi a připíše událost do logu ticketu (sdílené zavírání s /result);
     výhra ticket NEZAVÍRÁ ani cooldown nenastavuje,
@@ -82,6 +87,22 @@ _MSG_BAD_TIER = (
     + ", ".join(f"**{t}" for t in HT_FIGHT_TIERS)
     + "."
 )
+_MSG_BAD_BRIDGE = (
+    "❌ Neplatný bridge tier `{bridge}`. Bridge je reálný tier ze žebříčku, "
+    "na který hráč postoupí PŘESKOČENÍM mezistupňů (např. z LT3 rovnou na "
+    "LT2). Platné tiery: "
+    + ", ".join(f"**{t}" for t in HT_FIGHT_TIERS)
+    + "."
+)
+_MSG_BRIDGE_ONLY_ON_WIN = (
+    "❌ Bridge se zadává jen při **výhře** – při prohře hráč nepostupuje "
+    "a žádný bridge tier se nepoužije."
+)
+_MSG_BRIDGE_NOT_HIGHER = (
+    "❌ Bridge tier `{bridge}` není **vyšší** než aktuální tier hráče "
+    "`{current}` – bridge slouží k povýšení přeskokem mezistupňů (např. "
+    "hráč z LT3 bridgne rovnou na LT2), ne k setrvání nebo degradaci."
+)
 
 
 def _now_ms() -> int:
@@ -124,6 +145,19 @@ def validate_ht_fight_outcome(outcome: str) -> tuple[bool, str]:
     o = (outcome or "").strip().upper()
     if o not in ("WON", "LOST"):
         return False, "❌ Neplatný výsledek zápasu – použij **vyhrál** nebo **prohrál**."
+    return True, ""
+
+
+def validate_ht_fight_bridge(bridge: str) -> tuple[bool, str]:
+    """Bridge tier pro /topresult: reálný tier ze žebříčku (bez LT3E).
+
+    Bridge je cíl povýšení PŘESKOČENÍM mezistupňů (např. z LT3 rovnou na
+    LT2). Samotná podmínka „bridguje se jen NA VYŠŠÍ tier, než je aktuální"
+    se kontroluje až s kontextem hráče v ``record_ht_fight``.
+    """
+    b = normalize_tier(bridge)
+    if b not in HT_FIGHT_TIERS:
+        return False, _MSG_BAD_BRIDGE.format(bridge=(bridge or "").strip())
     return True, ""
 
 
@@ -250,6 +284,7 @@ async def record_ht_fight(
     opponent_id: str,
     opponent_name: str = "",
     tier_status: str,
+    bridge: str = None,
     notes: str = None,
     now: int = None,
     date: str = "",
@@ -263,6 +298,18 @@ async def record_ht_fight(
     Prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
     vlastníkovi (``ht3_cooldown_ms``) a připíše událost do logu ticketu;
     výhra ticket NEZAVÍRÁ a cooldown nenastavuje (hráč ve výhře pokračuje).
+
+    **Bridge** (``bridge``, volitelné): tester může při výhře hráče povýšit
+    PŘESKOČENÍM mezistupňů přímo na zadaný cílový tier (např. topresult o
+    získání HT3, ale hráč z LT3 bridgne rovnou na LT2). Pravidla:
+      - zadává se JEN při výhře (prohra → ``invalid_bridge``),
+      - cíl musí být reálný tier ze žebříčku (bez LT3E) – ``invalid_bridge``,
+      - když je aktuální tier hráče známý, musí být bridge STRICTLY VYŠŠÍ
+        (jinak ``invalid_bridge`` – bridge není setrvání ani degradace),
+      - neznámý aktuální tier (nový hráč) → bridge se akceptuje (explicitní
+        záměr testera, ne hádání),
+      - do záznamu se připíše ``bridgeTier`` (auditní stopa: povýšení přes
+        bridge, ne standardní krok).
 
     ``ticket_id`` (ID kanálu HT Fight ticketu) → výsledek se propojí
     s ticketem a idempotentně klíčuje jako ``{ticketId}:ht_fight``:
@@ -280,7 +327,7 @@ async def record_ht_fight(
       - ``{"result": "not_found"}`` / ``{"result": "not_fight_ticket", "ticket"}``
       - ``{"result": "ticket_closed", "ticket"}``
       - ``{"result": "wrong_player", "ticket"}`` / ``{"result": "wrong_kit", "ticket"}``
-      - ``{"result": "invalid_*", "message": ...}``
+      - ``{"result": "invalid_*", "message": ...}`` (včetně ``invalid_bridge``)
     """
     if now is None:
         now = _now_ms()
@@ -308,6 +355,17 @@ async def record_ht_fight(
     ok, msg = validate_ht_fight_status(status_clean)
     if not ok:
         return {"result": "invalid_status", "message": msg}
+
+    # Bridge (volitelné): jen při výhře + reálný tier ze žebříčku.
+    # Podmínka „vyšší než aktuální tier hráče" se ověří a transakci
+    # (tam je znám aktuální tier z players.json).
+    bridge_clean = normalize_tier(bridge) if (bridge or "").strip() else ""
+    if bridge_clean:
+        if outcome_clean == "Lost":
+            return {"result": "invalid_bridge", "message": _MSG_BRIDGE_ONLY_ON_WIN}
+        ok, msg = validate_ht_fight_bridge(bridge_clean)
+        if not ok:
+            return {"result": "invalid_bridge", "message": msg}
 
     files = [HT_RESULTS_FILE, "players.json"]
     if ticket_id is not None:
@@ -340,15 +398,27 @@ async def record_ht_fight(
             result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
 
         players = tx.get("players.json", [])
-        previous = (
-            find_player_tier_in(players, ign, kit, discord_id=player_id) or "N/A"
-        )
+        current = find_player_tier_in(players, ign, kit, discord_id=player_id)
+        previous = current or "N/A"
 
         promoted = None
-        if outcome_clean == "Won":
-            current = find_player_tier_in(players, ign, kit, discord_id=player_id)
-            if current:
-                promoted = next_ticket_tier(current)
+        if outcome_clean == "Won" and bridge_clean:
+            # Bridge: povýšení přeskočením na zadaný cílový tier. Cíl MUSÍ
+            # být strictly vyšší než aktuální tier hráče (když je známý) –
+            # jinak by „bridge" bridgoval dolů / do setrvání (chyba).
+            if current and current in HT3_TIER_LADDER and (
+                HT3_TIER_LADDER.index(bridge_clean)
+                <= HT3_TIER_LADDER.index(current)
+            ):
+                return {
+                    "result": "invalid_bridge",
+                    "message": _MSG_BRIDGE_NOT_HIGHER.format(
+                        bridge=bridge_clean, current=current
+                    ),
+                }
+            promoted = bridge_clean
+        elif outcome_clean == "Won" and current:
+            promoted = next_ticket_tier(current)
         new_tier = promoted if promoted else ""
 
         if outcome_clean == "Won" and promoted is not None:
@@ -385,6 +455,8 @@ async def record_ht_fight(
             opponent_id=str(opponent_id) if opponent_id else None,
             opponent_name=opponent_name,
         )
+        if bridge_clean:
+            record["bridgeTier"] = bridge_clean
         results[result_id] = record
         tx.set(HT_RESULTS_FILE, results)
 

@@ -79,7 +79,11 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   historie jako `/result` (`data/ht_results.json`, `resultType: "ht_fight"`).
   **Výhra povyšuje hráče** v `players.json` (canonické `next_ticket_tier` ze
   žebříčku bez LT3E), **prohra tier nemění**; neznámý/retired aktuální tier se
-  nikdy nehádá. **Výhra uvnitř HT Fight ticketu** ticket zavře + nastaví HT3+
+  nikdy nehádá. Volitelný **bridge** (`bridge:LT2`) povýší hráče při výhře
+  přeskočením rovnou na zadaný **vyšší** tier (např. topresult o získání HT3,
+  ale hráč z LT3 bridgne přímo na LT2); cíl musí být reálný tier ze žebříčku
+  a striktně vyšší než aktuální (záznam nese `bridgeTier` jako audit).
+  **Výhra uvnitř HT Fight ticketu** ticket zavře + nastaví HT3+
   cooldown vlastníka a připíše událost do logu ticketu (sdílené zavírání
   s `/result`); prohra nechává ticket otevřený. V kanálu HT Fight ticketu se
   hráč/IGN/kit berou z ticketu (autoritativně) a druhé odeslání se zablokuje
@@ -173,7 +177,7 @@ příchody/odchody).
 | `/sync discord mode:preview\|apply` *(admin)* | Tier role na Discordu vs. kanonická `players.json` (RoleSyncService). `preview` ukáže rozdíly – **nic nemění**; `apply` vyžaduje **explicitní potvrzení** (tlačítko) před aplikací (role add/remove). Stav se mezi náhledem a potvrzením ověřuje, konflikty se neřeší automaticky a **DB se z Discordu nepřepisuje**. Audit v `data/playersync_log.json`. |
 | `/sync web mode:preview\|apply` *(admin)* | Web (players.json na GitHubu) vs. kanonická DB. `preview` stáhne a porovná (detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče, neplatné záznamy) – **nic neposílá**. `apply` po potvrzení nahradí soubor na webu kanonickou DB (čtení i zápis mají retry). Selhání GitHubu **není hlášeno jako úspěch**, prázdná DB se neposílá. Audit v `data/websync_log.json`. |
 | `/sync data` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky, **retired tiery v modes** a **duplicitní discordId hráčů**. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, audit v `data/datacheck_log.json`. |
-| `/topresult hrac ign kit fight_tier outcome score opponent tier_status` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json`. **Výhra povyšuje hráče** (`players.json`, `next_ticket_tier` bez LT3E; v ticketu navíc zavře ticket + nastaví HT3+ cooldown + událost do logu ticketu), **prohra tier nemění a ticket nechává otevřený**; neznámý/retired tier se nehádá. Zprávu pošle ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID` (stav odeslání `pending → sent/failed`, selhání nabízí opakování tlačítkem). V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
+| `/topresult hrac ign kit fight_tier outcome score opponent tier_status bridge?` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json`. **Výhra povyšuje hráče** (`players.json`, `next_ticket_tier` bez LT3E; v ticketu navíc zavře ticket + nastaví HT3+ cooldown + událost do logu ticketu), **prohra tier nemění a ticket nechává otevřený**; neznámý/retired tier se nehádá. Volitelný **`bridge`** povýší při výhře přeskočením rovnou na zadaný vyšší tier (jen při výhře, reálný tier, striktně vyšší než aktuální; auditní `bridgeTier` v záznamu). Zprávu pošle ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID` (stav odeslání `pending → sent/failed`, selhání nabízí opakování tlačítkem). V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
 > **Deprecated aliasy:** `/playersync preview|apply`, `/websync preview|apply`,
 > `/checkweb preview|apply` a `/datacheck` zůstávají funkční a v patičce
 > upozorní „⚠️ Deprecated – použij /sync …". Jedinou výjimkou je

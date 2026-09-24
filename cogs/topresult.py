@@ -20,6 +20,10 @@ Behavior:
 - **výhra povyšuje hráče** na další tier (services/topresult.py – kanonické
   pravidlo next_ticket_tier); výhra udělí i novou tier roli (stejná logika
   jako /result – auto_grant_kit_role); prohra tier ani roli nemění,
+- **bridge** (volitelný parametr, jen při výhře) – tester může hráče povýšit
+  přeskočením rovnou na zadaný vyšší tier (např. topresult o získání HT3,
+  ale hráč z LT3 bridgne přímo na LT2); cíl musí být reálný tier a strictly
+  vyšší než aktuální tier hráče; do záznamu se připíše ``bridgeTier``,
 - prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown;
   výhra ticket NEZAVÍRÁ ani cooldown nenastavuje (hráč ve výhře pokračuje),
 - oznámení má stav pending → sent/failed (retry tlačítkem po selhání –
@@ -136,6 +140,7 @@ class TopResult(commands.Cog):
         hrac="Testovaný hráč (v HT Fight ticketu se bere z ticketu)",
         ign="Minecraft IGN hráče (v HT Fight ticketu se bere z ticketu)",
         kit="Kit (v HT Fight ticketu se bere z ticketu)",
+        bridge="Bridge – povýšení přeskočením na vyšší tier (jen při výhře, např. z LT3 rovnou na LT2)",
     )
     @app_commands.choices(
         outcome=[
@@ -143,7 +148,11 @@ class TopResult(commands.Cog):
             app_commands.Choice(name="prohrál", value="Lost"),
         ]
     )
-    @app_commands.autocomplete(kit=kit_autocomplete, fight_tier=fight_tier_autocomplete)
+    @app_commands.autocomplete(
+        kit=kit_autocomplete,
+        fight_tier=fight_tier_autocomplete,
+        bridge=fight_tier_autocomplete,
+    )
     async def topresult(
         self,
         interaction: discord.Interaction,
@@ -155,6 +164,7 @@ class TopResult(commands.Cog):
         hrac: discord.User | None = None,
         ign: str | None = None,
         kit: str | None = None,
+        bridge: str | None = None,
     ) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
@@ -278,6 +288,7 @@ class TopResult(commands.Cog):
             opponent_id=str(opponent.id),
             opponent_name=opponent.display_name or opponent.name,
             tier_status=tier_status,
+            bridge=bridge,
             now=now_ms(),
             date=today_cz(),
             ht3_cooldown_ms=HT3_COOLDOWN_MS,
@@ -333,6 +344,7 @@ class TopResult(commands.Cog):
             "invalid_score",
             "invalid_outcome",
             "invalid_status",
+            "invalid_bridge",
         ):
             return await interaction.followup.send(
                 record.get("message", "❌ Neplatný výsledek."), ephemeral=True
@@ -425,6 +437,8 @@ class TopResult(commands.Cog):
         )
         if promoted:
             reply += f"\n**Povýšení: {previous_tier} → {new_tier}**"
+            if rec.get("bridgeTier"):
+                reply += " ⚡ (bridge – přeskočení na zadaný tier)"
             if grant_note:
                 reply += f"\n{grant_note}"
         await interaction.followup.send(reply, ephemeral=True)

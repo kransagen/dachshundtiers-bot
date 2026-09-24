@@ -52,6 +52,7 @@ from services.checkweb import (
     STATUSES,
     apply_checkweb_decisions,
     analyze_checkweb,
+    build_discord_import_decisions,
     fingerprint_resolvable,
     log_checkweb_event,
 )
@@ -801,6 +802,138 @@ class SyncWebConfirmView(SafeView):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+class SyncImportDiscordConfirmView(SafeView):
+    """Potvrdí bezpečný hromadný import Discord tierů do DB a na web."""
+
+    def __init__(self, *, guild, analysis: dict):
+        super().__init__(timeout=120)
+        self.guild = guild
+        self.fingerprint = analysis["fingerprint"]
+        self.finished = False
+
+    @discord.ui.button(
+        label="✅ Potvrdit: Discord → DB → web",
+        style=discord.ButtonStyle.success,
+        custom_id="sync_importdiscord_confirm",
+    )
+    async def confirm(self, interaction: discord.Interaction, button) -> None:
+        if (msg := admin_gate_error(interaction)) is not None:
+            return await interaction.response.send_message(msg, ephemeral=True)
+        if self.finished:
+            return await interaction.response.send_message(
+                "✅ Import už proběhl.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        fresh = await _gather_checkweb(self.guild)
+        if fingerprint_resolvable(fresh["records"]) != self.fingerprint:
+            self.finished = True
+            return await self._finish(interaction, stale=True)
+
+        decisions, skipped = build_discord_import_decisions(fresh["records"])
+        players = load_data("players.json", []) or []
+        new_players, applied = apply_checkweb_decisions(
+            players=players,
+            records=fresh["records"],
+            decisions=decisions,
+            kit_display=fresh.get("kit_display") or {},
+        )
+        changed = [a for a in applied if a.get("ok") and a.get("newTier") != a.get("oldTier")]
+        if not changed:
+            self.finished = True
+            return await self._finish(interaction, applied=applied, skipped=skipped)
+
+        try:
+            await save_players(new_players)
+        except Exception as err:  # noqa: BLE001 – na web se po selhání DB nesmí psát
+            log.exception("Zápis players.json (/sync importdiscord) selhal")
+            self.finished = True
+            return await self._finish(
+                interaction, applied=applied, skipped=skipped, error=str(err)
+            )
+
+        try:
+            await log_checkweb_event(
+                actor_id=interaction.user.id,
+                actor_name=str(interaction.user),
+                mode="import_discord",
+                status="success",
+                summary=fresh["summary"],
+                website=fresh.get("website_source"),
+                errors=fresh.get("errors") or [],
+                repairs=applied,
+            )
+        except Exception:  # noqa: BLE001 – audit nesmí zrušit hotový zápis
+            log.exception("Auditní zápis (/sync importdiscord) selhal")
+
+        web_result = await sync_website(
+            canonical=new_players,
+            message="sync importdiscord: Discord tier role → players.json → web",
+            actor_id=interaction.user.id,
+            actor_name=str(interaction.user),
+        )
+        self.finished = True
+        await self._finish(
+            interaction, applied=applied, skipped=skipped, web_result=web_result
+        )
+
+    async def _finish(
+        self, interaction, *, stale=False, applied=None, skipped=None, web_result=None, error=""
+    ) -> None:
+        if stale:
+            embed = discord.Embed(
+                title="🔄 /sync importdiscord – stav se změnil",
+                description=(
+                    "Mezitím se změnily Discord role nebo players.json – "
+                    "**nic jsem nezapsal**. Spusť příkaz znovu."
+                ),
+                color=0xEF4444,
+            )
+        elif error:
+            embed = discord.Embed(
+                title="❌ /sync importdiscord – DB se neuložila",
+                description=(
+                    f"players.json se nepodařilo zapsat: `{error}`. "
+                    "Web se proto vůbec neměnil."
+                ),
+                color=0xEF4444,
+            )
+        else:
+            changed = [
+                a for a in (applied or [])
+                if a.get("ok") and a.get("newTier") != a.get("oldTier")
+            ]
+            web_ok = bool(web_result and web_result.get("ok"))
+            lines = [
+                f"✏️ **{a['player']}** · **{a['kit']}**: "
+                f"{a.get('oldTier') or '—'} → **{a.get('newTier')}**"
+                for a in changed[:12]
+            ]
+            if len(changed) > 12:
+                lines.append(f"…a dalších {len(changed) - 12} změn")
+            description = (
+                f"Zapsáno do DB: **{len(changed)}** tierů. "
+                f"Přeskočeno k ručnímu řešení: **{len(skipped or [])}**.\n\n"
+                + ("\n".join(lines) if lines else "Žádná jednoznačná změna.")
+            )
+            if web_result:
+                description += "\n\n" + (
+                    "✅ Web aktualizován." if web_ok else f"⚠️ DB je uložená, web ne: {web_result['message']}"
+                )
+            embed = discord.Embed(
+                title="✅ /sync importdiscord – dokončeno" if web_ok else "⚠️ /sync importdiscord – DB dokončena",
+                description=description,
+                color=0x10B981 if web_ok else 0xF59E0B,
+            )
+            embed.set_footer(text="Audit: data/checkweb_log.json a data/websync_log.json")
+        try:
+            if interaction.message is not None:
+                await interaction.message.edit(embed=embed, view=None)
+        except (discord.HTTPException, discord.Forbidden) as err:
+            log.warning("Nelze upravit potvrzení /sync importdiscord: %s", err)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 class SyncDataRepairView(SafeView):
     """Tlačítko „Aplikovat bezpečné opravy" pro /sync data."""
 
@@ -1316,6 +1449,63 @@ class Sync(commands.Cog):
             return
 
         view = SyncDiscordConfirmView(analysis=analysis)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # /sync importdiscord (Discord → DB → web)
+    # ------------------------------------------------------------------
+    @sync.command(
+        name="importdiscord",
+        description="Převezme jednoznačné Discord tiery do DB a pak na web",
+    )
+    @app_commands.describe(mode="preview = náhled · apply = po potvrzení zapíše DB i web")
+    @app_commands.choices(
+        mode=[
+            app_commands.Choice(name="preview", value="preview"),
+            app_commands.Choice(name="apply", value="apply"),
+        ]
+    )
+    async def sync_importdiscord(
+        self, interaction: discord.Interaction, mode: str
+    ) -> None:
+        """Hromadný import tier rolí, pouze pro jednoznačně spárované hráče.
+
+        Discord neumí spolehlivě dodat IGN nového člena a více tier rolí je
+        konflikt. Tyto případy se proto nikdy nevytvářejí ani nevolí samy.
+        """
+        if (msg := admin_gate_error(interaction)) is not None:
+            return await interaction.response.send_message(msg, ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+
+        analysis = await _gather_checkweb(interaction.guild)
+        decisions, skipped = build_discord_import_decisions(analysis["records"])
+        lines = [
+            f"✏️ **{d['player']}** · **{d['kit_key']}** → **{d['tier']}**"
+            for d in decisions[:15]
+        ]
+        if len(decisions) > 15:
+            lines.append(f"…a dalších {len(decisions) - 15} změn")
+        description = (
+            f"Jednoznačné změny z Discordu: **{len(decisions)}**\n"
+            f"Přeskočeno (konflikt, neznámý hráč, duplicita nebo chybějící role): "
+            f"**{len(skipped)}**\n\n"
+            + ("\n".join(lines) if lines else "Žádná bezpečná změna k importu.")
+        )
+        embed = discord.Embed(
+            title="🔎 /sync importdiscord – náhled",
+            description=description,
+            color=0xF59E0B if decisions else 0x10B981,
+        )
+        embed.set_footer(
+            text=(
+                "Při potvrzení: Discord → data/players.json → web. "
+                "Víc tier rolí se nikdy nevybírá automaticky."
+            )
+        )
+        if mode == "preview" or not decisions:
+            return await interaction.followup.send(embed=embed, ephemeral=True)
+
+        view = SyncImportDiscordConfirmView(guild=interaction.guild, analysis=analysis)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     # ------------------------------------------------------------------

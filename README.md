@@ -62,6 +62,14 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   zvlášť – chyba (Forbidden) = PARTIAL, nikdy crash. Audit
   v `data/playersync_log.json`.
 
+- **`/sync importdiscord mode:preview|apply` – bezpečný hromadný import Discord → DB → web** –
+  zkontroluje tier role všech členů a pro každou **jednoznačnou** shodu
+  existujícího hráče převezme jediný Discord tier do `players.json`; po
+  potvrzení pak aktualizuje web. Hráči bez záznamu v DB, duplicity a více tier
+  rolí jednoho kitu se nikdy nehádají ani nevytvářejí automaticky – zůstanou v
+  reportu pro ruční opravu. Před zápisem se stav znovu ověří a vše se audituje
+  do `data/checkweb_log.json` a `data/websync_log.json`.
+
 - **`/sync web mode:preview|apply` – synchronizace webu s kanonickou `players.json`** –
   web (players.json na GitHubu) je jen kopie, jediný zdroj pravdy zůstává
   lokální kanonická DB. `preview` stáhne web a detekuje chybějící hráče,
@@ -112,7 +120,8 @@ Tok dat je jednosměrný, kanonická `players.json` je **jediný zdroj pravdy**:
    `playersync_log.json`).
 3. **Web = kopie** – jediný zapisovatel `players.json` na GitHub je
    `/sync web` (preview/apply s potvrzením, audit v `websync_log.json`).
-   Žádný jiný příkaz web nemění.
+   `/sync importdiscord apply` je řízená výjimka: nejdřív bezpečně importuje
+   jednoznačné Discord tiery do DB a tutéž potvrzenou DB pak nahraje na web.
 
 Pravidla z auditu (kodifikovaná v `services/role_sync.py` + `services/datacheck.py`):
 
@@ -175,6 +184,7 @@ příchody/odchody).
 | `/kitrole` | Vypíše všechna namapovaná role (kit → tier). |
 | `/sync check [area]` *(admin)* | Komplexní **read-only** diagnostika: porovná **Discord role × `players.json` × web** (statusy: MATCH / MISSING_DISCORD_ROLE / DATABASE_MISMATCH / WEBSITE_MISMATCH / MULTIPLE_TIER_ROLES (KONFLIKT) / UNKNOWN_ROLE / UNKNOWN_PLAYER / DUPLICATE_PLAYER) + integritu dat a rozdíly webu. Agregace **OK/WARNING/CONFLICT/ERROR**, filtr podle `area` (all/identity/tiers/roles/web/data). **Nic nemění** – Discord role už nejsou zdroj pravdy, jen projekce DB. Audit v `data/checkweb_log.json` + `data/datacheck_log.json`. |
 | `/sync discord mode:preview\|apply` *(admin)* | Tier role na Discordu vs. kanonická `players.json` (RoleSyncService). `preview` ukáže rozdíly – **nic nemění**; `apply` vyžaduje **explicitní potvrzení** (tlačítko) před aplikací (role add/remove). Stav se mezi náhledem a potvrzením ověřuje, konflikty se neřeší automaticky a **DB se z Discordu nepřepisuje**. Audit v `data/playersync_log.json`. |
+| `/sync importdiscord mode:preview\|apply` *(admin)* | Hromadný import **Discord → `players.json` → web**. U každé jednoznačné role existujícího hráče `preview` ukáže změnu; `apply` po potvrzení přepíše tier v DB a nahraje ji na GitHub. Více tier rolí, neznámí hráči a duplicity se jen vypíšou, nikdy se automaticky nevybírají ani nevytvářejí. Audit v `checkweb_log.json` a `websync_log.json`. |
 | `/sync web mode:preview\|apply` *(admin)* | Web (players.json na GitHubu) vs. kanonická DB. `preview` stáhne a porovná (detekuje chybějící hráče, špatné tiery, zastaralá data, duplicitní hráče, neplatné záznamy) – **nic neposílá**. `apply` po potvrzení nahradí soubor na webu kanonickou DB (čtení i zápis mají retry). Selhání GitHubu **není hlášeno jako úspěch**, prázdná DB se neposílá. Audit v `data/websync_log.json`. |
 | `/sync data` *(admin)* | Kontrola integrity všech databází: duplicitní hráči / Discord ID / IGN, neplatné tiery, konfliktní Discord role, chybějící webové záznamy, neplatné eval reference, osamocené tickety a výsledky, **retired tiery v modes** a **duplicitní discordId hráčů**. **Nic nemaže** – bezpečné opravy jen tlačítkem po potvrzení, audit v `data/datacheck_log.json`. |
 | `/topresult hrac ign kit fight_tier outcome score opponent tier_status bridge?` *(tester)* | HT Fight výsledek – specializovaná verze `/result`, **ne žebříček**. Vyvaliduje skóre `0-4`, HT tier (z žebříčku, bez LT3E) a status; zapíše záznam s `resultType=ht_fight` do **stejné** historie `ht_results.json`. **Výhra povyšuje hráče** (`players.json`, `next_ticket_tier` bez LT3E; v ticketu navíc zavře ticket + nastaví HT3+ cooldown + událost do logu ticketu), **prohra tier nemění a ticket nechává otevřený**; neznámý/retired tier se nehádá. Volitelný **`bridge`** povýší při výhře přeskočením rovnou na zadaný vyšší tier (jen při výhře, reálný tier, striktně vyšší než aktuální; auditní `bridgeTier` v záznamu). Zprávu pošle ve stylu serveru jen do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID` (stav odeslání `pending → sent/failed`, selhání nabízí opakování tlačítkem). V HT Fight ticketu se hráč/IGN/kit berou z ticketu; 1 ticket = 1 fight výsledek (idempotence). |
@@ -350,14 +360,30 @@ v `.env` (viz `.env.example`):
 | `GUILD_ID` | Scope registrace příkazů. **Nastaveno** → příkazy se synchronizují jen do této guildy (produkce na jednom serveru). **Prazdné** → jen globálně (dev/testing). Scopy se nikdy nemíchají, takže duplicity nevznikají. |
 | `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |
 | `GITHUB_*` | Volitelná synchronizace `players.json` na GitHub. |
+| `DATABASE_URL` | Volitelný PostgreSQL backend, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot používá stávající JSON soubory. |
 
 > Kanál panelu fronty pro kit se dá nastavit i za běhu přes `/addqchannel`
 > (ukládá se do `data/queue_channels.json` a má přednost před env i defaulty).
 
 ## Data
 
-Všechny databáze jsou JSON soubory ve složce `data/` (stejný formát jako
-v originále):
+Výchozí úložiště jsou JSON soubory ve složce `data/` (stejný formát jako
+v originále). Pro produkci lze nastavit `DATABASE_URL`: bot pak ukládá stejné
+hodnoty do tabulky PostgreSQL s JSONB a vícesouborové operace (`/result`,
+tickety, synchronizace) se provedou v jedné databázové transakci. Pokud je
+`DATABASE_URL` nastavené a PostgreSQL nefunguje, bot se **potichu nevrací k
+JSONům** — zabrání se tak vzniku dvou rozdílných databází.
+
+Migrace existujících dat je bezpečná a původní JSON soubory nemaže:
+
+```bash
+DATABASE_URL='postgresql://user:heslo@host:5432/dachshundtiers' \
+  python migrate_json_to_postgres.py
+```
+
+Po úspěšné migraci nastav stejnou proměnnou v hostingu a restartuj bota.
+
+Datové klíče odpovídají dosavadním souborům:
 `queue.json`, `active_queues.json`, `queue_messages.json`, `queue_channels.json`
 (spravuje `/addqchannel`), `testers.json`, `players.json`, `cooldowns.json`,
 `testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,

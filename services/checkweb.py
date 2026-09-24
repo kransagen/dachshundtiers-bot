@@ -555,6 +555,39 @@ def fingerprint_resolvable(records) -> str:
     return "|".join(sorted(lines))
 
 
+def build_discord_import_decisions(records) -> tuple[list, list]:
+    """Připraví hromadný, ale bezpečný import Discord tierů do DB.
+
+    Do importu jdou pouze záznamy ``DATABASE_MISMATCH`` s *právě jedním*
+    platným Discord tierem. Více tier rolí je konflikt a neznámý hráč nemá
+    spolehlivě zjistitelný Minecraft IGN, proto se obojí nikdy nevytváří ani
+    nevybírá automaticky.
+
+    Vrací ``(decisions, skipped)``. Rozhodnutí lze beze změny předat do
+    :func:`apply_checkweb_decisions`; ``skipped`` jsou záznamy pro report UI.
+    """
+    decisions = []
+    skipped = []
+    for record in records or []:
+        if record.get("status") != "DATABASE_MISMATCH":
+            if record.get("status") != "MATCH":
+                skipped.append(record)
+            continue
+        tiers = sorted({str(t).strip().upper() for t in record.get("discord") or [] if t})
+        if len(tiers) != 1:
+            skipped.append(record)
+            continue
+        decisions.append(
+            {
+                "player": record.get("player"),
+                "kit_key": record.get("kit_key"),
+                "decision": "use_discord",
+                "tier": tiers[0],
+            }
+        )
+    return decisions, skipped
+
+
 # ---------------------------------------------------------------------------
 # Aplikace rozhodnutí (pouze po explicitním potvrzení)
 # ---------------------------------------------------------------------------

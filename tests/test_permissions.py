@@ -37,6 +37,27 @@ class PermissionsTests(unittest.TestCase):
             m2 = make_member(roles=[role(6, "Moderátor")])
             self.assertFalse(permissions.has_tester_role(m2))
 
+    def test_tester_fragment_from_config_is_case_insensitive(self):
+        """Fragment z env může mít libovolný case, stejně jako název role."""
+        with (
+            mock.patch.object(permissions, "TESTER_ROLE_IDS", []),
+            mock.patch.object(permissions, "TESTER_ROLE_FRAGMENT", "Tester"),
+        ):
+            member = make_member(roles=[role(5, "Head Tester")])
+            self.assertTrue(permissions.has_tester_role(member))
+            self.assertEqual(
+                [r.id for r in permissions.get_tester_roles(member.roles)], [5]
+            )
+
+    def test_empty_tester_fragment_does_not_grant_every_role(self):
+        with (
+            mock.patch.object(permissions, "TESTER_ROLE_IDS", []),
+            mock.patch.object(permissions, "TESTER_ROLE_FRAGMENT", ""),
+        ):
+            member = make_member(roles=[role(5, "Běžný člen")])
+            self.assertFalse(permissions.has_tester_role(member))
+            self.assertEqual(permissions.get_tester_roles(member.roles), [])
+
     def test_tester_empty_roles(self):
         with mock.patch.object(permissions, "TESTER_ROLE_IDS", []):
             self.assertFalse(permissions.has_tester_role(make_member(roles=[])))

@@ -25,6 +25,7 @@ from services.playersync import (
     find_rollback_target,
     get_playersync_rollback_log,
     log_playersync_rollback_event,
+    verify_rollback_plan,
 )
 
 
@@ -137,6 +138,108 @@ class RollbackPlanTests(unittest.TestCase):
         self.assertEqual(plan["target_ts"], 1000)
         self.assertEqual(plan["target_actor_id"], "999")
         self.assertEqual(plan["target_actor_name"], "boss")
+
+
+class RollbackVerificationTests(unittest.TestCase):
+    """Finální bezpečnostní kontrola plánu proti audit záznamu (čistá).
+
+    Pro každou plánovanou akci ověřuje memberId + roleId + original op +
+    důkaz ok=True v auditu a seskupuje souhrn podle PŮVODNÍ operace
+    (REMOVE → ADD / ADD → REMOVE) s kontrolou X + Y == total.
+    """
+
+    def test_verifies_mixed_plan_and_groups_by_original(self):
+        entry = _applied(
+            [
+                _rec("remove", "1", "101"),
+                _rec("remove", "2", "102"),
+                _rec("add", "3", "103"),
+            ]
+        )
+        plan = build_rollback_plan(entry)
+        v = verify_rollback_plan(entry, plan)
+        self.assertTrue(v["ok"])
+        self.assertTrue(v["sum_matches"])
+        self.assertEqual(v["total"], 3)
+        self.assertEqual(v["verified"], 3)
+        self.assertEqual(v["by_original"]["remove_to_add"], 2)
+        self.assertEqual(v["by_original"]["add_to_remove"], 1)
+        self.assertEqual(v["problems"], [])
+        x, y = v["by_original"]["remove_to_add"], v["by_original"]["add_to_remove"]
+        self.assertEqual(x + y, v["total"])
+
+    def test_missing_ok_proof_detected(self):
+        # Akce je v plánu, ale v auditu neexistuje ok=True záznam (důkaz
+        # úspěšné aplikace) → kontrola selže.
+        entry = _applied([_rec("add", "1", "101")])
+        plan = build_rollback_plan(entry)
+        plan["actions"].append(
+            {
+                "op": "add",
+                "original_op": "remove",
+                "member_id": "1",
+                "role_id": "999",
+                "member_name": "AliceMC",
+                "kit": "AnchorPvP",
+                "tier": "HT3",
+            }
+        )
+        v = verify_rollback_plan(entry, plan)
+        self.assertFalse(v["ok"])
+        self.assertEqual(len(v["problems"]), 1)
+        self.assertIn("ok=True", v["problems"][0]["reason"])
+
+    def test_missing_member_id_detected(self):
+        entry = _applied([_rec("add", "1", "101")])
+        plan = {
+            "actions": [
+                {
+                    "op": "remove",
+                    "original_op": "add",
+                    "member_id": "",
+                    "role_id": "101",
+                }
+            ]
+        }
+        v = verify_rollback_plan(entry, plan)
+        self.assertFalse(v["ok"])
+        self.assertIn("member_id", v["problems"][0]["reason"])
+
+    def test_wrong_inversion_detected(self):
+        entry = _applied([_rec("add", "1", "101")])
+        plan = build_rollback_plan(entry)
+        plan["actions"][0]["op"] = "add"  # poškozená inverze (má být remove)
+        v = verify_rollback_plan(entry, plan)
+        self.assertFalse(v["ok"])
+        self.assertIn("inverz", v["problems"][0]["reason"])
+
+    def test_sum_mismatch_reported(self):
+        entry = _applied([_rec("add", "1", "101")])
+        plan = {
+            "actions": [
+                {
+                    "op": "remove",
+                    "original_op": "explode",  # neplatná původní operace
+                    "member_id": "1",
+                    "role_id": "101",
+                }
+            ]
+        }
+        v = verify_rollback_plan(entry, plan)
+        self.assertFalse(v["ok"])
+        self.assertFalse(v["sum_matches"])
+        self.assertEqual(v["verified"], 0)
+        x, y = v["by_original"]["remove_to_add"], v["by_original"]["add_to_remove"]
+        self.assertEqual(x + y, 0)
+
+    def test_empty_plan_verified_trivially(self):
+        entry = _applied([])
+        plan = build_rollback_plan(entry)
+        v = verify_rollback_plan(entry, plan)
+        self.assertTrue(v["ok"])
+        self.assertTrue(v["sum_matches"])
+        self.assertEqual(v["total"], 0)
+        self.assertEqual(v["verified"], 0)
 
 
 class RollbackTargetSelectionTests(unittest.TestCase):

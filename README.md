@@ -74,7 +74,12 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   potvrzení** tlačítkem. Cíl = poslední apply záznam s úspěšnými akcemi,
   nebo konkrétní `target_ts` (ms epoch); preview záznamy se nevyberou nikdy.
   Před spuštěním se znovu ověří cílový záznam + otisk plánu (změnil-li se,
-  nic se nevrátí). Každá akce běží zvlášť a rozlišuje se **aplikováno /
+  nic se nevrátí). V náhledu se **každá akce finálně ověří proti auditu**
+  (memberId + roleId + op + důkaz `ok=True`) a souhrn se seskupí podle
+  **původní operace** – `Original REMOVE → Rollback ADD` / `Original ADD →
+  Rollback REMOVE` – s kontrolou **X + Y = celkem**; neprojde-li kontrola,
+  rollback se NESPUSTÍ a nic se nemění. Každá akce běží zvlášť a rozlišuje se
+  **aplikováno /
   už správně (idempotentní, bez volání API) / chyba** – rollback lze bezpečně
   spustit dvakrát. Vlastní audit (timestamp, cíl, výsledek každé akce) jde do
   separátního `data/playersync_rollback_log.json`, původní audit syncu se

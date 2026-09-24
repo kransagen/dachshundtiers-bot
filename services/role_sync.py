@@ -34,6 +34,7 @@ from services.playersync import (
     log_playersync_event,
     log_playersync_rollback_event,
     make_member,
+    verify_rollback_plan,
 )
 
 __all__ = [
@@ -54,6 +55,7 @@ __all__ = [
     "log_playersync_event",
     "log_playersync_rollback_event",
     "make_member",
+    "verify_rollback_plan",
 ]
 
 

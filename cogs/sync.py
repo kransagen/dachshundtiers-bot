@@ -75,6 +75,7 @@ from services.role_sync import (
     get_playersync_log,
     log_playersync_event,
     log_playersync_rollback_event,
+    verify_rollback_plan,
 )
 from services.websync import (
     KIND_LABELS as WS_KIND_LABELS,
@@ -500,10 +501,23 @@ def _fmt_ts(ts_ms) -> str:
         return str(ts_ms)
 
 
-def _rollback_embed(plan: dict, *, mode: str, note: str = "") -> list:
-    """Shrnutí rollbacku /sync discord (dry run / potvrzení) – nic nemění."""
-    adds = sum(1 for a in plan["actions"] if a.get("op") == "add")
-    removes = sum(1 for a in plan["actions"] if a.get("op") == "remove")
+def _rollback_embed(
+    plan: dict, *, mode: str, note: str = "", verification: dict | None = None
+) -> list:
+    """Shrnutí rollbacku /sync discord (dry run / potvrzení) – nic nemění.
+
+    Souhrn se seskupuje podle PŮVODNÍ operace auditu (Original REMOVE →
+    Rollback ADD, Original ADD → Rollback REMOVE) a ukazuje výsledek finální
+    bezpečnostní kontroly (memberId + roleId + op + důkaz ok=True).
+    """
+    total = len(plan["actions"])
+    remove_to_add = sum(
+        1 for a in plan["actions"] if a.get("original_op") == "remove"
+    )
+    add_to_remove = total - remove_to_add
+    verified = (verification or {}).get("verified", total)
+    sum_ok = bool((verification or {}).get("sum_matches", True))
+    verified_ok = verified == total and sum_ok
     if mode == "apply":
         footer = (
             "Rollback se spustí JEN po potvrzení tlačítkem níže – inverze "
@@ -519,10 +533,14 @@ def _rollback_embed(plan: dict, *, mode: str, note: str = "") -> list:
             f"• Kdo: **{plan['target_actor_name']}** (ID `{plan['target_actor_id']}`)\n"
             f"• Úspěšně aplikováno: **{plan['original_applied']} / "
             f"{plan['total_logged']}** akcí\n\n"
-            "**Rollback (inverze akcí z auditu):**\n"
-            f"• AJ přidat roli (ADD): **{adds}**\n"
-            f"• AJ odebrat roli (REMOVE): **{removes}**\n"
-            f"• Celkem: **{len(plan['actions'])}**"
+            "**Přehled dle původní operace auditu:**\n"
+            f"• Original REMOVE → Rollback ADD: **{remove_to_add}**\n"
+            f"• Original ADD → Rollback REMOVE: **{add_to_remove}**\n"
+            f"• Celkem: **{total}** · kontrola X + Y = celkem: "
+            f"**{'OK ✓' if sum_ok else 'NESHODA ✗'}**\n\n"
+            f"**Finální bezpečnostní ověření:** {verified} / {total} akcí "
+            f"(memberId + roleId + op + důkaz ok=True) "
+            f"{'✓' if verified_ok else '✗'}"
         ),
         color=0xF59E0B,
     )
@@ -984,9 +1002,12 @@ class SyncDiscordRollbackView(SafeView):
             await self._finish(interaction, results=None, stale=True)
             return
         fresh_plan = build_rollback_plan(fresh_entry)
+        fresh_verify = verify_rollback_plan(fresh_entry, fresh_plan)
         if (
             not fresh_plan["ok"]
             or fingerprint(fresh_plan["actions"]) != self.fingerprint
+            or not fresh_verify["ok"]
+            or not fresh_verify["sum_matches"]
         ):
             self.finished = True
             await self._finish(interaction, results=None, stale=True)
@@ -1897,7 +1918,35 @@ class Sync(commands.Cog):
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        # 3) Rollback audit (preview i apply – dry run se taky zaznamenává).
+        # 3) Finální bezpečnostní kontrola – každá akce plánu se ověří proti
+        #    audit záznamu (memberId + roleId + op + důkaz ok=True) a souhrn
+        #    dle původní operace musí dát X + Y == total. Při neúspěchu se
+        #    rollback NESPUSTÍ – žádný výstup s potvrzením, žádné volání API.
+        verification = verify_rollback_plan(entry, plan)
+        if not verification["ok"] or not verification["sum_matches"]:
+            problem_lines = [
+                f"• member `{p.get('member_id')}` · role `{p.get('role_id')}` "
+                f"(original {p.get('original_op')}) – {p.get('reason')}"
+                for p in verification["problems"]
+            ]
+            embed = discord.Embed(
+                title="❌ /sync discord-rollback – bezpečnostní kontrola selhala",
+                description=(
+                    "Rollback se NESPUSTÍ – plán neprošel finálním ověřením "
+                    "proti auditu (chybí memberId/roleId nebo důkaz ok=True, "
+                    "případně špatná inverze):\n\n"
+                    + "\n".join(problem_lines or ["Neznámá chyba ověření."])
+                ),
+                color=0xEF4444,
+            )
+            embed.set_footer(
+                text=f"Cílový sync: {_fmt_ts(plan['target_ts'])} "
+                f"({plan['target_ts']})."
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        # 4) Rollback audit (preview i apply – dry run se taky zaznamenává).
         summary = {
             "add": sum(1 for a in plan["actions"] if a.get("op") == "add"),
             "remove": sum(1 for a in plan["actions"] if a.get("op") == "remove"),
@@ -1919,7 +1968,9 @@ class Sync(commands.Cog):
         except Exception:  # noqa: BLE001 – audit nesmí shodit výpis
             log.exception("Rollback audit (preview) selhal")
 
-        embeds = _rollback_embed(plan, mode=mode, note=note)
+        embeds = _rollback_embed(
+            plan, mode=mode, note=note, verification=verification
+        )
         if mode != "apply":
             # Dry run – NIKDY nemění Discord.
             await _send_embed_pack(interaction.followup, embeds)

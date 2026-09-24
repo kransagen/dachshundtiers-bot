@@ -299,6 +299,15 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         self.assertIn("🔄 /sync discord-rollback", embed.title)
         self.assertIn("Dry run", embed.footer.text)
         self.assertIn("Celkem: **2**", embed.description)
+        # Finální bezpečnostní kontrola: souhrn dle PŮVODNÍ operace + X + Y.
+        self.assertIn("Original REMOVE → Rollback ADD: **1**", embed.description)
+        self.assertIn("Original ADD → Rollback REMOVE: **1**", embed.description)
+        self.assertIn("kontrola X + Y = celkem: **OK ✓**", embed.description)
+        self.assertIn(
+            "**Finální bezpečnostní ověření:** 2 / 2 akcí "
+            "(memberId + roleId + op + důkaz ok=True) ✓",
+            embed.description,
+        )
         alice.add_roles.assert_not_awaited()
         alice.remove_roles.assert_not_awaited()
         # rollback preview audit v separátním souboru
@@ -319,6 +328,49 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         asyncio.run(main())
         embed, kwargs = _sent(inter)
         self.assertIsInstance(kwargs.get("view"), SyncDiscordRollbackView)
+        alice.add_roles.assert_not_awaited()
+        alice.remove_roles.assert_not_awaited()
+
+    def test_verification_failure_aborts_without_view_or_roles(self):
+        # Finální bezpečnostní kontrola selhala → rollback se NESPUSTÍ:
+        # žádné potvrzovací tlačítko, žádné volání role API (ani v apply).
+        self._seed()
+        cog = Sync.__new__(Sync)
+        alice = _member(1, "AliceMC")
+        guild = _guild([alice])
+        inter = _interaction(user=_admin_member(), guild=guild)
+
+        failing = {
+            "ok": False,
+            "total": 2,
+            "verified": 1,
+            "problems": [
+                {
+                    "member_id": "1",
+                    "role_id": "202",
+                    "original_op": "remove",
+                    "op": "add",
+                    "reason": (
+                        "v auditu chybí ok=True záznam pro tuto akci "
+                        "(důkaz úspěšné aplikace)"
+                    ),
+                }
+            ],
+            "by_original": {"remove_to_add": 1, "add_to_remove": 0},
+            "sum_matches": False,
+        }
+
+        async def main():
+            with mock.patch(
+                "cogs.sync.verify_rollback_plan", return_value=failing
+            ):
+                await Sync.sync_discord_rollback.callback(cog, inter, "apply")
+
+        asyncio.run(main())
+        embed, kwargs = _sent(inter)
+        self.assertIn("bezpečnostní kontrola selhala", embed.title)
+        self.assertIn("důkaz úspěšné aplikace", embed.description)
+        self.assertNotIn("view", kwargs)
         alice.add_roles.assert_not_awaited()
         alice.remove_roles.assert_not_awaited()
 

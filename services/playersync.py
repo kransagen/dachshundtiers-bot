@@ -751,6 +751,107 @@ def build_rollback_plan(entry) -> dict:
     }
 
 
+def verify_rollback_plan(entry, plan) -> dict:
+    """Finální bezpečnostní kontrola každé plánované rollback akce (čistá).
+
+    Pro KAŽDOU akci plánu se znovu ověří proti cílovému audit záznamu:
+    - ``member_id`` i ``role_id`` jsou vyplněná čísla (odpovídají memberId /
+      roleId z auditu),
+    - ``original_op`` je platná operace (add/remove),
+    - v ``applied`` cílového záznamu existuje záznam se stejnými
+      memberId/roleId/op a ``ok`` True → **důkaz, že původní operace byla
+      úspěšně aplikovaná**,
+    - rollback operace je správnou inverzí (REMOVE → ADD, ADD → REMOVE).
+
+    Nic nemění (žádné Discord volání). Vrací přehled seskupený podle PŮVODNÍ
+    operace auditu (``remove_to_add`` / ``add_to_remove``), kontrolu
+    X + Y == total (``sum_matches``) a seznam problémů. ``ok`` False =
+    rollback se NESPUSTÍ.
+    """
+    by_key = {}
+    for rec in entry.get("applied") or []:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("ok"):
+            by_key[
+                (
+                    str(rec.get("memberId") or "").strip(),
+                    str(rec.get("roleId") or "").strip(),
+                    rec.get("op"),
+                )
+            ] = rec
+
+    problems = []
+    verified = 0
+    remove_to_add = 0
+    add_to_remove = 0
+    total = len(plan.get("actions") or [])
+    for a in plan.get("actions") or []:
+        if not isinstance(a, dict):
+            problems.append(
+                {
+                    "member_id": "",
+                    "role_id": "",
+                    "original_op": None,
+                    "op": None,
+                    "reason": "neplatná akce plánu",
+                }
+            )
+            continue
+        member_id = str(a.get("member_id") or "").strip()
+        role_id = str(a.get("role_id") or "").strip()
+        original_op = a.get("original_op")
+        op = a.get("op")
+        issues = []
+        if not member_id or not member_id.isdigit():
+            issues.append("chybí member_id / není číslo")
+        if not role_id or not role_id.isdigit():
+            issues.append("chybí role_id / není číslo")
+        if original_op not in ("add", "remove"):
+            issues.append(f"neplatný original_op {original_op!r}")
+        if op not in ("add", "remove"):
+            issues.append(f"neplatná rollback operace {op!r}")
+        elif _invert_op(original_op) != op:
+            issues.append(
+                f"špatná inverze: {original_op!r} → {op!r} "
+                f"(očekáváno {_invert_op(original_op)!r})"
+            )
+        proof = by_key.get((member_id, role_id, original_op))
+        if proof is None:
+            issues.append(
+                "v auditu chybí ok=True záznam pro tuto akci "
+                "(důkaz úspěšné aplikace)"
+            )
+        if issues:
+            problems.append(
+                {
+                    "member_id": member_id,
+                    "role_id": role_id,
+                    "original_op": original_op,
+                    "op": op,
+                    "reason": "; ".join(issues),
+                }
+            )
+            continue
+        verified += 1
+        if original_op == "remove":  # → rollback ADD
+            remove_to_add += 1
+        else:  # original_op == "add" → rollback REMOVE
+            add_to_remove += 1
+
+    return {
+        "ok": not problems,
+        "total": total,
+        "verified": verified,
+        "problems": problems,
+        "by_original": {
+            "remove_to_add": remove_to_add,  # Original REMOVE → Rollback ADD
+            "add_to_remove": add_to_remove,  # Original ADD → Rollback REMOVE
+        },
+        "sum_matches": (remove_to_add + add_to_remove) == total,
+    }
+
+
 async def log_playersync_rollback_event(
     *,
     actor_id,

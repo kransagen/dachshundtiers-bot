@@ -360,7 +360,8 @@ v `.env` (viz `.env.example`):
 | `GUILD_ID` | Scope registrace příkazů. **Nastaveno** → příkazy se synchronizují jen do této guildy (produkce na jednom serveru). **Prazdné** → jen globálně (dev/testing). Scopy se nikdy nemíchají, takže duplicity nevznikají. |
 | `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |
 | `GITHUB_*` | Volitelná synchronizace `players.json` na GitHub. |
-| `DATABASE_URL` | Volitelný PostgreSQL backend, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot používá stávající JSON soubory. |
+| `DATABASE_URL` | Volitelný PostgreSQL backend, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Má přednost před jednotlivými `DB_*` hodnotami. |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL`: vyplň všech pět hodnot a bot si připojovací URL sestaví automaticky. |
 
 > Kanál panelu fronty pro kit se dá nastavit i za běhu přes `/addqchannel`
 > (ukládá se do `data/queue_channels.json` a má přednost před env i defaulty).

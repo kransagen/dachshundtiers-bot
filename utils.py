@@ -6,7 +6,7 @@ from datetime import datetime
 import discord
 from discord import app_commands
 
-from services.permissions import has_admin_role, has_tester_role as _permissions_has_tester_role
+from services.permissions import has_tester_role as _permissions_has_tester_role
 from storage import data_path, load_data, save_data
 
 # Výchozí sada kitů (použije se, dokud neexistuje data/kits.json)
@@ -22,11 +22,61 @@ DEFAULT_KITS = [
 
 
 def get_kits():
-    """Registrované kity z ``data/kits.json`` (nebo výchozí seznam)."""
+    """Registrované kity z ``data/kits.json`` (nebo výchozí seznam).
+
+    Názvy kitů se SJEDNOCUJÍ case-insensitive: case-duplicity v souboru
+    („MolePVP" + „molepvp") se sloučí – zůstane první výskyt. Tím se
+    sjednotí autocomplete, selecty i ``kit_display_map`` napříč cogami.
+    """
     if not os.path.exists(data_path("kits.json")):
         return list(DEFAULT_KITS)
     raw = load_data("kits.json", [])
-    return [k for k in raw if isinstance(k, str) and k.strip()] or []
+    seen = set()
+    out = []
+    for k in raw:
+        if not isinstance(k, str) or not k.strip():
+            continue
+        key = k.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(k.strip())
+    return out
+
+
+def canonical_kit_name(kit: str) -> str:
+    """Kanonický (display-case) název kitu z kits.json.
+
+    Registrovaný kit (case-insensitive) → oficiální název („molepvp" →
+    „MolePVP"). Nezaregistrovaný → původní vstup (našeptávání /result kity
+    registruje samo). Používá se pro JEDNOTNÉ klíče v ``modes`` / ``history``.
+    """
+    kit = (kit or "").strip()
+    if not kit:
+        return kit
+    target = kit.lower()
+    for name in get_kits():
+        if name.lower() == target:
+            return name
+    return kit
+
+
+def migrate_mode_keys(mapping: dict, kit: str) -> str:
+    """Kanonický klíč kitu v mapping (modes/history) + migrace case-klíče.
+
+    Existující klíč s jiným case („MolePVP" vs „molepvp") se bezeztrátově
+    přejmenuje na kanonický název kitu – NIKDY nevzniknou dva klíče jednoho
+    kitu. Nový klíč se zapíše už jako kanonický. Vrací klíč k zápisu.
+    """
+    canonical = canonical_kit_name(kit)
+    if not canonical:
+        return ""
+    for key in list(mapping.keys()):
+        if str(key).strip().lower() == canonical.lower():
+            if str(key) != canonical:
+                mapping[canonical] = mapping.pop(key)
+            return canonical
+    return canonical
 
 
 async def kit_autocomplete(

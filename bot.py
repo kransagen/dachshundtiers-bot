@@ -133,23 +133,36 @@ async def sync_commands(
     }
 
 
+def _build_intents() -> discord.Intents:
+    """Intenty bota pro celý Discord server.
+
+    ``members`` je PRIVILEGOVANÝ intent – musí být zapnutý i v Developer
+    Portálu aplikace (Bot → Privileged Gateway Intents). Bez něj
+    ``guild.get_member()`` vrací None (prázdná cache členů), což rozbíjí
+    synchronizaci rolí a lookupy členů napříč cogami.
+    """
+    intents = discord.Intents.default()
+    intents.guilds = True
+    intents.guild_messages = True
+    intents.message_content = True  # jako v originále
+    intents.members = True  # privileged – zapnout v portálu (viz README)
+    return intents
+
+
 class DachshundTiersBot(commands.Bot):
     def __init__(self):
-        intents = discord.Intents.default()
-        intents.guilds = True
-        intents.guild_messages = True
-        intents.message_content = True  # jako v originále
-
         super().__init__(
             command_prefix="!",
-            intents=intents,
+            intents=_build_intents(),
             tree_cls=DachshundTiersTree,
             allowed_mentions=discord.AllowedMentions(
                 everyone=True, users=True, roles=True
             ),
         )
-        # Synchronizace příkazů běží přesně jednou za běh procesu.
+        # Synchronizace příkazů běží přesně jednou za běh procesu (viz
+        # ``_sync_commands_once``); lock chrání před souběžnými on_ready.
         self._commands_synced = False
+        self._sync_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         # Načtení cogů
@@ -179,27 +192,37 @@ class DachshundTiersBot(commands.Bot):
         guildům) – bez guardu by se každý reconnect zbytečně přepisoval celý
         command set. Samotná synchronizace je přitom deterministická a
         idempotentní (viz ``sync_commands``), takže žádné duplicity nevznikají.
+
+        Race conditions, které tohle řešení potlačuje:
+        - souběžné ``on_ready`` události by spustily sync dvakrát (asyncio.Lock
+          + dvojitá kontrola flagu),
+        - selhání synchronizace (rate limit, odpojení) NESMÍ označit sync za
+          „hotový" – flag se nastaví až po úspěchu, takže se sync zkusí znovu
+          při dalším ``on_ready`` místo tichého provozu bez příkazů.
         """
         if self._commands_synced:
             return
-        self._commands_synced = True
-        try:
-            info = await sync_commands(self.tree, guild_id=GUILD_ID)
-            extra = ""
-            if info["scope"] == "guild":
-                removed = ", ".join(info["removed_guild"]) or "žádné"
-                extra = (
-                    f" [guild {info['guild_id']}, "
-                    f"odstraněno {len(info['removed_guild'])} obsolete: {removed}]"
+        async with self._sync_lock:
+            if self._commands_synced:
+                return
+            try:
+                info = await sync_commands(self.tree, guild_id=GUILD_ID)
+                self._commands_synced = True
+                extra = ""
+                if info["scope"] == "guild":
+                    removed = ", ".join(info["removed_guild"]) or "žádné"
+                    extra = (
+                        f" [guild {info['guild_id']}, "
+                        f"odstraněno {len(info['removed_guild'])} obsolete: {removed}]"
+                    )
+                log.info(
+                    "Synchronizováno %d slash příkazů [scope=%s]%s",
+                    info["synced"],
+                    info["scope"],
+                    extra,
                 )
-            log.info(
-                "Synchronizováno %d slash příkazů [scope=%s]%s",
-                info["synced"],
-                info["scope"],
-                extra,
-            )
-        except Exception as err:  # noqa: BLE001
-            log.error("Chyba při synchronizaci příkazů: %s", err)
+            except Exception as err:  # noqa: BLE001
+                log.error("Chyba při synchronizaci příkazů: %s", err)
 
     async def on_ready(self) -> None:
         log.info("Bot %s (ID: %s) je online!", self.user, self.user.id)

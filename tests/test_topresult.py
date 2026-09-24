@@ -354,6 +354,56 @@ class RecordHTFightFreeTests(unittest.TestCase):
             self.assertEqual(fights[0]["resultType"], "ht_fight")
         asyncio.run(main())
 
+    def test_identical_free_result_within_window_is_duplicate(self):
+        """Dvojklik / dvakrát odeslaný identický zápas → duplicate (item 10)."""
+        async def main():
+            first = await self._record()
+            self.assertEqual(first["result"], "created")
+            again = await self._record(now=NOW + 60_000)  # stejný zápas +1 min
+            self.assertEqual(again["result"], "duplicate")
+            self.assertEqual(again["existing"]["id"], first["record"]["id"])
+            # historie pořád obsahuje JEN první záznam
+            hist = storage.load_data(results.HT_RESULTS_FILE, {})
+            self.assertEqual(len(hist), 1)
+        asyncio.run(main())
+
+    def test_different_score_is_not_duplicate(self):
+        async def main():
+            await self._record(score="0-4", outcome="Lost")
+            other = await self._record(now=NOW + 10_000, score="2-4", outcome="Lost")
+            self.assertEqual(other["result"], "created")
+            self.assertEqual(
+                len(storage.load_data(results.HT_RESULTS_FILE, {})), 2
+            )
+        asyncio.run(main())
+
+    def test_duplicate_outside_window_allowed(self):
+        """Stejný zápas po 2h okně je nový záznam (okno už neplatí)."""
+        async def main():
+            await self._record()
+            late = await self._record(now=NOW + topresult.HT_FIGHT_DEDUP_WINDOW_MS + 1)
+            self.assertEqual(late["result"], "created")
+            self.assertEqual(
+                len(storage.load_data(results.HT_RESULTS_FILE, {})), 2
+            )
+        asyncio.run(main())
+
+    def test_ticket_result_never_dedups_free_result(self):
+        """Záznam z ticketu (ticketId) se neškrtá s volnými – vlastní režim."""
+        async def main():
+            storage.save_data(
+                tickets.HT_TICKETS_FILE,
+                {"2001": _fight_ticket(channel_id=2001)},
+            )
+            ticket_rec = await self._record(ticket_id=2001, now=NOW)
+            self.assertEqual(ticket_rec["result"], "created")
+            free_rec = await self._record(now=NOW + 60_000)
+            self.assertEqual(free_rec["result"], "created")
+            self.assertEqual(
+                len(storage.load_data(results.HT_RESULTS_FILE, {})), 2
+            )
+        asyncio.run(main())
+
 
 class RecordHTFightTicketTests(unittest.TestCase):
     """HT Fight výsledek uvnitř HT Fight ticketu."""

@@ -16,9 +16,11 @@ Pokrývají Phase 3 požadavky:
 import asyncio
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import storage
+from cogs.results import Results
 from services import results, tickets
 
 NOW = 1_700_000_000_000
@@ -513,3 +515,156 @@ class RecordResultConcurrencyTests(unittest.TestCase):
             self.assertEqual((r1["result"], r2["result"]), ("created", "created"))
             self.assertEqual(len(storage.load_data(results.HT_RESULTS_FILE, {})), 2)
         asyncio.run(main())
+
+
+class ResultCogSelfResultTests(unittest.TestCase):
+    """item 6: tester si NEMŮŽE zapsat výsledek sám sobě (admin ano)."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _interaction(self, user_id):
+        inter = mock.MagicMock()
+        inter.user = SimpleNamespace(
+            id=user_id,
+            name="tester",
+            display_name="tester",
+            roles=[SimpleNamespace(id=777, name="Tester")],
+            guild_permissions=SimpleNamespace(administrator=False),
+        )
+        inter.guild = mock.MagicMock()
+        inter.channel = mock.MagicMock()  # mimo HT ticket → queue cesta
+        inter.response.send_message = mock.AsyncMock()
+        inter.response.defer = mock.AsyncMock()
+        inter.followup.send = mock.AsyncMock()
+        return inter
+
+    def _call(self, cog, inter, hrac):
+        async def main():
+            await cog.result.callback(
+                cog,
+                interaction=inter,
+                hrac=hrac,
+                ign="AliceMC",
+                kit="AnchorPvP",
+                tier="LT3",
+                score="3:1",
+                outcome="WON",
+            )
+
+        asyncio.run(main())
+
+    def test_tester_cannot_record_own_result(self):
+        cog = Results.__new__(Results)
+        inter = self._interaction(user_id=777)
+        hrac = SimpleNamespace(id=777, name="AliceMC", display_name="AliceMC")
+
+        with mock.patch("cogs.results.has_tester_role", return_value=True), \
+             mock.patch("cogs.results.has_admin_role", return_value=False):
+            self._call(cog, inter, hrac)
+
+        inter.response.send_message.assert_awaited_once_with(
+            "❌ Nemůžeš zapisovat výsledek sám sobě.", ephemeral=True
+        )
+        inter.response.defer.assert_not_awaited()
+
+    def test_tester_can_record_other_players_result(self):
+        """Jiný hráč → guard propustí do hlavního toku (defer → validace)."""
+        cog = Results.__new__(Results)
+        inter = self._interaction(user_id=777)
+        hrac = SimpleNamespace(id=999, name="BobMC", display_name="BobMC")
+
+        with mock.patch("cogs.results.has_tester_role", return_value=True), \
+             mock.patch("cogs.results.has_admin_role", return_value=False), \
+             mock.patch(
+                 "cogs.results.validate_result_tier",
+                 return_value=(False, "test-stop"),
+             ):
+            self._call(cog, inter, hrac)
+
+        # guard prošel → flow pokročil za self-result kontrolu
+        inter.response.defer.assert_awaited_once()
+        self.assertEqual(
+            inter.response.send_message.await_count, 0,
+            "self-result hláška se nesmí poslat",
+        )
+        inter.followup.send.assert_awaited_once_with("test-stop", ephemeral=True)
+
+    def test_admin_may_record_own_result(self):
+        """Admin (jiný subjekt dohledu) smí zapsat i sobě."""
+        cog = Results.__new__(Results)
+        inter = self._interaction(user_id=777)
+        hrac = SimpleNamespace(id=777, name="AliceMC", display_name="AliceMC")
+
+        with mock.patch("cogs.results.has_tester_role", return_value=True), \
+             mock.patch("cogs.results.has_admin_role", return_value=True), \
+             mock.patch(
+                 "cogs.results.validate_result_tier",
+                 return_value=(False, "test-stop"),
+             ):
+            self._call(cog, inter, hrac)
+
+        inter.response.defer.assert_awaited_once()
+        self.assertEqual(inter.response.send_message.await_count, 0)
+
+
+class CanonicalKitKeyTests(unittest.TestCase):
+    """item 8: apply_result_to_players píše modes/history pod kanonickým
+    (display-case) názvem kitu z kits.json – žádné case-duplicitní klíče."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+        storage.save_data("kits.json", ["MolePVP"])
+
+    def test_new_result_written_under_canonical_case(self):
+        players, prev = results.apply_result_to_players(
+            [], "alice", "molepvp", "LT3", "23.09.2026"
+        )
+        self.assertEqual(prev, "N/A")
+        self.assertIn("MolePVP", players[0]["modes"])
+        self.assertNotIn("molepvp", players[0]["modes"])
+        self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
+        self.assertEqual(players[0]["history"]["MolePVP"][-1]["tier"], "LT3")
+
+    def test_existing_variant_key_migrated_without_data_loss(self):
+        src = [{
+            "username": "alice",
+            "modes": {"molepvp": "LT3"},
+            "history": {"molepvp": [{"date": "01.01.2026", "tier": "LT3"}]},
+        }]
+        players, prev = results.apply_result_to_players(
+            src, "alice", "molepvp", "HT3", "24.09.2026"
+        )
+        self.assertEqual(prev, "LT3")  # stará hodnota se našla přes migraci
+        self.assertEqual(players[0]["modes"], {"MolePVP": "HT3"})
+        self.assertEqual(
+            players[0]["history"]["MolePVP"],
+            [
+                {"date": "01.01.2026", "tier": "LT3"},
+                {"date": "24.09.2026", "tier": "HT3"},
+            ],
+        )
+        self.assertNotIn("molepvp", players[0]["history"])
+
+    def test_never_creates_duplicate_keys_for_same_kit(self):
+        src = [{
+            "username": "alice",
+            "modes": {"MolePVP": "HT3"},
+            "history": {"MolePVP": [{"date": "01.01.2026", "tier": "HT3"}]},
+        }]
+        players, prev = results.apply_result_to_players(
+            src, "alice", "molepvp", "LT3", "25.09.2026"
+        )
+        self.assertEqual(prev, "HT3")
+        self.assertEqual(list(players[0]["modes"].keys()), ["MolePVP"])
+        self.assertEqual(list(players[0]["history"].keys()), ["MolePVP"])
+
+
+if __name__ == "__main__":
+    unittest.main()

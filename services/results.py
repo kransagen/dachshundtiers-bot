@@ -43,6 +43,7 @@ from services.tickets import (
     STATUS_CLOSED,
     STATUS_OPEN,
 )
+from utils import migrate_mode_keys
 
 log = logging.getLogger("dachshundtiers")
 
@@ -187,11 +188,17 @@ def apply_result_to_players(
     previous = "N/A"
     player.setdefault("modes", {})
     player.setdefault("history", {})
-    if player["modes"].get(kit):
-        previous = str(player["modes"][kit]).upper()
-    player["history"].setdefault(kit, [])
-    player["modes"][kit] = new_tier
-    player["history"][kit].append({"date": current_date, "tier": new_tier})
+    # Sjednocení názvů kitů: klíče modes/history jdou POUZE pod kanonickým
+    # (display-case) názvem kitu z kits.json. Existující klíč s jiným case se
+    # migruje bezeztrátově – nikdy nevzniknou dva klíče jednoho kitu
+    # („MolePVP" i „molepvp").
+    kit_key = migrate_mode_keys(player["modes"], kit)
+    migrate_mode_keys(player["history"], kit)
+    if player["modes"].get(kit_key):
+        previous = str(player["modes"][kit_key]).upper()
+    player["history"].setdefault(kit_key, [])
+    player["modes"][kit_key] = new_tier
+    player["history"][kit_key].append({"date": current_date, "tier": new_tier})
     return players, previous
 
 

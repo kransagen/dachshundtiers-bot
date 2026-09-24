@@ -20,6 +20,8 @@ import storage
 from services import datacheck
 from services.datacheck import (
     canonical_tier,
+    check_duplicate_kit_names,
+    check_duplicate_modes_keys,
     check_duplicate_players,
     check_duplicate_testers,
     check_eval_references,
@@ -309,7 +311,8 @@ class PureCheckTests(unittest.TestCase):
             "222": _ticket("222", status="closed"),
             "333": _ticket("333", status="open"),
         }
-        exists = lambda cid: cid != "333"  # kanál 333 smazaný
+        def exists(cid):  # kanál 333 smazaný
+            return cid != "333"
         findings = check_orphaned_tickets(tickets, channel_exists=exists)
         self.assertEqual(len(findings), 1)
         f = findings[0]
@@ -354,6 +357,46 @@ class PureCheckTests(unittest.TestCase):
         self.assertEqual(findings[0]["severity"], "error")
 
 
+class DuplicateKitChecksTests(unittest.TestCase):
+    """item 8: report-only nálezy case-duplicit kitů (kits.json / modes).
+
+    Sloučení řeší utils.get_kits a services.results.apply_result_to_players;
+    tyto kontroly JEN reportují stav, nic automaticky neopravují.
+    """
+
+    def test_duplicate_kit_names(self):
+        findings = check_duplicate_kit_names(
+            ["MolePVP", "molepvp", "AnchorPvP", "MolePvP", ""]
+        )
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f["kind"], "duplicate_kit_names")
+        self.assertEqual(f["severity"], "warning")
+        self.assertIsNone(f["repair"])  # report-only
+        self.assertIn("MolePVP", f["message"])
+        self.assertIn("MolePvP", f["message"])
+
+    def test_duplicate_kit_names_clean(self):
+        self.assertEqual(check_duplicate_kit_names(["MolePVP", "AnchorPvP"]), [])
+
+    def test_duplicate_modes_keys(self):
+        players = [
+            _player("alice", {"MolePVP": "HT3", "molepvp": "LT3"}),
+            _player("bob", {"AnchorPvP": "HT3"}),
+        ]
+        findings = check_duplicate_modes_keys(players)
+        self.assertEqual(len(findings), 1)
+        f = findings[0]
+        self.assertEqual(f["kind"], "duplicate_modes_keys")
+        self.assertIsNone(f["repair"])
+        self.assertIn("alice", f["message"].lower())
+        self.assertIn("molepvp", f["message"].lower())
+
+    def test_duplicate_modes_keys_skips_non_dict(self):
+        findings = check_duplicate_modes_keys(["garbage", {"username": "x"}])
+        self.assertEqual(findings, [])
+
+
 class RunDataCheckTests(unittest.TestCase):
     """End-to-end kontrola ze souborů v temp DATA_DIR + audit log."""
 
@@ -393,6 +436,8 @@ class RunDataCheckTests(unittest.TestCase):
                 _player("ALICE", {"IronAxe": " lt3 "}),  # duplicita + nekanonický
                                                          # tier + bez historie
                 _player("Retired", {"AnchorPvP": "RLT2"}),   # retired v modes
+                _player("MixedKits", {"AnchorPvP": "HT3", "anchorpvp": "LT3"}),
+                                                   # dup mode keys (case)
                 _player("Dup1", discord_id="42"),            # duplicitní discordId
                 _player("Dup2", discord_id="42"),
             ],
@@ -415,17 +460,18 @@ class RunDataCheckTests(unittest.TestCase):
             },
         )
         self._write("kit_roles.json", {"a": {"HT3": "101"}, "b": {"LT2": "101"}})
-        self._write("kits.json", ["AnchorPvP"])
+        self._write("kits.json", ["AnchorPvP", "anchorpvp"])  # dup názvy (case)
         self._write("testers.json", ["111", "111"])
 
-        exists = lambda cid: cid != "4"
+        def exists(cid):
+            return cid != "4"
 
         async def main():
             report = await datacheck.run_datacheck(
                 channel_exists=exists, now=5,
             )
             self.assertTrue(report["has_issues"])
-            # všechny kategorie (11) aspoň jednou
+            # všechny kategorie (13) aspoň jednou
             for kind in datacheck.KINDS:
                 self.assertGreaterEqual(
                     report["summary"][kind], 1, f"{kind} nebyl detekován"

@@ -72,6 +72,12 @@ HT_FIGHT_TICKET_KEY_SUFFIX = ":ht_fight"
 # Klíč HT Fight výsledku mimo ticket (unikatní podle času zápisu).
 HT_FIGHT_RESULT_PREFIX = "htfight-"
 
+# Ochrana před duplicitou VOLNÝCH HT Fight výsledků: identický záznam
+# (stejný hráč + kit + fight tier + status + skóre + outcome + soupeř) v tomto
+# okně se považuje za duplicitní odeslání (dvojklik / dvakrát odeslaný zápas)
+# a NEPOŠLE se dvakrát. Každý jiný zápas (jiné skóre/soupeř/status) projde.
+HT_FIGHT_DEDUP_WINDOW_MS = 2 * 60 * 60 * 1000  # 2 hodiny
+
 # Skóre ve formátu používaném serverem: "0-4" (body hráče - body soupeře).
 # Nepovolujeme "abc", "4", "4-", "-4" ani "4-x".
 SCORE_RE = re.compile(r"^\d+-\d+$")
@@ -107,6 +113,58 @@ _MSG_BRIDGE_NOT_HIGHER = (
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _find_recent_ht_fight_duplicate(
+    results: dict,
+    player_id: str,
+    *,
+    kit: str,
+    fight_tier: str,
+    score: str,
+    outcome: str,
+    opponent_id,
+    tier_status: str,
+    now: int,
+):
+    """Volný HT Fight záznam identický s tímto odesláním (dedup), nebo None.
+
+    Porovnává POUZE volné záznamy (žádný ticketId – ticket režim má vlastní
+    idempotenci podle klíče) v časovém okně ``HT_FIGHT_DEDUP_WINDOW_MS``.
+    Vrací existující záznam, jinak ``None``.
+    """
+    kit_low = (kit or "").strip().lower()
+    ft = (fight_tier or "").strip().upper()
+    sc = (score or "").strip().lower()
+    oc = (outcome or "").strip()
+    op = str(opponent_id or "").strip()
+    ts = (tier_status or "").strip().upper()
+    for record in results.values():
+        if not isinstance(record, dict):
+            continue
+        if record.get("resultType") != "ht_fight":
+            continue
+        if record.get("ticketId"):
+            continue
+        if str(record.get("playerId", "")).strip() != str(player_id).strip():
+            continue
+        stamp = record.get("timestamp") or 0
+        if not stamp or now - int(stamp) > HT_FIGHT_DEDUP_WINDOW_MS:
+            continue
+        if str(record.get("kit", "")).strip().lower() != kit_low:
+            continue
+        if str(record.get("fightTier", "")).strip().upper() != ft:
+            continue
+        if str(record.get("score", "")).strip().lower() != sc:
+            continue
+        if str(record.get("outcome", "")).strip() != oc:
+            continue
+        if str(record.get("opponentId", "") or "").strip() != op:
+            continue
+        if str(record.get("tierStatus", "")).strip().upper() != ts:
+            continue
+        return record
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -317,8 +375,9 @@ async def record_ht_fight(
     - hráč musí být vlastníkem, kit musí sedět,
     - druhé odeslání vrátí ``duplicate`` s existujícím záznamem.
 
-    ``ticket_id=None`` → volný HT Fight výsledek (klíč ``htfight-{hráč}-{čas}``),
-    žádná deduplikace (každý zápas je samostatný).
+    ``ticket_id=None`` → volný HT Fight výsledek (klíč ``htfight-{hráč}-{čas}``);
+    identické opakované odeslání ve volném režimu se dedupuje přes
+    ``_find_recent_ht_fight_duplicate`` (2h okno, fingerprint zápasu).
 
     Vrací:
       - ``{"result": "created", "record": {...}, "previous_tier": ...}``
@@ -395,6 +454,21 @@ async def record_ht_fight(
                 return {"result": "wrong_kit", "ticket": ticket}
             result_id = key
         else:
+            # Volný HT Fight výsledek: ochrana před duplicitou (dvojklik /
+            # dvakrát odeslaný identický zápas) – viz _find_recent_ht_fight_duplicate.
+            dup = _find_recent_ht_fight_duplicate(
+                results,
+                player_id,
+                kit=kit,
+                fight_tier=fight_tier,
+                score=score_clean,
+                outcome=outcome_clean,
+                opponent_id=opponent_id,
+                tier_status=status_clean,
+                now=now,
+            )
+            if dup is not None:
+                return {"result": "duplicate", "existing": dup}
             result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
 
         players = tx.get("players.json", [])

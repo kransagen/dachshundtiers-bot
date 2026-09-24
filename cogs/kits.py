@@ -10,8 +10,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import set_queue_channel_id
+from services.permissions import has_admin_role
 from storage import load_data
-from utils import add_kit, get_kits, has_admin_role, has_tester_role, kit_autocomplete, remove_kit
+from utils import add_kit, get_kits, has_tester_role, kit_autocomplete, remove_kit
 from views import HT3PanelView
 
 HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"

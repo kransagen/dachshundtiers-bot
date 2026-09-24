@@ -17,8 +17,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import TOP_RESULT_ROLE_ID, TOURNAMENT_RESULT_CHANNEL_ID
+from cogs._shared import admin_gate_error
 from storage import load_data, save_data
-from utils import DEFAULT_KITS, get_kits, kit_autocomplete
+from utils import get_kits, has_tester_role, kit_autocomplete
 from views import TournamentSignupView
 
 TOURNAMENT_TIERS = ["LT3", "HT3", "LT2", "HT2", "LT1", "HT1"]
@@ -167,6 +168,9 @@ class Tournaments(commands.Cog):
         kit: str,
         tier: str,
     ) -> None:
+        if (msg := admin_gate_error(interaction)) is not None:
+            return await interaction.response.send_message(msg, ephemeral=True)
+
         kit_key = kit.lower()
         tournaments = load_data("tournaments.json", {})
 
@@ -267,6 +271,15 @@ class Tournaments(commands.Cog):
         z_tieru: str,
         na_tier: str,
     ) -> None:
+        if not has_tester_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro testery.", ephemeral=True
+            )
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+
         target_channel = interaction.guild.get_channel(TOURNAMENT_RESULT_CHANNEL_ID)
         if target_channel is None:
             try:
@@ -320,6 +333,9 @@ class Tournaments(commands.Cog):
     @app_commands.describe(kit="Kit turnaje ke smazání")
     @app_commands.autocomplete(kit=kit_autocomplete)
     async def deleteturnaj(self, interaction: discord.Interaction, kit: str) -> None:
+        if (msg := admin_gate_error(interaction)) is not None:
+            return await interaction.response.send_message(msg, ephemeral=True)
+
         kit_key = kit.lower()
         tournaments = load_data("tournaments.json", {})
 

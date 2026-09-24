@@ -25,9 +25,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from services.permissions import has_admin_role, has_tester_role
 from services.store import transaction
 from storage import load_data
-from utils import has_admin_role, has_tester_role, kit_autocomplete
+from utils import kit_autocomplete
 
 log = logging.getLogger("dachshundtiers")
 

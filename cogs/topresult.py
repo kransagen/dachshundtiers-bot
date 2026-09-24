@@ -296,12 +296,21 @@ class TopResult(commands.Cog):
         r = record["result"]
         if r == "duplicate":
             existing = record.get("existing") or {}
-            return await interaction.followup.send(
-                "❌ Výsledek pro tento HT Fight ticket už byl zaznamenán "
-                f"(idempotentně – nic se nemění; skóre {existing.get('score') or '?'} "
-                f"dne {existing.get('date') or '?'}).",
-                ephemeral=True,
-            )
+            score_txt = existing.get("score") or "?"
+            date_txt = existing.get("date") or "?"
+            if ticket is not None:
+                msg = (
+                    "❌ Výsledek pro tento HT Fight ticket už byl zaznamenán "
+                    f"(idempotentně – nic se nemění; skóre {score_txt} "
+                    f"dne {date_txt})."
+                )
+            else:
+                msg = (
+                    "❌ Identický HT Fight výsledek pro tohoto hráče už byl "
+                    f"zaznamenán (duplicitní odeslání – nic se nemění; skóre "
+                    f"{score_txt} dne {date_txt})."
+                )
+            return await interaction.followup.send(msg, ephemeral=True)
         if r == "not_found":
             return await interaction.followup.send(
                 "❌ Tento kanál není HT ticket.", ephemeral=True

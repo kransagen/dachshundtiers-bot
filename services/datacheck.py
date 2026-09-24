@@ -10,6 +10,8 @@ nic se nekopíruje do druhé databáze) a hlásí problémy:
   - conflicting_discord_roles   – jedna role namapovaná na víc (kit, tier)
   - missing_website_records     – modes má kit, ale chybí historie (web by byl neúplný)
   - invalid_eval_references     – evals.json ukazuje na neznámý kit / neexistujícího hráče
+  - duplicate_kit_names         – kits.json: stejný kit s jiným case („MolePVP" i „molepvp")
+  - duplicate_modes_keys        – players.json: jeden kit zapsaný 2× v modes pod jiným case
   - orphaned_tickets            – ticket, jehož kanál už neexistuje / poškozený záznam
   - orphaned_results            – výsledek bez hráče v players.json / bez ticketu
 
@@ -42,6 +44,8 @@ KINDS = (
     "orphaned_results",
     "retired_tiers_in_modes",
     "duplicate_player_discord_ids",
+    "duplicate_kit_names",
+    "duplicate_modes_keys",
 )
 
 KIND_LABELS = {
@@ -56,6 +60,8 @@ KIND_LABELS = {
     "orphaned_results": "📋 Osamocené výsledky",
     "retired_tiers_in_modes": "🧓 Retired tiery v modes",
     "duplicate_player_discord_ids": "🆔 Duplicitní discordId hráčů",
+    "duplicate_kit_names": "🔁 Duplicitní názvy kitů",
+    "duplicate_modes_keys": "🔁 Duplicitní klíče kitů v modes",
 }
 
 # Známý vesmír tierů: žebříček + aliasy LT3-evalu + turnajové S/A/B + R-tiery.
@@ -370,6 +376,66 @@ def check_player_discord_ids(players: list) -> list:
     return out
 
 
+def check_duplicate_kit_names(kits: list) -> list:
+    """Case-insensitive duplicity v kits.json („MolePVP" + „molepvp").
+
+    Report-only: sloučení dělá ``utils.get_kits`` (dedup), vstupní data se
+    nemění automaticky – první výskyt je kanonický (display-case) název.
+    """
+    groups: dict[str, list] = {}
+    for i, k in enumerate(kits or []):
+        key = _normalize_key(k)
+        if not key:
+            continue
+        groups.setdefault(key, []).append((i, str(k)))
+    out = []
+    for key, entries in sorted(groups.items()):
+        if len(entries) > 1:
+            names = ", ".join(f"`{n}`" for _, n in entries)
+            out.append(
+                _finding(
+                    "duplicate_kit_names",
+                    "warning",
+                    f"🔁 Kit **{key}** je v kits.json {len(entries)}× s jiným case: "
+                    f"{names}. Zůstane první výskyt (kanonický název), ostatní "
+                    "se odvodí case-insensitive – oprava je bezeztrátová, "
+                    "nic se nemění automaticky.",
+                )
+            )
+    return out
+
+
+def check_duplicate_modes_keys(players: list) -> list:
+    """Duplicitní klíče jednoho kitu v modes hráče („MolePVP" i „molepvp").
+
+    Vzniká historicky, když psali kity různé cog A s jiným case. Report-only:
+    nové zápisy už jdou pod kanonickým názvem (services/results
+    ``apply_result_to_players``), existující data se nemění automaticky.
+    """
+    out = []
+    for p in (players or []):
+        if not isinstance(p, dict):
+            continue
+        username = _username(p)
+        modes = p.get("modes") if isinstance(p.get("modes"), dict) else {}
+        groups: dict[str, list] = {}
+        for key, value in modes.items():
+            groups.setdefault(_normalize_key(key), []).append((str(key), value))
+        for kit_low, entries in sorted(groups.items()):
+            if len(entries) > 1:
+                detail = ", ".join(f"`{k}` = `{v}`" for k, v in entries)
+                out.append(
+                    _finding(
+                        "duplicate_modes_keys",
+                        "warning",
+                        f"🔁 **{username}** má kit **{kit_low}** {len(entries)}× "
+                        f"v modes: {detail}. Sloučit na jeden klíč (návrh: "
+                        "/edituser) – nic se nemění automaticky.",
+                    )
+                )
+    return out
+
+
 def check_eval_references(evals: dict, players: list, kits: list) -> list:
     player_igns = {_normalize_key(_username(p)) for p in (players or []) if isinstance(p, dict)}
     kit_keys = {_normalize_key(k) for k in (kits or [])}
@@ -560,6 +626,8 @@ async def run_datacheck(
     findings += check_missing_website_records(players)
     findings += check_retired_tiers_in_modes(players)
     findings += check_player_discord_ids(players)
+    findings += check_duplicate_kit_names(kits)
+    findings += check_duplicate_modes_keys(players)
     findings += check_eval_references(evals, players, kits)
     findings += check_orphaned_tickets(tickets, channel_exists=channel_exists)
     findings += check_orphaned_results(results, players, tickets)

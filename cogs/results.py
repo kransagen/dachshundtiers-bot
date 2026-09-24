@@ -24,6 +24,7 @@ from config import (
     get_result_channel_id,
 )
 from panel import update_panel
+from services.permissions import has_admin_role
 from services.queue_service import leave_queue, remove_pulled_player
 from services.results import (
     EVAL_TIER,
@@ -37,7 +38,6 @@ from storage import load_data
 from utils import (
     add_kit,
     get_kits,
-    has_admin_role,
     has_tester_role,
     kit_autocomplete,
     month_key,
@@ -165,6 +165,17 @@ class Results(commands.Cog):
     ) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+        # Self-result: tester si NEMŮŽE zapisovat výsledek sám sobě – tester
+        # hraje PROTI hráči, který je testovaný. Admini (jiný subjekt dohledu)
+        # můžou zapsat i sobě, tester ne.
+        if hrac.id == interaction.user.id and not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Nemůžeš zapisovat výsledek sám sobě.", ephemeral=True
+            )
 
         # Défer hned napřed – stejně jako originál (index.ts: deferReply),
         # abychom se vešli do 3s okna Discord i přes fetch roomky / kanálu.

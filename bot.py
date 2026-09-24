@@ -73,11 +73,8 @@ class DachshundTiersBot(commands.Bot):
             "cogs.tournaments",
             "cogs.kits",
             "cogs.roles",
-            "cogs.playersync",
-            "cogs.websync",
-            "cogs.checkweb",
+            "cogs.sync",
             "cogs.topresult",
-            "cogs.datacheck",
             "cogs.info",
             "cogs.edituser",
         ]

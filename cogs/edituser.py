@@ -40,6 +40,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS
+from cogs._shared import apply_role_actions, kit_display_map, member_to_dict
 from services import edituser as edituser_service
 from services.edituser import (
     STATUS_FAILURE,
@@ -62,7 +63,6 @@ from services.player_identity import (
 )
 from services.permissions import has_admin_role
 from services.queue_service import cooldown_remaining
-from services.role_sync import make_member
 from services.websync import sync_website
 from storage import load_data
 from utils import DEFAULT_KITS, get_kits
@@ -77,12 +77,7 @@ KIT_ROLES_FILE = "kit_roles.json"
 # Pomocné funkce (embed + data)
 # ---------------------------------------------------------------------------
 def _member_to_dict(member) -> dict:
-    return make_member(
-        member.id,
-        member.display_name,
-        {str(r.id) for r in member.roles},
-        extra_names=[member.name, member.nick],
-    )
+    return member_to_dict(member)
 
 
 def _current_tier(player: dict, kit_key: str) -> str:
@@ -1092,48 +1087,12 @@ class EditUser(commands.Cog):
     # Discord role (RoleSyncService, best effort) – používá ConfirmEditView
     # ------------------------------------------------------------------
     async def _apply_roles(self, guild: discord.Guild, actions: list) -> list:
-        """Aplikuje akce (add/remove rolí); každá akce se vyhodnotí zvlášť."""
-        applied = []
-        for action in actions:
-            member_id = str(action.get("member_id") or "")
-            role_id = str(action.get("role_id") or "")
-            record = {
-                "op": action.get("op"),
-                "roleId": role_id,
-                "memberId": member_id,
-                "kit": action.get("kit") or "",
-                "tier": action.get("tier") or "",
-                "ok": False,
-                "error": None,
-            }
-            member = None
-            if member_id.isdigit():
-                member = guild.get_member(int(member_id))
-                if member is None:
-                    try:
-                        member = await guild.fetch_member(int(member_id))
-                    except (
-                        discord.NotFound,
-                        discord.Forbidden,
-                        discord.HTTPException,
-                    ):
-                        member = None
-            role = guild.get_role(int(role_id)) if role_id.isdigit() else None
-            if member is None:
-                record["error"] = "člen není na serveru"
-            elif role is None:
-                record["error"] = "role neexistuje"
-            else:
-                try:
-                    if action.get("op") == "add":
-                        await member.add_roles(role)
-                    else:
-                        await member.remove_roles(role)
-                    record["ok"] = True
-                except (discord.Forbidden, discord.HTTPException) as err:
-                    record["error"] = str(err)
-            applied.append(record)
-        return applied
+        """Aplikuje akce (add/remove rolí); každá akce se vyhodnotí zvlášť.
+
+        Sdílená implementace v ``cogs/_shared.apply_role_actions`` (stejný kód
+        jako /sync discord) – žádná duplicita role-plan aplikace.
+        """
+        return await apply_role_actions(guild, actions)
 
     async def _role_context(self, guild: discord.Guild, player_id: str) -> dict:
         """Kontext pro plán role syncu (normalizovaný member + mapování rolí)."""
@@ -1153,7 +1112,7 @@ class EditUser(commands.Cog):
         return {
             "member": member_dict,
             "roles_map": load_data(KIT_ROLES_FILE, {}) or {},
-            "kit_display": {str(k).lower(): str(k) for k in get_kits()},
+            "kit_display": kit_display_map(),
         }
 
 

@@ -79,6 +79,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.topresult",
             "cogs.datacheck",
             "cogs.info",
+            "cogs.edituser",
         ]
         for extension in extensions:
             try:

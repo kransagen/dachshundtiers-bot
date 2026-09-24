@@ -22,7 +22,7 @@ funkce fungují jak v běžícím botovi (jeden loop), tak v testech.
 import asyncio
 import logging
 
-from storage import DataCorruptionError, load_data, save_data
+from storage import load_data, save_data
 
 log = logging.getLogger("dachshundtiers")
 

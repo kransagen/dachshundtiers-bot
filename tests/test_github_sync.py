@@ -47,7 +47,7 @@ class GithubSyncTests(unittest.TestCase):
     def test_push_success(self):
         async def main():
             with (
-                mock.patch.object(github_sync.requests, "get", return_value=_get_ok([], "sha1")) as g,
+                mock.patch.object(github_sync.requests, "get", return_value=_get_ok([], "sha1")),
                 mock.patch.object(github_sync.requests, "put", return_value=_put(200)) as p,
             ):
                 ok, msg, built = await github_sync.push_players(
@@ -117,7 +117,7 @@ class GithubSyncTests(unittest.TestCase):
     def test_push_file_missing_creates_new(self):
         async def main():
             with (
-                mock.patch.object(github_sync.requests, "get", return_value=_get_404()) as g,
+                mock.patch.object(github_sync.requests, "get", return_value=_get_404()),
                 mock.patch.object(github_sync.requests, "put", return_value=_put(201)) as p,
             ):
                 ok, msg, built = await github_sync.push_players("msg", _merge)

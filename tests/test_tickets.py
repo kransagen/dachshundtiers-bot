@@ -13,7 +13,6 @@ Pokrývají Phase 2 požadavky:
 
 import asyncio
 import tempfile
-import time
 import unittest
 from unittest import mock
 

@@ -16,12 +16,19 @@ tento repozitář obsahuje stejné funkce postavené na **discord.py**.
   roomky + práva + uvítací zpráva); stejný tok jako pull tlačítko na panelu.
 - **`/mktesterroom`** – soukromá text roomka pro pullování hráčů, zavírá se
   tlačítkem v roomce.
-- **`/verze`** – diagnostika: commit běžícího bota, stav `/result` a počet
-  slash příkazů (rozliší „staré nasazení" od „cache Discordu").
+- **`/verze`** – diagnostika: commit běžícího bota, stav `/result` a přehled
+  slash příkazů (lokální tree / Discord globální / Discord guild + duplicitní
+  jména global ∩ guild – read-only).
 - **`/setkitrole` / `/unsetkitrole` / `/kitrole`** – mapa „kit → role tieru"
   v `data/kit_roles.json` (necommituje se).
-- **Opraven bug „Synchronizováno 0"** – `tree.copy_global_to(guild=...)` před
-  `sync(guild=...)`, takže slash příkazy na serveru nikdy nezmizí.
+- **Deterministická synchronizace příkazů (bez duplicit)** – každý start
+  synchronizuje slash příkazy do **JEDINÉHO scope**: s `GUILD_ID` jen do guildy
+  (produkce), bez něj jen globálně. Při startu se nejdřív bezpečně odstraní
+  **obsolete guild příkazy** téhle aplikace z dřívějších nasazení (jen naše
+  příkazy, jen v cílové guildu, globální scope se nedotýká) a pak se
+  nasyncuje zamýšlený set (`copy_global_to` + `sync(guild=...)`). Sync běží
+  **přesně jednou za běh procesu** (reconnect nepřepisuje nic zbytečně),
+  scopy se nikdy nemíchají → duplicity global+guild nevznikají.
 - **`/sync` – centrální synchronizace (check | discord | web | data)** –
   jeden příkaz pro všechny admin synchronizační operace. Cog je jen
   orchestrace – business logika zůstává v existujících službách
@@ -251,7 +258,7 @@ a vylosují se 1v1 zápasy.
 | `/addkit kit` *(admin)* | Přidá nový kit do seznamu (`data/kits.json`). |
 | `/removekit kit` *(admin)* | Odebere kit ze seznamu. |
 | `/kits` | Vypíše všechny registrované kity. |
-| `/verze` | Diagnostika – commit běžícího bota a stav `/result add_role/remove_role`. |
+| `/verze` | Diagnostika – commit, stav `/result add_role/remove_role` a přehled slash příkazů (lokální tree / Discord globální / Discord guild / duplicity). |
 
 Přidaný/odebraný kit se hned promítne do:
 - HT3+ panelu („Žádost o TierTest“ – select menu s kity, panel se automaticky
@@ -336,7 +343,7 @@ v `.env` (viz `.env.example`):
 | `QUEUE_CHANNELS_JSON` | Mapa „kit → určený kanál panelu fronty“, např. `{"randompot":"..."}`. |
 | `TESTER_ROOM_CATEGORY_ID` | Kategorie pro tester roomky (`/mktesterroom`); `0` = bez kategorie. |
 | `TOURNAMENT_RESULT_CHANNEL_ID` | Kanál pro `/turnajresult`. |
-| `GUILD_ID` | Registrace příkazů jen na tomto serveru (rychlejší vývoj). |
+| `GUILD_ID` | Scope registrace příkazů. **Nastaveno** → příkazy se synchronizují jen do této guildy (produkce na jednom serveru). **Prazdné** → jen globálně (dev/testing). Scopy se nikdy nemíchají, takže duplicity nevznikají. |
 | `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |
 | `GITHUB_*` | Volitelná synchronizace `players.json` na GitHub. |
 

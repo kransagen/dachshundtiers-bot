@@ -693,8 +693,12 @@ class HTTicketView(SafeView):
             return None
         return ticket
 
-    async def _refresh(self, interaction, ticket) -> None:
-        """Aktualizuje embed panel zprávy ticketu (pokud existuje)."""
+    async def _refresh_ticket_state(self, interaction, ticket) -> None:
+        """Aktualizuje embed panel zprávy ticketu (pokud existuje).
+
+        Pozn.: pojmenováno tak, aby NEstínilo interní ``discord.ui.View._refresh(components)``
+        (volané z ``ViewStore.update_from_message`` při MESSAGE_UPDATE).
+        """
         try:
             message = interaction.message
             if message is not None:
@@ -740,7 +744,7 @@ class HTTicketView(SafeView):
             interaction.user.display_name,
             details=f"Claim: {ticket.get('ign')} / {ticket.get('kit')}",
         )
-        await self._refresh(interaction, ticket)
+        await self._refresh_ticket_state(interaction, ticket)
         await interaction.response.send_message(
             f"✅ **{interaction.user.display_name}** převzal/a ticket "
             f"<#{interaction.channel_id}> – můžeš začít test.",
@@ -770,7 +774,7 @@ class HTTicketView(SafeView):
             interaction.user.display_name,
             details=f"Vzdal se: {previous['claimer_name'] or previous['claimer_id']}",
         )
-        await self._refresh(interaction, result["ticket"])
+        await self._refresh_ticket_state(interaction, result["ticket"])
         await interaction.response.send_message(
             "↩️ Ticket je zase volný – nikdo ho nemá převzatý.", ephemeral=True
         )
@@ -802,7 +806,7 @@ class HTTicketView(SafeView):
             interaction.user.display_name,
             details="7denní HT3+ cooldown nastaven",
         )
-        await self._refresh(interaction, result["ticket"])
+        await self._refresh_ticket_state(interaction, result["ticket"])
         await interaction.response.send_message(
             "🔒 Ticket zavřený – hráč má 7denní HT3+ cooldown na tento kit. "
             "Kanál zůstává (Reopen / log).",
@@ -852,7 +856,7 @@ class HTTicketView(SafeView):
             interaction.channel_id, "reopened", str(interaction.user.id),
             interaction.user.display_name,
         )
-        await self._refresh(interaction, result["ticket"])
+        await self._refresh_ticket_state(interaction, result["ticket"])
         await interaction.response.send_message(
             "🔓 Ticket je zase otevřený.", ephemeral=True
         )

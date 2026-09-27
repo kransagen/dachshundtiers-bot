@@ -217,7 +217,17 @@ class SyncCheckTests(unittest.TestCase):
             _member(4, "DaveMC", []),
         ]
         storage.save_data("players.json", _deep(self.players))
-        storage.save_data("kit_roles.json", {"randompot": {"HT3": "101", "HT2": "102"}})
+        # kit_roles už nemá JSON úložiště (jen PostgreSQL) – bez DB v tomhle
+        # scénáři (cog.bot není nastaveno) se mapa vrací mockem, ne souborem.
+        patch = mock.patch.object(
+            sync_mod,
+            "_kit_role_maps_or_empty",
+            new=mock.AsyncMock(
+                return_value={"randompot": {"HT3": 101, "HT2": 102}}
+            ),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _run(self, inter, area="all", *, web=(True,)):
         cog = Sync.__new__(Sync)

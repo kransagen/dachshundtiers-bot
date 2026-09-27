@@ -10,14 +10,10 @@ na **discord.py**.
 - **Discord je jediná autorita aktuálního tieru hráče.** Role na Discordu se
   mění jen přes autorizované příkazy (`/result`, `/topresult`, `/edituser`,
   `/sync discord-rollback`) – nikdy automaticky z databáze ani z JSONu.
-- **PostgreSQL** (když je nastavené `DATABASE_URL`) je perzistentní aplikační
-  databáze – zrcadlí Discord, drží historii, frontu, tickety, audit a
-  statistiky. Startup s nakonfigurovaným, ale nedostupným PostgreSQL **tvrdě
-  selže** (žádný tichý návrat k JSONu).
-- Bez `DATABASE_URL` běží bot v **legacy JSON-only režimu** – `players.json`
-  je pak sám zdrojem aktuálního tieru. Je to explicitně zvolený deployment
-  mode, ne fallback.
-- `players.json` v PostgreSQL režimu slouží jen jako **export/kompatibilita**
+- **PostgreSQL je povinný.** `DATABASE_URL` musí být nastavené a schéma
+  zmigrované (`alembic upgrade head`), jinak start bota tvrdě selže. Žádný
+  JSON-only deployment mode, žádný tichý fallback.
+- `players.json` slouží jen jako **export/kompatibilita**
   (kopie pro GitHub/web) – nikdy se nečte zpět jako zdroj aktuálního tieru.
   Pokud export z PostgreSQL selže, `/sync web` to nahlásí nahlas jako
   „LEGACY JSON FALLBACK“, nikdy potichu.
@@ -212,21 +208,19 @@ python main.py
 | `DATABASE_URL` | PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj běží legacy JSON-only režim. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL` (bot URL sestaví sám). |
 | `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB (hodí se bez IPv6 trasy). |
-| `DB_REQUIRED` | `true` = start selže tvrdou chybou, pokud PostgreSQL není dostupné (žádný tichý návrat k JSONu). |
 
 > Kanál panelu fronty jde nastavit i za běhu přes `/addqchannel`
 > (`data/queue_channels.json`, má přednost před env i defaulty).
 
 ## Data
 
-**PostgreSQL režim** (`DATABASE_URL` nastavené): Discord je autorita
-aktuálního tieru, PostgreSQL je perzistentní zrcadlo/historie/audit.
-`players.json` slouží jen jako export/kompatibilita – nikdy se nečte jako
-zdroj aktuálního tieru. Nedostupné PostgreSQL při startu = tvrdá chyba, ne
-tichý návrat k JSONu.
-
-**JSON-only režim** (bez `DATABASE_URL`): `players.json` je sám zdrojem
-aktuálního tieru – explicitně zvolený, jednodušší deployment mode.
+`DATABASE_URL` je **povinné** – bez něj bot start odmítne (žádný JSON-only
+deployment mode, žádný tichý fallback). Discord je autorita aktuálního
+tieru, PostgreSQL je perzistentní zrcadlo/historie/audit. `players.json`
+(a ostatní JSON soubory) zatím zůstávají jako export/kompatibilita a jako
+podpůrné úložiště pro některé nekritické subsystémy (cooldowny, tickety,
+fronta) – jejich postupný přesun na relační PostgreSQL tabulky probíhá.
+Nedostupné/nemigrované PostgreSQL při startu = tvrdá chyba.
 
 Migrace existujících JSON dat do PostgreSQL (nemaže originály):
 

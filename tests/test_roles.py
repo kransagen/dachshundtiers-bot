@@ -10,14 +10,12 @@ volající (PostgreSQL mirror) se tím řídí.
 """
 
 import asyncio
-import tempfile
 import unittest
 from unittest import mock
 
 import discord
-import storage
+import cogs.roles as roles_mod
 from cogs.roles import TierRoleGrant, auto_grant_kit_role
-from services.kit_roles import KIT_ROLES_FILE
 
 
 def _role(rid, name=None):
@@ -47,19 +45,28 @@ def _fresh_after(member, roles):
 
 
 class AutoGrantKitRoleTests(unittest.TestCase):
-    """Kit lookup je case-insensitive (klíče v kit_roles.json jsou lowercase)."""
+    """Kit lookup je case-insensitive (klíče v kit_roles jsou lowercase).
+
+    ``auto_grant_kit_role``'s own concern is Discord mutation/confirmation
+    semantics, not kit_roles persistence (that's covered by
+    ``tests/test_services_kits_evals_roles_db.py`` against real PostgreSQL) —
+    so the role-map lookup is mocked directly here rather than seeding a real
+    database per test.
+    """
 
     def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
         # /setkitrole ukládá klíče vždy lowercase – display-case názvy kitu
         # ("MolePVP") posílají volající; auto_grant_kit_role je sjednocuje.
-        storage.save_data(
-            KIT_ROLES_FILE,
-            {"molepvp": {"HT3": "111", "HT2": "222", "S": "333"}},
+        roles_map = {"molepvp": {"HT3": 111, "HT2": 222, "S": 333}}
+
+        async def _fake_get_kit_role_map(kit_key, *, session_factory=None):
+            return dict(roles_map.get((kit_key or "").strip().lower(), {}))
+
+        patch = mock.patch.object(
+            roles_mod, "get_kit_role_map", side_effect=_fake_get_kit_role_map
         )
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _guild(self, member_roles=None):
         guild = mock.MagicMock()

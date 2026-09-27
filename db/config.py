@@ -28,16 +28,6 @@ def database_url() -> str:
     return _database_url_from_environment()
 
 
-def database_required() -> bool:
-    """DB functionality required at startup? (env ``DB_REQUIRED``)."""
-    return os.getenv("DB_REQUIRED", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
 def strict_kit_roles_enabled() -> bool:
     """Kity bez mapovaných rolí = chyba místo varování? (env ``STRICT_KIT_ROLES``).
 

@@ -7,7 +7,6 @@ from db.config import (
     DatabaseConfigError,
     build_async_database_url,
     build_sync_database_url,
-    database_required,
     database_url,
 )
 from db.engine import (
@@ -87,7 +86,6 @@ __all__ = [
     "classify_member_roles",
     "commit_promotion_with_wedge",
     "create_async_engine_from_url",
-    "database_required",
     "database_url",
     "dispose_engine",
     "enqueue_promotion_wedge",

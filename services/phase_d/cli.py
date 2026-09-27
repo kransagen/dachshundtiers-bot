@@ -155,6 +155,33 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _run_import_kit_roles(url: str, data_dir: Path) -> None:
+    from services.phase_d.import_kit_roles import import_kit_roles_json
+
+    engine, factory = _make_session_factory(url)
+    try:
+        report = await import_kit_roles_json(factory, data_dir=data_dir)
+        _print_json(report)
+    finally:
+        await engine.dispose()
+
+
+def cmd_import_kit_roles(args: argparse.Namespace) -> int:
+    """D2b — kit_roles.json import. PostgreSQL-only: JSON fallback is forbidden."""
+    if not storage.using_postgres():
+        raise SystemExit("Import vyžaduje PostgreSQL backend (JSON fallback zakázán).")
+    url = build_async_database_url()
+    if not url:
+        raise SystemExit("DATABASE_URL není nastavené – import se zastavuje.")
+    data_dir = Path(args.data) if args.data else Path(storage.DATA_DIR)
+    try:
+        asyncio.run(_run_import_kit_roles(url, data_dir))
+    except Exception as err:
+        raise SystemExit(f"Import selhal (transakce odvolána, nic částečného): {err}")
+    print("[ok] Import kit_roles dokončen v jedné transakci (report výše).", file=sys.stderr)
+    return 0
+
+
 async def _run_unresolved(url: str) -> int:
     from services.phase_d.report_unresolved import build_unresolved_report
 
@@ -318,6 +345,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_imp.add_argument("--data", help="data dir (default: storage.DATA_DIR)")
     p_imp.set_defaults(func=cmd_import)
+
+    p_kr = sub.add_parser(
+        "import-kit-roles",
+        help="D2b: idempotentní import kit_roles.json (kit-tier -> Discord role)",
+    )
+    p_kr.add_argument("--data", help="data dir (default: storage.DATA_DIR)")
+    p_kr.set_defaults(func=cmd_import_kit_roles)
 
     return parser
 

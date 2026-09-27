@@ -99,7 +99,6 @@ from views import SafeView
 
 log = logging.getLogger("dachshundtiers")
 
-KIT_ROLES_FILE = "kit_roles.json"
 SYNC_MESSAGE = "websync: synchronizace hráčů na web"
 
 # Soubory, které čte /datacheck – strict probe před analýzou, aby se korupce
@@ -269,11 +268,18 @@ async def _canonical_players(session_factory) -> list:
     return load_data("players.json", []) or []
 
 
+async def _kit_role_maps_or_empty(session_factory) -> dict:
+    """``get_all_kit_role_maps`` bez JSON fallbacku – bez DB vrátí {}."""
+    if session_factory is None:
+        return {}
+    return await get_all_kit_role_maps(session_factory=session_factory)
+
+
 async def _gather_checkweb(
     guild: discord.Guild, *, session_factory=None
 ) -> dict:
     """Čerstvá analýza: Discord role × PostgreSQL mirror × web (nic nemění)."""
-    roles_map = await get_all_kit_role_maps(session_factory=session_factory)
+    roles_map = await _kit_role_maps_or_empty(session_factory)
     players = await _canonical_players(session_factory)
     kit_display = await kit_display_map(session_factory=session_factory)
     members = [member_to_dict(m) for m in await guild_members(guild)]
@@ -1738,8 +1744,8 @@ class Sync(commands.Cog):
         players = await _canonical_players(
             getattr(interaction.client, "db_session_factory", None)
         )
-        roles_map = await get_all_kit_role_maps(
-            session_factory=getattr(interaction.client, "db_session_factory", None)
+        roles_map = await _kit_role_maps_or_empty(
+            getattr(interaction.client, "db_session_factory", None)
         )
         kit_display = await kit_display_map(
             session_factory=getattr(

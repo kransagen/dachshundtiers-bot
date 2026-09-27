@@ -68,8 +68,6 @@ from views import SafeModal, SafeView
 
 log = logging.getLogger("dachshundtiers")
 
-KIT_ROLES_FILE = "kit_roles.json"
-
 
 # ---------------------------------------------------------------------------
 # Pomocné funkce (embed + data)
@@ -1262,12 +1260,9 @@ class EditUser(commands.Cog):
                     member = None
         member_dict = _member_to_dict(member) if member is not None else None
         session_factory = getattr(self.bot, "db_session_factory", None)
-        if session_factory is not None:
-            from services.kit_roles import get_all_kit_role_maps
+        from services.kit_roles import get_all_kit_role_maps
 
-            roles_map = await get_all_kit_role_maps(session_factory=session_factory)
-        else:
-            roles_map = load_data(KIT_ROLES_FILE, {}) or {}
+        roles_map = await get_all_kit_role_maps(session_factory=session_factory)
         return {
             "member": member_dict,
             "roles_map": roles_map,

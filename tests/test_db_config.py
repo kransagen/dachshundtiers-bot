@@ -6,7 +6,6 @@ from db.config import (
     DatabaseConfigError,
     build_async_database_url,
     build_sync_database_url,
-    database_required,
     database_url,
     strict_kit_roles_enabled,
 )
@@ -44,17 +43,13 @@ def test_build_rejects_unknown_scheme():
         build_async_database_url("mysql://u:p@host/db")
 
 
-def test_database_required_flag(monkeypatch):
-    for value, expected in [
-        ("", False),
-        ("0", False),
-        ("false", False),
-        ("1", True),
-        ("true", True),
-        ("YES", True),
-    ]:
-        monkeypatch.setenv("DB_REQUIRED", value)
-        assert database_required() is expected
+def test_database_required_symbol_removed():
+    """PostgreSQL is unconditionally mandatory now — there is no more
+    opt-in DB_REQUIRED flag (bot.py._init_database always raises on a
+    missing DATABASE_URL, JSON-only deployment mode no longer exists)."""
+    import db.config as dbconfig
+
+    assert not hasattr(dbconfig, "database_required")
 
 
 def test_strict_kit_roles_flag(monkeypatch):

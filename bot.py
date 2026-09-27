@@ -472,17 +472,14 @@ class DachshundTiersBot(commands.Bot):
 
 
 async def _init_database():
-    """Phase C: vytvoří PostgreSQL engine + session factory a vrátí je.
+    """Vytvoří PostgreSQL engine + session factory a vrátí je.
 
-    - číselnost role ID (kit_roles.json) se kontroluje vždy (fail-fast),
-    - bez DATABASE_URL pokračuje JSON backend; s DB_REQUIRED=true chybí-li
-      URL, start selže jasnou hláškou,
-    - s DATABASE_URL se ověří konektivita + shoda schématu s Alembic head
-      (žádné tajemství v logu/hláškách — ani URL, ani heslo).
-
-    Vrací ``(engine, session_factory)``, když je PostgreSQL nakonfigurováno,
-    jinak ``None``. Pool předává ``main()`` botu (``db_engine`` /
-    ``db_session_factory``) a disposuje se v ``close()``.
+    PostgreSQL je od tohoto refactoru POVINNÝ — žádný JSON-only deployment
+    mode ani fallback. Chybějící ``DATABASE_URL`` je vždy tvrdá chyba, stejně
+    jako nedostupné/nemigrované PostgreSQL (žádné tajemství v logu/hláškách —
+    ani URL, ani heslo). Vrací ``(engine, session_factory)`` nebo nikdy
+    nevrátí nic (``SystemExit``). Pool předává ``main()`` botu (``db_engine``
+    / ``db_session_factory``) a disposuje se v ``close()``.
     """
     import db.config as dbconfig
     from db.engine import create_async_engine_from_url, make_session_factory
@@ -492,13 +489,10 @@ async def _init_database():
 
     url = dbconfig.database_url()
     if not url:
-        if dbconfig.database_required():
-            raise SystemExit(
-                "❌ DB_REQUIRED=true, ale chybí DATABASE_URL (nebo DB_HOST/DB_NAME/"
-                "DB_USER/DB_PASSWORD). Nastav připojovací údaje (viz .env.example)."
-            )
-        log.info("PostgreSQL není nakonfigurováno — backend zůstává JSON (fáze A).")
-        return None
+        raise SystemExit(
+            "❌ Chybí DATABASE_URL (nebo DB_HOST/DB_NAME/DB_USER/DB_PASSWORD). "
+            "PostgreSQL je povinný – nastav připojovací údaje (viz .env.example)."
+        )
 
     engine = create_async_engine_from_url(dbconfig.build_async_database_url(url))
     try:
@@ -517,11 +511,10 @@ async def _init_database():
 async def main() -> None:
     ensure_data_dir()
     log.info("Úložiště dat: %s", backend_name())
-    pool = await _init_database()
+    engine, session_factory = await _init_database()
     bot = DachshundTiersBot()
-    if pool is not None:
-        bot.db_engine, bot.db_session_factory = pool
-        log.info("PostgreSQL pool připraven pro cog příkazy.")
+    bot.db_engine, bot.db_session_factory = engine, session_factory
+    log.info("PostgreSQL pool připraven pro cog příkazy.")
     await bot.start(DISCORD_TOKEN)
 
 

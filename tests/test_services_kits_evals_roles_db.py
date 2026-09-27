@@ -1,14 +1,8 @@
-"""DB (PostgreSQL) i JSON režim services/kit_catalog, evals, kit_roles — Phase F (todo #9).
+"""services/kit_catalog, evals, kit_roles — PostgreSQL only.
 
-Ověřuje dual-mode kontrakt tří služeb, které nahrazují legacy JSON soubory
-v produkčních cestách: kity (kits.json), evaly (evals.json) a mapování rolí
-kit→tier (kit_roles.json). DB režim běží na reálném PostgreSQL
-(``session_factory`` + ``clean_db``), JSON režim na tmp DATA_DIR — parity
-s legacy soubory, dokud Phase F nedokončí kompletní rewire (F10 kontrakt).
+Kity, evaly a mapování rolí kit→tier (dříve kits.json/evals.json/
+kit_roles.json) žijí výhradně v PostgreSQL; žádný JSON režim už neexistuje.
 """
-
-import json
-from pathlib import Path
 
 from db.repositories.kits import ensure_dimensions
 from db.repositories.players import PlayerRepository
@@ -86,32 +80,6 @@ async def test_kits_canonical_unknown_returns_input(session_factory, clean_db):
 
 
 # ---------------------------------------------------------------------------
-# kit_catalog — JSON režim (parity s legacy kits.json)
-# ---------------------------------------------------------------------------
-
-
-async def test_kits_json_defaults_when_file_missing(tmp_path: Path, monkeypatch):
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert await kit_catalog.get_kits() == list(kit_catalog.DEFAULT_KITS)
-
-
-async def test_kits_json_add_remove_roundtrip(tmp_path: Path, monkeypatch):
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert await kit_catalog.add_kit("MolePVP")
-    seeded = json.loads((tmp_path / "kits.json").read_text())
-    assert seeded == list(kit_catalog.DEFAULT_KITS) + ["MolePVP"]
-    assert await kit_catalog.remove_kit("molepvp")
-    assert json.loads((tmp_path / "kits.json").read_text()) == list(
-        kit_catalog.DEFAULT_KITS
-    )
-    assert not await kit_catalog.remove_kit("molepvp")
-
-
-# ---------------------------------------------------------------------------
 # evals — DB režim
 # ---------------------------------------------------------------------------
 
@@ -156,25 +124,6 @@ async def test_evals_double_revoke_second_false(session_factory, clean_db):
     await evals.set_eval("mendu__", "molepvp", session_factory=session_factory)
     assert await evals.unset_eval("mendu__", "molepvp", session_factory=session_factory)
     assert not await evals.unset_eval("mendu__", "molepvp", session_factory=session_factory)
-
-
-# ---------------------------------------------------------------------------
-# evals — JSON režim (parity s legacy evals.json)
-# ---------------------------------------------------------------------------
-
-
-async def test_evals_json_roundtrip(tmp_path: Path, monkeypatch):
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert not await evals.has_eval("mendu__", "molepvp")
-    assert await evals.set_eval("mendu__", "molepvp")
-    assert await evals.has_eval("mendu__", "molepvp")
-    stored = json.loads((tmp_path / "evals.json").read_text())
-    assert set(stored) == {"molepvp"}
-    assert set(stored["molepvp"]) == {"mendu__"}
-    assert await evals.unset_eval("mendu__", "molepvp")
-    assert not await evals.has_eval("mendu__", "molepvp")
 
 
 # ---------------------------------------------------------------------------
@@ -250,34 +199,3 @@ async def test_kit_role_all_maps_returns_case_lower_keys(session_factory, clean_
         session_factory=session_factory
     )
     assert all_maps == {"molepvp": {"S": 333}, "uke": {"HT2": 444}}
-
-
-# ---------------------------------------------------------------------------
-# kit_roles — JSON režim (parity s legacy kit_roles.json)
-# ---------------------------------------------------------------------------
-
-
-async def test_kit_role_json_set_get_unset(tmp_path: Path, monkeypatch):
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert await kit_roles.set_kit_role("MolePVP", "HT3", 111)
-    assert await kit_roles.get_kit_role_map("molepvp") == {"HT3": "111"}
-    stored = json.loads((tmp_path / "kit_roles.json").read_text())
-    assert stored == {"molepvp": {"HT3": "111"}}
-    assert await kit_roles.unset_kit_role("molepvp", "HT3")
-    assert await kit_roles.get_kit_role_map("molepvp") == {}
-
-
-async def test_kit_role_json_get_unknown_empty(tmp_path: Path, monkeypatch):
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert await kit_roles.get_kit_role_map("nope") == {}
-
-
-async def test_kit_role_json_unset_missing_false(tmp_path: Path, monkeypatch):
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert not await kit_roles.unset_kit_role("molepvp", "HT3")

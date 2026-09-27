@@ -38,6 +38,7 @@ styl jako services/results.apply_result_to_players).
 
 import logging
 import time
+from datetime import datetime, timezone
 
 from services import datacheck
 from services.player_identity import (
@@ -79,6 +80,10 @@ class InvalidTierEdit(ValueError):
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _copy_players(players) -> list:
@@ -586,6 +591,7 @@ async def apply_player_edit(
     now: int = None,
     queue_cooldown_ms: int = 0,
     ht3_cooldown_ms: int = 0,
+    session_factory=None,
 ) -> dict:
     """Aplikuje JEDNU potvrzenou změnu hráče ATOMICky + audit ve stejné transakci.
 
@@ -605,10 +611,26 @@ async def apply_player_edit(
 
     Konflikty identity / neplatné tiery / poškozený JSON → ``status="error"``
     (nic se neuloží, soubor zůstává nedotčený).
+
+    Když je předán ``session_factory``, běží DB cesta (PostgreSQL = autorita):
+    private/metody repozitářů, žádný JSON reader/writer (F10). Audit jde do
+    ``audit_logs`` (append-only) místo edituser_log.json; ``changed_files`` je
+    prázdný (DB se nepíše do JSON souborů).
     """
     if now is None:
         now = _now_ms()
     field = edit.get("field")
+    if session_factory is not None:
+        return await _apply_player_edit_db(
+            player_id=str(player_id),
+            edit=edit,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            now=now,
+            queue_cooldown_ms=queue_cooldown_ms,
+            ht3_cooldown_ms=ht3_cooldown_ms,
+            session_factory=session_factory,
+        )
     files = _files_for_edit(edit)
 
     async def _run(tx):
@@ -736,6 +758,336 @@ async def apply_player_edit(
 
 
 # ---------------------------------------------------------------------------
+# DB cesta (session_factory předán): PostgreSQL = autorita, žádný JSON (F10)
+# ---------------------------------------------------------------------------
+def _db_error(message: str) -> dict:
+    return {"status": "error", "message": message, "audit": None}
+
+
+def _db_not_found(player_id: str) -> dict:
+    return {
+        "status": "not_found",
+        "message": f"Hráč `<@{player_id}>` nemá záznam v databázi.",
+        "audit": None,
+    }
+
+
+async def _apply_player_edit_db(
+    *,
+    player_id: str,
+    edit: dict,
+    actor_id=None,
+    actor_name="",
+    now: int,
+    queue_cooldown_ms: int,
+    ht3_cooldown_ms: int,
+    session_factory,
+) -> dict:
+    """DB režim apply_player_edit — stejná pravidla jako JSON cesta."""
+    from db.repositories.cooldowns import (
+        COOLDOWN_HT3,
+        COOLDOWN_WAITLIST,
+        CooldownRepository,
+    )
+    from db.repositories.kits import KitRepository, TierDefinitionRepository
+    from db.repositories.players import PlayerRepository
+    from db.repositories.sync_audit import AuditRepository
+    from db.repositories.tiers import MirrorRepository, MirrorServiceRepository
+    from db.services.session import transaction as db_transaction
+
+    field = edit.get("field")
+    discord_id = int(player_id) if str(player_id).isdigit() else None
+    if discord_id is None:
+        return _db_not_found(player_id)
+    async with db_transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, discord_id)
+        if player is None:
+            return _db_not_found(player_id)
+
+        ts_dt = datetime.fromtimestamp(now / 1000, tz=timezone.utc)
+
+        def _audit(info: dict) -> dict:
+            entry = {
+                "ts": now,
+                "actorId": str(actor_id) if actor_id is not None else None,
+                "actorName": actor_name or "",
+                "playerId": str(player_id),
+                "field": field,
+                "kit": info.get("kit") or None,
+                "oldValue": info.get("old_value"),
+                "newValue": info.get("new_value"),
+            }
+            return entry
+
+        async def _commit(info: dict) -> dict:
+            entry = _audit(info)
+            await AuditRepository().append(
+                session,
+                action="edituser",
+                actor_id=int(actor_id) if actor_id is not None else None,
+                actor_name=actor_name or None,
+                entity_type="player",
+                entity_id=str(player.id),
+                details={
+                    "field": field,
+                    "kit": info.get("kit") or None,
+                    "oldValue": info.get("old_value"),
+                    "newValue": info.get("new_value"),
+                },
+            )
+            return {
+                "status": OUTCOME_CHANGED,
+                "field": field,
+                "kit": info.get("kit"),
+                "old_value": info.get("old_value"),
+                "new_value": info.get("new_value"),
+                "message": f"Změna pole `{field}` aplikována (PostgreSQL).",
+                "audit": entry,
+                "changed_files": [],
+            }
+
+        async def _resolve_kit(kit_key: str):
+            key = (kit_key or "").strip().lower()
+            if not key:
+                return None
+            kit = await KitRepository().get_by_key(session, key)
+            if kit is not None:
+                return kit
+            return await KitRepository().get_by_name(session, kit_key)
+
+        async def _resolve_tier(code: str):
+            tier = await TierDefinitionRepository().get_by_code(session, code)
+            if tier is not None:
+                return tier
+            retired = code.startswith(RETIRED_PREFIX)
+            kind = "virtual" if code == "LT3E" or retired else "ladder"
+            return await TierDefinitionRepository().get_or_create(
+                session, code=code, kind=kind, display_name=code
+            )
+
+        if field == "cooldown":
+            action = edit.get("action")
+            kit_key = str(edit.get("kit") or "").strip().lower()
+            if action in ("clear_queue", "set_queue"):
+                active = await CooldownRepository().get_active(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_WAITLIST,
+                    now=ts_dt,
+                )
+                old_ms = int(active[0].expires_at.timestamp() * 1000) - now if active else None
+                old_desc = f"waitlist: {format_duration(old_ms)}"
+                if action == "clear_queue":
+                    if not active:
+                        return {
+                            "status": OUTCOME_UNCHANGED,
+                            "old_value": old_desc,
+                            "new_value": old_desc,
+                            "audit": None,
+                        }
+                    await CooldownRepository().delete(
+                        session,
+                        player_id=player.id,
+                        cooldown_type=COOLDOWN_WAITLIST,
+                    )
+                    return await _commit(
+                        {
+                            "old_value": old_desc,
+                            "new_value": "waitlist: žádný",
+                        }
+                    )
+                expires = datetime.fromtimestamp((now + queue_cooldown_ms) / 1000, tz=timezone.utc)
+                await CooldownRepository().upsert(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_WAITLIST,
+                    expires_at=expires,
+                    source="edituser",
+                )
+                return await _commit(
+                    {
+                        "old_value": old_desc,
+                        "new_value": (f"waitlist: {format_duration(queue_cooldown_ms)} (od teď)"),
+                    }
+                )
+
+            if action in ("clear_ht3", "set_ht3"):
+                if not kit_key:
+                    return _db_error("Pro HT3+ cooldown je potřeba kit.")
+                kit = await _resolve_kit(kit_key)
+                if kit is None:
+                    kits = await KitRepository().list(session)
+                    names = ", ".join(k.name for k in kits) or "—"
+                    return _db_error(f"Kit `{kit_key}` není v databázi (známé: {names}).")
+                active = await CooldownRepository().get_active(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_HT3,
+                    kit_id=kit.id,
+                    now=ts_dt,
+                )
+                old_ms = int(active[0].expires_at.timestamp() * 1000) - now if active else None
+                old_desc = f"HT3 {kit_key}: {format_duration(old_ms)}"
+                if action == "clear_ht3":
+                    if not active:
+                        return {
+                            "status": OUTCOME_UNCHANGED,
+                            "old_value": old_desc,
+                            "new_value": old_desc,
+                            "audit": None,
+                        }
+                    await CooldownRepository().delete(
+                        session,
+                        player_id=player.id,
+                        cooldown_type=COOLDOWN_HT3,
+                        kit_id=kit.id,
+                    )
+                    return await _commit(
+                        {"old_value": old_desc, "new_value": f"HT3 {kit_key}: žádný"}
+                    )
+                expires = datetime.fromtimestamp((now + ht3_cooldown_ms) / 1000, tz=timezone.utc)
+                await CooldownRepository().upsert(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_HT3,
+                    kit_id=kit.id,
+                    expires_at=expires,
+                    source="edituser",
+                )
+                return await _commit(
+                    {
+                        "old_value": old_desc,
+                        "new_value": (
+                            f"HT3 {kit_key}: {format_duration(ht3_cooldown_ms)} (od teď)"
+                        ),
+                        "kit": kit_key,
+                    }
+                )
+            return _db_error(f"Neznámá akce cooldownu: {action}")
+
+        if field == "discord_id":
+            old_id = str(player.discord_id or "")
+            new_id = str(edit.get("new_value") or "").strip()
+            if not new_id.isdigit() or len(new_id) < 15:
+                return _db_error("Nové Discord ID vypadá podezřele (Discord ID má ~17–19 číslic).")
+            if old_id == new_id:
+                return {
+                    "status": OUTCOME_UNCHANGED,
+                    "old_value": old_id,
+                    "new_value": old_id,
+                    "audit": None,
+                }
+            other = await PlayerRepository().get_by_discord_id(session, int(new_id))
+            if other is not None and other.id != player.id:
+                return _db_error(
+                    f"Discord ID `{new_id}` už patří hráči "
+                    f"`{other.ign or '?'}` – identitní konflikt, "
+                    "sloučení hráčů se odmítá."
+                )
+            player.discord_id = int(new_id)
+            await session.flush()
+            return await _commit({"old_value": old_id, "new_value": new_id})
+
+        if field == "ign":
+            old_ign = str(player.ign or "")
+            new_ign = str(edit.get("new_value") or "").strip()
+            if not new_ign:
+                return _db_error("IGN je prázdné – nelze změnit.")
+            if old_ign.strip().lower() == new_ign.strip().lower():
+                return {
+                    "status": OUTCOME_UNCHANGED,
+                    "old_value": old_ign,
+                    "new_value": old_ign,
+                    "audit": None,
+                }
+            other = await PlayerRepository().get_by_ign(session, new_ign)
+            if other is not None and other.id != player.id:
+                return _db_error(
+                    f"IGN `{new_ign}` patří jinému záznamu "
+                    f"(`{other.ign or '?'}`) – přejmenování se odmítá."
+                )
+            player.ign = str(new_ign).strip()
+            await session.flush()
+            return await _commit({"old_value": old_ign, "new_value": player.ign})
+
+        if field == "tier":
+            kit_key = str(edit.get("kit") or "").strip().lower()
+            if not kit_key:
+                return _db_error("Pro změnu tieru je potřeba kit.")
+            kit = await _resolve_kit(kit_key)
+            if kit is None:
+                kits = await KitRepository().list(session)
+                names = ", ".join(k.name for k in kits) or "—"
+                return _db_error(f"Kit `{kit_key}` není v databázi (známé: {names}).")
+            current = await MirrorRepository().get_current(
+                session, player_id=player.id, kit_id=kit.id
+            )
+            old_tier = None
+            if current is not None:
+                tier_row = await TierDefinitionRepository().get_by_id(session, current.tier_id)
+                old_tier = tier_row.code if tier_row is not None else None
+
+            new_tier = str(edit.get("tier") or "").strip()
+            retired = bool(edit.get("retired"))
+            stored = normalize_tier_choice(new_tier, retired=retired)
+            if stored is None:
+                return _db_error(f"Neplatný tier `{new_tier}`.")
+            if old_tier is not None and old_tier.upper() == stored:
+                return {
+                    "status": OUTCOME_UNCHANGED,
+                    "old_value": old_tier,
+                    "new_value": old_tier,
+                    "kit": kit_key,
+                    "audit": None,
+                }
+            if retired:
+                base = (
+                    stored[len(RETIRED_PREFIX) :] if stored.startswith(RETIRED_PREFIX) else stored
+                )
+                if (
+                    old_tier is not None
+                    and not is_retired_tier(old_tier)
+                    and base != old_tier.upper()
+                ):
+                    return _db_error(
+                        f"Retired tier `{stored}` by přepsal aktuální tier "
+                        f"`{old_tier}` kitu – retired tier se NESMÍ překrýt "
+                        f"s aktuálním. Archivovat lze jen přesně stejnou "
+                        f"hodnotu (`R{old_tier}`)."
+                    )
+            else:
+                if old_tier is not None and is_retired_tier(old_tier):
+                    return _db_error(
+                        f"Kit má retired tier `{old_tier}` (archivovaná "
+                        "historie) – nejde ho přepsat aktuálním tierem. "
+                        "Aktuální tier se zapisuje přes `/result`."
+                    )
+
+            tier_row = await _resolve_tier(stored)
+            await MirrorServiceRepository().apply_observation(
+                session,
+                player_id=player.id,
+                kit_id=kit.id,
+                tier_id=tier_row.id,
+                observed_at=ts_dt,
+                source="manual",
+                actor_id=int(actor_id) if actor_id is not None else None,
+                actor_name=actor_name or None,
+                reason="edituser",
+            )
+            await session.flush()
+            return await _commit(
+                {
+                    "old_value": old_tier,
+                    "new_value": stored,
+                    "kit": kit_key,
+                }
+            )
+
+        return _db_error(f"Neznámé pole úpravy: {field}")
+
+
+# ---------------------------------------------------------------------------
 # Orchestrace celé potvrzené úpravy: DB → Discord role → web (best effort)
 # ---------------------------------------------------------------------------
 async def execute_player_edit(
@@ -747,6 +1099,7 @@ async def execute_player_edit(
     now: int = None,
     queue_cooldown_ms: int = 0,
     ht3_cooldown_ms: int = 0,
+    session_factory=None,
     player_after=None,
     role_context=None,
     apply_roles=None,
@@ -765,6 +1118,9 @@ async def execute_player_edit(
     (cog) provede akce; ``push_web(canonical) -> {"ok": bool, "message": str}``
     – cog deleguje na services/websync.sync_website. Obojí je volitelné
     (bez vrstvy se synchronizace přeskočí s poznámkou).
+
+    S ``session_factory`` běží celá úprava na PostgreSQL (F10): player_after
+    i web canonical se staví z DB (services.player_export), žádný JSON read.
     """
     if now is None:
         now = _now_ms()
@@ -777,6 +1133,7 @@ async def execute_player_edit(
         now=now,
         queue_cooldown_ms=queue_cooldown_ms,
         ht3_cooldown_ms=ht3_cooldown_ms,
+        session_factory=session_factory,
     )
     if db["status"] in ("error", "not_found"):
         return _report(STATUS_FAILURE, db=db, roles=None, web=None)
@@ -796,15 +1153,29 @@ async def execute_player_edit(
     if db["field"] == "tier" and role_context is not None and apply_roles is not None:
         kit_key = db.get("kit") or ""
         if player_after is None:
-            # Kanonickou podobu hráče PO změně doplníme ze souboru (právě
+            # Kanonickou podobu hráče PO změně doplníme z autority (právě
             # zapsáno výše) – stejně jako když ji dodá volající.
-            from services.player_identity import find_by_discord_id
-            from services.store import read as _store_read
+            if session_factory is not None:
+                from db.repositories.players import PlayerRepository
+                from db.services.session import transaction as _db_tx
+                from services.player_export import build_player_shape
 
-            current = await _store_read("players.json", [])
-            player_after = find_by_discord_id(
-                current if isinstance(current, list) else [], str(player_id)
-            )
+                async with _db_tx(session_factory) as session:
+                    _did = int(player_id) if str(player_id).isdigit() else None
+                    if _did is not None:
+                        _player = await PlayerRepository().get_by_discord_id(
+                            session, _did
+                        )
+                        if _player is not None:
+                            player_after = await build_player_shape(session, _player)
+            else:
+                from services.player_identity import find_by_discord_id
+                from services.store import read as _store_read
+
+                current = await _store_read("players.json", [])
+                player_after = find_by_discord_id(
+                    current if isinstance(current, list) else [], str(player_id)
+                )
         plan = plan_role_sync(
             player=player_after or {},
             member=role_context.get("member"),
@@ -828,9 +1199,14 @@ async def execute_player_edit(
 
     # --- Web (jen změny publikované v players.json) ---
     if db["field"] in ("tier", "ign", "discord_id") and push_web is not None:
-        from services.store import read as _store_read
+        if session_factory is not None:
+            from services.player_export import export_players
 
-        canonical = await _store_read("players.json", [])
+            canonical = await export_players(session_factory)
+        else:
+            from services.store import read as _store_read
+
+            canonical = await _store_read("players.json", [])
         if isinstance(canonical, list) and canonical:
             try:
                 wresult = await push_web(canonical)

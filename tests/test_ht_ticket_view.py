@@ -46,6 +46,10 @@ def _interaction():
     inter.channel_id = 1001
     inter.user.id = "99"
     inter.user.display_name = "tester-one"
+    # JSON režim: client bez db_session_factory, aby se testy chovaly stejně
+    # při assertNotCalled na session_factory (MagicMock trap: auto-MagicMock
+    # client by byl truthy a podstrčil by view falešný session_factory).
+    inter.client.db_session_factory = None
     inter.message = mock.MagicMock()
     inter.message.edit = mock.AsyncMock()
     inter.response.send_message = mock.AsyncMock()

@@ -199,6 +199,24 @@ class QueueServiceTests(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_preset_player_room(self):
+        async def main():
+            await queue_service.preset_player_room(
+                {
+                    "id": "8",
+                    "username": "h",
+                    "ign": "Hank",
+                    "kit": "",
+                    "joinedAt": 0,
+                },
+                999,
+            )
+            pulled = storage.load_data("pulled_players.json", {})
+            self.assertEqual(pulled["8"]["channel"], "999")
+            self.assertEqual(pulled["8"]["player"]["username"], "h")
+
+        asyncio.run(main())
+
 
 class CooldownRemainingTests(unittest.TestCase):
     """cooldowns.json ukládá čas POSLEDNÍHO testu (ne expiry).

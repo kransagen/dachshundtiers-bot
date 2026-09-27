@@ -46,7 +46,8 @@ from config import (
     TOP_RESULT_CHANNEL_ID,
     TOP_RESULT_ROLE_ID,
 )
-from cogs.roles import auto_grant_kit_role
+from cogs.roles import TierRoleGrant, auto_grant_kit_role
+from services.kit_catalog import get_kits
 from services.results import ANNOUNCEMENT_FAILED, ANNOUNCEMENT_SENT
 from services.tickets import get_ticket, is_ht_fight_ticket
 from services.topresult import (
@@ -60,7 +61,7 @@ from services.topresult import (
     validate_ht_fight_tier,
     validate_topresult_config,
 )
-from utils import get_kits, has_tester_role, kit_autocomplete, now_ms, today_cz
+from utils import has_tester_role, kit_autocomplete, now_ms, today_cz
 
 log = logging.getLogger("dachshundtiers")
 
@@ -171,6 +172,13 @@ class TopResult(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
+        # G0 audit fix (H1 cutover): resolved once, used for every
+        # dual-mode call below (ticket lookup, kit lookup, the canonical
+        # record_ht_fight write, tier grant). Previously get_ticket and
+        # record_ht_fight never received it, so /topresult always used the
+        # legacy JSON path even when PostgreSQL was fully configured.
+        sf = getattr(self.bot, "db_session_factory", None)
+
         # 0) Konfigurace /topresult – jasná admin chyba místo tichého selhání.
         ok_cfg, cfg_msg = validate_topresult_config(TOP_RESULT_CHANNEL_ID, TOP_RESULT_ROLE_ID)
         if not ok_cfg:
@@ -207,7 +215,7 @@ class TopResult(commands.Cog):
         #     mimo ticket musí být hrac/ign/kit zadány.
         ticket = None
         if isinstance(interaction.channel, discord.TextChannel):
-            ticket = await get_ticket(interaction.channel_id)
+            ticket = await get_ticket(interaction.channel_id, session_factory=sf)
 
         if ticket is not None:
             if not is_ht_fight_ticket(ticket):
@@ -243,7 +251,10 @@ class TopResult(commands.Cog):
             player_name = hrac.display_name or hrac.name
             ign_clean = (ign or "").strip()
             kit_clean = (kit or "").strip()
-            if not is_registered_kit(kit_clean, get_kits()):
+            if not is_registered_kit(
+                kit_clean,
+                await get_kits(session_factory=sf),
+            ):
                 return await interaction.followup.send(
                     f"❌ Neznámý kit `{kit_clean}` – registruj ho přes `/addkit` "
                     "(nebo první `/result`).",
@@ -271,7 +282,11 @@ class TopResult(commands.Cog):
                 "❌ Soupeř nemůže být stejný hráč jako testovaný.", ephemeral=True
             )
 
-        # 1) Zápis do kanonické historie (ht_results.json, resultType=ht_fight):
+        # 1) Zápis do kanonické historie. V DB režimu (session_factory) jde
+        #    o kanonický PostgreSQL zápis (Result, promotion_status=
+        #    discord_pending) – players.json se NEpíše a nerozhoduje o
+        #    current tieru (G0 audit fix / H1 cutover). Bez PostgreSQL
+        #    zůstává legacy JSON chování (ht_results.json) beze změny.
         #    výhra = povýšení hráče, ticket zůstává otevřený; prohra = zavření
         #    ticketu + HT3+ cooldown vlastníka.
         record = await record_ht_fight(
@@ -292,6 +307,7 @@ class TopResult(commands.Cog):
             now=now_ms(),
             date=today_cz(),
             ht3_cooldown_ms=HT3_COOLDOWN_MS,
+            session_factory=sf,
         )
         r = record["result"]
         if r == "duplicate":
@@ -371,19 +387,68 @@ class TopResult(commands.Cog):
         # 1a) Výhra = povýšení → udělení nové tier role (stejná centrální
         #     synchronizační logika jako /result, NENÍ to druhý role systém).
         grant_note = ""
+        grant = None
         if promoted:
             try:
-                grant_note = await auto_grant_kit_role(
-                    interaction.guild, player_id, kit_clean, tier_up=new_tier
+                grant = await auto_grant_kit_role(
+                    interaction.guild,
+                    player_id,
+                    kit_clean,
+                    tier_up=new_tier,
+                    session_factory=sf,
+                )
+                grant_note = (
+                    grant.note if isinstance(grant, TierRoleGrant) else grant
                 )
             except Exception:  # noqa: BLE001
                 log.exception("Nelze udělit tier roli po HT Fightu (%s)", kit_clean)
                 grant_note = "⚠️ Tier roli se nepodařilo udělit – oprav ji manuálně."
 
+        # 1a2) PostgreSQL mirror (Discord-first, invariant 6): jen když se role
+        #      opravdu změnila (grant.ok) – selže-li DB, událost do outboxu.
+        db_note = ""
+        if promoted:
+            try:
+                from db.services import commit_promotion_with_wedge
+
+                if (
+                    isinstance(grant, TierRoleGrant)
+                    and grant.ok
+                    and grant.tier_role_id is not None
+                ):
+                    wedge = await commit_promotion_with_wedge(
+                        session_factory=sf,
+                        result_key=f"ht_fight:{rec.get('id')}",
+                        kind="ht_fight",
+                        discord_id=int(player_id),
+                        ign=ign_clean,
+                        kit_key=kit_clean,
+                        new_tier_code=new_tier,
+                        discord_role_id=int(grant.tier_role_id),
+                        previous_tier_code=(
+                            previous_tier if previous_tier not in ("N/A", "") else None
+                        ),
+                        bridge_tier_code=(rec.get("bridgeTier") or None),
+                        tier_status=tier_status.strip() or None,
+                        score=score.strip(),
+                        outcome=outcome,
+                        opponent_id=(
+                            int(rec["opponentId"]) if rec.get("opponentId") else None
+                        ),
+                        opponent_name=(rec.get("opponentName") or None),
+                        date=(rec.get("date") or None),
+                        audit_actor_id=interaction.user.id,
+                        audit_actor_name=str(interaction.user),
+                    )
+                    if wedge.message:
+                        db_note = f"\n{wedge.message}"
+            except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /topresult
+                log.exception("PostgreSQL mirror pro HT Fight %s selhal", kit_clean)
+
         # 1b) Prohra v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
         if ticket is not None:
             try:
-                fresh_ticket = await get_ticket(ticket["id"])
+                fresh_ticket = await get_ticket(ticket["id"], session_factory=sf)
                 if fresh_ticket and fresh_ticket.get("panelMessageId"):
                     from views import ticket_embed
 
@@ -450,6 +515,8 @@ class TopResult(commands.Cog):
                 reply += " ⚡ (bridge – přeskočení na zadaný tier)"
             if grant_note:
                 reply += f"\n{grant_note}"
+            if db_note:
+                reply += f"\n{db_note}"
         await interaction.followup.send(reply, ephemeral=True)
 
 

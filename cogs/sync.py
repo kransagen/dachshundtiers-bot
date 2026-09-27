@@ -1,35 +1,38 @@
 """Centrální synchronizace – /sync (check | discord | web | data).
 
-Kanonický tok (jediný zdroj pravdy = ``data/players.json``):
+Fáze C – Discord je JEDINÁ autorita aktuálních tier rolí:
 
-    players.json → Discord role  (/sync discord, RoleSyncService)
-                → web/GitHub    (/sync web, services/websync)
+    Discord tier role → PostgreSQL mirror  (/sync discord, DiscordSyncService)
+    players.json      → web/GitHub         (/sync web, services/websync)
+    /result /topresult /linkdiscord        (explicitní operace s rolemi)
 
-- ``/sync check``   – read-only diagnostika: Discord role × players.json × web
-                      + lokální integrita (tickety, výsledky, evaly, duplicity).
-                      Nález se rozdělí na OK / WARNING / CONFLICT / ERROR a dá
-                      se filtrovat podle oblasti (area).
-- ``/sync discord`` – preview/apply: DB → Discord role. Nikdy nepřepisuje DB
-                      podle Discordu, nepovažuje Discorda za autoritativního,
-                      neřeší konflikty automaticky a neignoruje retired tiery.
-- ``/sync web``     – preview/apply: DB → web. Selhání GitHubu NIKDY není
-                      hlášeno jako úspěch; prázdná DB se na web neposílá.
-- ``/sync data``    – hluboká kontrola integrity (dříve /datacheck). Bezpečné
-                      opravy (zavření osamoceného ticketu, bezeztrátová
-                      normalizace tierů) jen po potvrzení tlačítkem.
+- ``/sync check``     – read-only diagnostika: Discord × players.json × web
+                        + lokální integrita (tickety, výsledky, evaly, duplicity).
+                        Nález se rozdělí na OK / WARNING / CONFLICT / ERROR a dá
+                        se filtrovat podle oblasti (area).
+- ``/sync discord``   – OBSERVE-ONLY: Discord → PostgreSQL mirror. Nikdy nemění
+                        Discord role, neopravuje anomálie automaticky a nikdy
+                        nepoužívá DB k rozsuzování Discordu.
+- ``/sync discord-rollback`` – jediná mutace rolí normálního syncu: invertuje
+                        PŘESNĚ akce historického aplikovaného syncu z auditu
+                        (obnova po chybném odsouhlasení; jinak se role nemění).
+- ``/sync web``       – preview/apply: DB → web. Selhání GitHubu NIKDY není
+                        hlášeno jako úspěch; prázdná DB se na web neposílá.
+- ``/sync data``      – hluboká kontrola integrity (dříve /datacheck). Bezpečné
+                        opravy (zavření osamoceného ticketu, bezeztrátová
+                        normalizace tierů) jen po potvrzení tlačítkem.
 
 Deprecated aliasy (funkční, upozorní na /sync):
-  /playersync preview|apply → /sync discord [mode]
+  /playersync preview|apply → /sync discord (observe-only)
   /websync   preview|apply  → /sync web   [mode]
   /checkweb  preview        → /sync check
-  /checkweb  apply          → per-záznamová rozhodnutí (jediný Discord→DB
-                              writer – explicitní rozhodnutí, doporučuje se
-                              /edituser; služba services.checkweb beze změny)
+  /checkweb  apply          → per-záznamová rozhodnutí, už jen NÁHLED (F-FIX:
+                              zápis JSON odstraněn; změnu provede /sync discord)
   /datacheck                → /sync data
 
 Architektura: tento cog JE POUZE orchestrace. Business logika zůstává ve
 službách (services/checkweb, services/playersync+role_sync, services/websync,
-services/datacheck) – NEVYTVÁŘÍME žádné nové služby.
+services/datacheck, db/services/mirror_sync) – NEVYTVÁŘÍME žádné nové služby.
 """
 
 import logging
@@ -42,13 +45,21 @@ from discord.ext import commands
 import github_sync
 from cogs._shared import (
     admin_gate_error,
-    apply_role_actions,
     apply_rollback_actions,
     guild_members,
     kit_display_map,
     member_to_dict,
-    save_players,
 )
+from db.repositories.sync_audit import (
+    SYNC_ACTION_APPLIED,
+    SYNC_ACTION_FAILED,
+    SYNC_RUN_FAILED,
+    SYNC_RUN_PARTIAL,
+    SYNC_RUN_SUCCESS,
+    SyncActionRepository,
+)
+from db.services import DiscordSyncOutcome, DiscordSyncService
+from db.services.session import transaction
 from services.checkweb import (
     STATUS_LABELS,
     STATUSES,
@@ -65,15 +76,13 @@ from services.datacheck import (
     perform_repairs,
     run_datacheck,
 )
+from services.kit_roles import get_all_kit_role_maps
+from services.player_export import export_players
 from services.role_sync import (
-    KIND_LABELS as PS_KIND_LABELS,
-    KINDS as PS_KINDS,
-    analyze_role_sync,
     build_rollback_plan,
     find_rollback_target,
     fingerprint,
     get_playersync_log,
-    log_playersync_event,
     log_playersync_rollback_event,
     verify_rollback_plan,
 )
@@ -212,20 +221,42 @@ async def _fetch_website():
     return players, "GitHub", []
 
 
-async def _gather_role_sync(guild: discord.Guild) -> dict:
-    """Čerstvá analýza: role vs. players.json (nic nemění)."""
-    roles_map = load_data(KIT_ROLES_FILE, {}) or {}
-    players = load_data("players.json", []) or []
-    kit_display = kit_display_map()
-    members = [member_to_dict(m) for m in await guild_members(guild)]
-    return analyze_role_sync(players, members, roles_map, kit_display)
+async def _canonical_for_export(session_factory) -> list:
+    """Canonical players pro web/GitHub export: PostgreSQL → players.json fallback.
+
+    Export je export-only kanál: při výpadku DB nesmí selhat, ale fallback je
+    hlasitý (log.exception) a nikdy se nepropírá do autoritativních cest.
+    """
+    if session_factory is not None:
+        try:
+            return await export_players(session_factory)
+        except Exception:  # noqa: BLE001 – výpadek DB nesmí zablokovat export
+            log.exception(
+                "Canonical export z PostgreSQL selhal – pokračuji z data/players.json"
+            )
+    return load_data("players.json", []) or []
 
 
-async def _gather_checkweb(guild: discord.Guild) -> dict:
-    """Čerstvá analýza: Discord role × players.json × web (nic nemění)."""
-    roles_map = load_data(KIT_ROLES_FILE, {}) or {}
-    players = load_data("players.json", []) or []
-    kit_display = kit_display_map()
+async def _canonical_players(session_factory) -> list:
+    """'DB' strana checkweb analýzy = canonical data z PostgreSQL (F-FIX).
+
+    V DB režimu je ``players.json`` export-only a nesmí být čten jako zdroj
+    current tieru, takže výpadek DB vyvolá výjimku — žádný tichý fallback.
+    Bez ``session_factory`` běží legacy JSON režim, kde je ``players.json``
+    jediný dostupný store.
+    """
+    if session_factory is not None:
+        return await export_players(session_factory)
+    return load_data("players.json", []) or []
+
+
+async def _gather_checkweb(
+    guild: discord.Guild, *, session_factory=None
+) -> dict:
+    """Čerstvá analýza: Discord role × PostgreSQL mirror × web (nic nemění)."""
+    roles_map = await get_all_kit_role_maps(session_factory=session_factory)
+    players = await _canonical_players(session_factory)
+    kit_display = await kit_display_map(session_factory=session_factory)
     members = [member_to_dict(m) for m in await guild_members(guild)]
 
     web_players, website_source, errors = await _fetch_website()
@@ -442,53 +473,6 @@ async def _edit_embed_pack(interaction, embeds) -> None:
             await interaction.message.edit(embeds=embeds[:10], view=None)
     except (discord.HTTPException, discord.Forbidden) as err:
         log.warning("Nelze upravit potvrzovací zprávu: %s", err)
-
-
-def _playersync_embed(analysis: dict, *, mode: str, note: str = "") -> list:
-    """Embed pack s přehledem rozdílů (preview / apply) – VŠECHNY nálezy."""
-    if mode == "apply":
-        if analysis["has_actions"]:
-            footer = (
-                f"Navržených změn: {len(analysis['actions'])} – pro aplikaci "
-                "potvrď tlačítkem níže."
-            )
-        else:
-            footer = (
-                "Žádné změny nelze aplikovat automaticky – viz nálezy "
-                "(oprava je ruční)."
-            )
-    else:
-        footer = (
-            "Náhled – žádné změny neaplikovány. Pro aplikaci použij "
-            "/sync discord mode:apply."
-        )
-
-    if not analysis["findings"]:
-        embed = discord.Embed(
-            title="✅ /sync discord – vše v pořádku",
-            description="Role tierů odpovídají players.json. Nemám co opravovat.",
-            color=0x10B981,
-        )
-        embed.set_footer(text=footer)
-        _append_note(embed, note)
-        return [embed]
-
-    embeds = build_embed_pack(
-        title=f"🔎 /sync discord – {'potvrzení změn' if mode == 'apply' else 'náhled'}",
-        description=(
-            f"Zkontrolováno párů (člen × kit): **{analysis['checked']}** "
-            f"(beze změny: **{analysis.get('unchanged', 0)}**)\n\n"
-            + "\n".join(
-                f"{PS_KIND_LABELS[k]}: **{analysis['summary'].get(k, 0)}**"
-                for k in PS_KINDS
-            )
-        ),
-        color=0xF59E0B,
-        footer=footer,
-        sections=[("Zjištěné rozdíly", [f["message"] for f in analysis["findings"]])],
-    )
-    _append_note(embeds[0], note)
-    return embeds
 
 
 def _fmt_ts(ts_ms) -> str:
@@ -873,95 +857,6 @@ def _check_embed(
 # ---------------------------------------------------------------------------
 # Potvrzovací view (přesunuto beze změny logiky ze starých cogů)
 # ---------------------------------------------------------------------------
-class SyncDiscordConfirmView(SafeView):
-    """Tlačítko „Potvrdit a aplikovat" pro /sync discord apply."""
-
-    def __init__(self, *, analysis: dict):
-        super().__init__(timeout=120)
-        self.fingerprint = analysis["fingerprint"]
-        self.finished = False
-
-    @discord.ui.button(
-        label="✅ Potvrdit a aplikovat",
-        style=discord.ButtonStyle.success,
-        custom_id="sync_discord_confirm",
-    )
-    async def confirm(self, interaction: discord.Interaction, button) -> None:
-        if (msg := admin_gate_error(interaction)) is not None:
-            return await interaction.response.send_message(msg, ephemeral=True)
-        if self.finished:
-            return await interaction.response.send_message(
-                "✅ Změny už byly aplikované.", ephemeral=True
-            )
-
-        await interaction.response.defer(ephemeral=True)
-
-        # 1) Ověření, že se stav od náhledu nezměnil → aplikujeme PŘESNĚ to,
-        #    co admin potvrdil (nikdy nic automaticky navíc).
-        fresh = await _gather_role_sync(interaction.guild)
-        if fingerprint(fresh["actions"]) != self.fingerprint:
-            self.finished = True
-            applied = []
-            await self._finish(interaction, applied=applied, stale=True)
-            return
-
-        # 2) Aplikace akcí – každá zvlášť, chyby se nikdy nešíří dál.
-        applied = await apply_role_actions(interaction.guild, fresh["actions"])
-
-        # 3) Audit.
-        try:
-            await log_playersync_event(
-                actor_id=interaction.user.id,
-                actor_name=str(interaction.user),
-                mode="apply",
-                summary=fresh["summary"],
-                applied=applied,
-            )
-        except Exception:  # noqa: BLE001 – audit nesmí shodit aplikaci
-            log.exception("Auditní zápis (apply) selhal")
-
-        self.finished = True
-        await self._finish(interaction, applied=applied, stale=False)
-
-    async def _finish(self, interaction, *, applied, stale) -> None:
-        if stale:
-            embed = discord.Embed(
-                title="🔄 /sync discord – stav se změnil",
-                description=(
-                    "Mezitím se změnily role nebo players.json – **nic jsem "
-                    "neaplikoval**. Spusť **/sync discord mode:apply** znovu."
-                ),
-                color=0xEF4444,
-            )
-        else:
-            ok = sum(1 for a in applied if a.get("ok"))
-            lines = []
-            for a in applied[:15]:
-                mark = "✅" if a.get("ok") else "❌"
-                op = "přidána" if a.get("op") == "add" else "odebrána"
-                line = f"{mark} <@{a.get('memberId')}> – {op} role <@&{a.get('roleId')}>"
-                if not a.get("ok"):
-                    line += f" (chyba: {a.get('error')})"
-                lines.append(line)
-            if len(applied) > 15:
-                lines.append(f"…a dalších {len(applied) - 15} akcí")
-            embed = discord.Embed(
-                title="✅ /sync discord – změny aplikovány",
-                description=(
-                    f"Úspěšně: **{ok} / {len(applied)}** akcí.\n\n" + "\n".join(lines)
-                ),
-                color=0x10B981 if ok == len(applied) and applied else 0xF59E0B,
-            )
-            embed.set_footer(text="Zapsáno do data/playersync_log.json (audit).")
-
-        try:
-            if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=None)
-        except (discord.HTTPException, discord.Forbidden) as err:
-            log.warning("Nelze upravit potvrzovací zprávu: %s", err)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
 class SyncDiscordRollbackView(SafeView):
     """Tlačítko „Potvrdit a vrátit změny" pro /sync discord-rollback apply.
 
@@ -1014,7 +909,15 @@ class SyncDiscordRollbackView(SafeView):
             return
 
         # 2) Aplikace rollback akcí – každá zvlášť, chyby se nešíří dál.
-        results = await apply_rollback_actions(interaction.guild, fresh_plan["actions"])
+        #    H3 audit fix: session_factory/target_ts umožní za-akci ověřit,
+        #    že hráč nebyl po cíleném syncu znovu povýšen přes /result
+        #    (jinak se akce přeskočí, viz apply_rollback_actions).
+        results = await apply_rollback_actions(
+            interaction.guild,
+            fresh_plan["actions"],
+            session_factory=getattr(interaction.client, "db_session_factory", None),
+            target_ts=fresh_plan["target_ts"],
+        )
 
         # 3) Rollback audit (separátní soubor; původní audit syncu se nemění).
         summary = {
@@ -1023,6 +926,9 @@ class SyncDiscordRollbackView(SafeView):
                 1 for r in results if r.get("status") == "already_correct"
             ),
             "failed": sum(1 for r in results if r.get("status") == "failed"),
+            "skipped_newer_promotion": sum(
+                1 for r in results if r.get("status") == "skipped_newer_promotion"
+            ),
             "total": len(results),
         }
         try:
@@ -1061,12 +967,16 @@ class SyncDiscordRollbackView(SafeView):
                 1 for r in results if r.get("status") == "already_correct"
             )
             failed = sum(1 for r in results if r.get("status") == "failed")
+            skipped_newer = sum(
+                1 for r in results if r.get("status") == "skipped_newer_promotion"
+            )
             lines = []
             for r in results[:15]:
                 mark = {
                     "applied": "✅",
                     "already_correct": "🟢",
                     "failed": "❌",
+                    "skipped_newer_promotion": "⏭️",
                 }.get(r.get("status"), "❓")
                 op = "přidána" if r.get("op") == "add" else "odebrána"
                 line = (
@@ -1077,6 +987,8 @@ class SyncDiscordRollbackView(SafeView):
                     line += f" (chyba: {r.get('error')})"
                 elif r.get("status") == "already_correct":
                     line += " (už ve stavu po rollbacku)"
+                elif r.get("status") == "skipped_newer_promotion":
+                    line += f" ({r.get('error')})"
                 lines.append(line)
             if len(results) > 15:
                 lines.append(f"…a dalších {len(results) - 15} akcí")
@@ -1084,6 +996,7 @@ class SyncDiscordRollbackView(SafeView):
                 title="↩️ /sync discord-rollback – dokončeno",
                 description=(
                     f"Aplikováno: **{applied}** · Už správně: **{already}** · "
+                    f"Přeskočeno (novější /result): **{skipped_newer}** · "
                     f"Chyby: **{failed}** / {len(results)}\n\n"
                     + "\n".join(lines)
                 ),
@@ -1132,7 +1045,8 @@ class SyncWebConfirmView(SafeView):
 
         # Ověření, že se kanonická DB od náhledu nezměnila – nahrajeme PŘESNĚ
         # to, co admin potvrdil (nikdy nic automaticky navíc).
-        canonical = load_data("players.json", []) or []
+        session_factory = getattr(interaction.client, "db_session_factory", None)
+        canonical = await _canonical_for_export(session_factory)
         if not canonical or fingerprint_canonical(canonical) != self.fingerprint:
             self.finished = True
             await self._finish(interaction, result=None, stale=True)
@@ -1195,7 +1109,7 @@ class SyncImportDiscordConfirmView(SafeView):
         self.finished = False
 
     @discord.ui.button(
-        label="✅ Potvrdit: Discord → DB → web",
+        label="ℹ️ Jak to opravit",
         style=discord.ButtonStyle.success,
         custom_id="sync_importdiscord_confirm",
     )
@@ -1208,76 +1122,58 @@ class SyncImportDiscordConfirmView(SafeView):
             )
 
         await interaction.response.defer(ephemeral=True)
-        fresh = await _gather_checkweb(self.guild)
+        fresh = await _gather_checkweb(
+            self.guild,
+            session_factory=getattr(
+                interaction.client, "db_session_factory", None
+            ),
+        )
         if fingerprint_resolvable(fresh["records"]) != self.fingerprint:
             self.finished = True
             return await self._finish(interaction, stale=True)
 
         decisions, skipped = build_discord_import_decisions(fresh["records"])
-        players = load_data("players.json", []) or []
-        new_players, applied = apply_checkweb_decisions(
-            players=players,
+        # F-FIX: players.json se už nezapisuje. `apply_checkweb_decisions` jen
+        # spočítá návrh; current tier promítne do PostgreSQL /sync discord
+        # (Discord → PG mirror) a players.json obnoví canonical export.
+        _, applied = apply_checkweb_decisions(
+            players=await _canonical_players(
+                getattr(interaction.client, "db_session_factory", None)
+            ),
             records=fresh["records"],
             decisions=decisions,
             kit_display=fresh.get("kit_display") or {},
         )
-        changed = [a for a in applied if a.get("ok") and a.get("newTier") != a.get("oldTier")]
-        if not changed:
-            self.finished = True
-            return await self._finish(interaction, applied=applied, skipped=skipped)
-
-        try:
-            await save_players(new_players)
-        except Exception as err:  # noqa: BLE001 – na web se po selhání DB nesmí psát
-            log.exception("Zápis players.json (/sync importdiscord) selhal")
-            self.finished = True
-            return await self._finish(
-                interaction, applied=applied, skipped=skipped, error=str(err)
-            )
 
         try:
             await log_checkweb_event(
                 actor_id=interaction.user.id,
                 actor_name=str(interaction.user),
                 mode="import_discord",
-                status="success",
+                status="superseded",
                 summary=fresh["summary"],
                 website=fresh.get("website_source"),
-                errors=fresh.get("errors") or [],
+                errors=(
+                    "F-FIX: zápis players.json odstraněn – "
+                    "použij /sync discord (Discord → PostgreSQL mirror)"
+                ),
                 repairs=applied,
             )
-        except Exception:  # noqa: BLE001 – audit nesmí zrušit hotový zápis
+        except Exception:  # noqa: BLE001 – audit nesmí shodit výpis
             log.exception("Auditní zápis (/sync importdiscord) selhal")
 
-        web_result = await sync_website(
-            canonical=new_players,
-            message="sync importdiscord: Discord tier role → players.json → web",
-            actor_id=interaction.user.id,
-            actor_name=str(interaction.user),
-        )
         self.finished = True
-        await self._finish(
-            interaction, applied=applied, skipped=skipped, web_result=web_result
-        )
+        await self._finish(interaction, applied=applied, skipped=skipped)
 
     async def _finish(
-        self, interaction, *, stale=False, applied=None, skipped=None, web_result=None, error=""
+        self, interaction, *, stale=False, applied=None, skipped=None
     ) -> None:
         if stale:
             embed = discord.Embed(
                 title="🔄 /sync importdiscord – stav se změnil",
                 description=(
-                    "Mezitím se změnily Discord role nebo players.json – "
+                    "Mezitím se změnily Discord role nebo PostgreSQL mirror – "
                     "**nic jsem nezapsal**. Spusť příkaz znovu."
-                ),
-                color=0xEF4444,
-            )
-        elif error:
-            embed = discord.Embed(
-                title="❌ /sync importdiscord – DB se neuložila",
-                description=(
-                    f"players.json se nepodařilo zapsat: `{error}`. "
-                    "Web se proto vůbec neměnil."
                 ),
                 color=0xEF4444,
             )
@@ -1286,7 +1182,6 @@ class SyncImportDiscordConfirmView(SafeView):
                 a for a in (applied or [])
                 if a.get("ok") and a.get("newTier") != a.get("oldTier")
             ]
-            web_ok = bool(web_result and web_result.get("ok"))
             lines = [
                 f"✏️ **{a['player']}** · **{a['kit']}**: "
                 f"{a.get('oldTier') or '—'} → **{a.get('newTier')}**"
@@ -1295,20 +1190,19 @@ class SyncImportDiscordConfirmView(SafeView):
             if len(changed) > 12:
                 lines.append(f"…a dalších {len(changed) - 12} změn")
             description = (
-                f"Zapsáno do DB: **{len(changed)}** tierů. "
+                f"Rozhodnutí k promítnutí: **{len(changed)}** tierů. "
                 f"Přeskočeno k ručnímu řešení: **{len(skipped or [])}**.\n\n"
                 + ("\n".join(lines) if lines else "Žádná jednoznačná změna.")
+                + "\n\n**Nic jsem nezapsal.** Tento příkaz už players.json ani "
+                "PostgreSQL nemění. Použij `/sync discord` (Discord → "
+                "PostgreSQL mirror) a pak `/sync web` (export na web)."
             )
-            if web_result:
-                description += "\n\n" + (
-                    "✅ Web aktualizován." if web_ok else f"⚠️ DB je uložená, web ne: {web_result['message']}"
-                )
             embed = discord.Embed(
-                title="✅ /sync importdiscord – dokončeno" if web_ok else "⚠️ /sync importdiscord – DB dokončena",
+                title="ℹ️ /sync importdiscord – jen náhled",
                 description=description,
-                color=0x10B981 if web_ok else 0xF59E0B,
+                color=0xF59E0B,
             )
-            embed.set_footer(text="Audit: data/checkweb_log.json a data/websync_log.json")
+            embed.set_footer(text="Audit: data/checkweb_log.json")
         try:
             if interaction.message is not None:
                 await interaction.message.edit(embed=embed, view=None)
@@ -1364,11 +1258,25 @@ class SyncDataRepairView(SafeView):
             return
 
         r = report["repairable"]
+        db_mode = getattr(interaction.client, "db_session_factory", None) is not None
+        if db_mode:
+            # F-FIX: players.json je v DB režimu generovaný export – normalizovat
+            # v něm `modes` by znamenalo zápis current tieru do neautority.
+            r = {**r, "normalize_tier": []}
         if not r["close_ticket"] and not r["normalize_tier"]:
             embeds = [
                 discord.Embed(
                     title="✅ /sync data – už není co opravit",
-                    description="Kontrola po náhledu nehlásí žádné bezpečné opravy.",
+                    description=(
+                        "Kontrola po náhledu nehlásí žádné bezpečné opravy."
+                        + (
+                            "\n\nV PostgreSQL režimu se navíc neopravují tiery v "
+                            "players.json – current tier je v `player_current_tiers` "
+                            "a opravuje se přes `/edituser`."
+                            if db_mode
+                            else ""
+                        )
+                    ),
                     color=0x10B981,
                 )
             ]
@@ -1540,30 +1448,28 @@ class CheckWebApplyView(SafeView):
 
         # 1) Ověření, že se stav od náhledu nezměnil → aplikujeme PŘESNĚ to,
         #    co admin potvrdil (nikdy nic automaticky navíc).
-        fresh = await _gather_checkweb(self.guild)
+        fresh = await _gather_checkweb(
+            self.guild,
+            session_factory=getattr(
+                interaction.client, "db_session_factory", None
+            ),
+        )
         if fingerprint_resolvable(fresh["records"]) != self.fingerprint:
             self.finished = True
             await self._finish(interaction, applied=None, stale=True)
             return
 
-        # 2) Aplikace potvrzených rozhodnutí na kanonickou DB.
-        players = load_data("players.json", []) or []
-        new_players, applied = apply_checkweb_decisions(
-            players=players,
+        # 2) Rozhodnutí se pouze SPOČÍTAJÍ jako návrh. F-FIX: players.json ani
+        #    JSONB se už nezapisují – current tier promítne do PostgreSQL
+        #    /sync discord (Discord → PG mirror).
+        _, applied = apply_checkweb_decisions(
+            players=await _canonical_players(
+                getattr(interaction.client, "db_session_factory", None)
+            ),
             records=fresh["records"],
             decisions=list(self.decisions.values()),
             kit_display=fresh.get("kit_display") or {},
         )
-        changed = [
-            a
-            for a in applied
-            if a.get("ok") and a.get("newTier") != a.get("oldTier")
-        ]
-        if changed:
-            try:
-                await save_players(new_players)
-            except Exception:  # noqa: BLE001 – chyba se zaloguje a řekne
-                log.exception("Zápis players.json (/checkweb apply) selhal")
 
         # 3) Audit – KAŽDÉ rozhodnutí (i keep/ignore) se zapisuje.
         try:
@@ -1571,13 +1477,16 @@ class CheckWebApplyView(SafeView):
                 actor_id=interaction.user.id,
                 actor_name=str(interaction.user),
                 mode="apply",
-                status="success",
+                status="superseded",
                 summary=fresh["summary"],
                 website=fresh.get("website_source"),
-                errors=fresh.get("errors") or [],
+                errors=(
+                    "F-FIX: zápis players.json odstraněn – "
+                    "použij /sync discord (Discord → PostgreSQL mirror)"
+                ),
                 repairs=applied,
             )
-        except Exception:  # noqa: BLE001 – audit nesmí shodit aplikaci
+        except Exception:  # noqa: BLE001 – audit nesmí shodit výpis
             log.exception("Auditní zápis (/checkweb apply) selhal")
 
         self.finished = True
@@ -1588,7 +1497,7 @@ class CheckWebApplyView(SafeView):
             embed = discord.Embed(
                 title="🔄 /checkweb – stav se změnil",
                 description=(
-                    "Mezitím se změnily role, web nebo players.json – "
+                    "Mezitím se změnily role, web nebo PostgreSQL mirror – "
                     "**nic jsem nezměnil**. Spusť **/checkweb apply** znovu."
                 ),
                 color=0xEF4444,
@@ -1620,12 +1529,15 @@ class CheckWebApplyView(SafeView):
             if total > 12:
                 lines.append(f"…a dalších {total - 12} rozhodnutí")
             embed = discord.Embed(
-                title="✅ /checkweb – rozhodnutí aplikována",
+                title="ℹ️ /checkweb – rozhodnutí pouze zaznamenána",
                 description=(
-                    f"Změněno v players.json: **{ok} / {total}**\n\n"
+                    f"Rozhodnutí k promítnutí: **{ok} / {total}**\n\n"
                     + "\n".join(lines)
+                    + "\n\n**Nic jsem nezapsal.** Tento příkaz už players.json ani "
+                    "PostgreSQL nemění. Použij `/sync discord` (Discord → "
+                    "PostgreSQL mirror) a pak `/sync web` (export na web)."
                 ),
-                color=0x10B981 if ok and total else 0xF59E0B if total else 0xEF4444,
+                color=0xF59E0B,
             )
             embed.set_footer(
                 text=f"Rozhodnutí: {total} · Audit: data/checkweb_log.json"
@@ -1683,9 +1595,17 @@ class Sync(commands.Cog):
             await _send_embed_pack(interaction.followup, embeds)
             return
 
-        players = load_data("players.json", []) or []
-        roles_map = load_data(KIT_ROLES_FILE, {}) or {}
-        kit_display = kit_display_map()
+        players = await _canonical_players(
+            getattr(interaction.client, "db_session_factory", None)
+        )
+        roles_map = await get_all_kit_role_maps(
+            session_factory=getattr(interaction.client, "db_session_factory", None)
+        )
+        kit_display = await kit_display_map(
+            session_factory=getattr(
+                interaction.client, "db_session_factory", None
+            )
+        )
         members = [member_to_dict(m) for m in await guild_members(interaction.guild)]
 
         web_players, website_source, errors = await _fetch_website()
@@ -1778,59 +1698,138 @@ class Sync(commands.Cog):
         await _send_embed_pack(interaction.followup, embeds)
 
     # ------------------------------------------------------------------
-    # /sync discord
+    # /sync discord (observe-only: Discord → PostgreSQL mirror)
     # ------------------------------------------------------------------
     @sync.command(
         name="discord",
-        description="Synchronizace DB → Discord role (preview / po potvrzení apply)",
+        description="Observe-only: Discord tier role → PostgreSQL mirror",
     )
-    @app_commands.describe(mode="preview = jen analýza · apply = po potvrzení aplikuje")
-    @app_commands.choices(
-        mode=[
-            app_commands.Choice(name="preview", value="preview"),
-            app_commands.Choice(name="apply", value="apply"),
-        ]
-    )
-    async def sync_discord(self, interaction: discord.Interaction, mode: str) -> None:
-        await self._run_discord(interaction, mode=mode)
+    async def sync_discord(self, interaction: discord.Interaction) -> None:
+        await self._run_discord(interaction)
 
     async def _run_discord(
-        self, interaction: discord.Interaction, mode: str, *, note: str = ""
+        self, interaction: discord.Interaction, *, note: str = ""
     ) -> None:
         if (msg := admin_gate_error(interaction)) is not None:
             return await interaction.response.send_message(msg, ephemeral=True)
         await interaction.response.defer(ephemeral=True)
 
-        analysis = await _gather_role_sync(interaction.guild)
-        if mode == "preview":
-            try:
-                await log_playersync_event(
-                    actor_id=interaction.user.id,
-                    actor_name=str(interaction.user),
-                    mode="preview",
-                    summary=analysis["summary"],
-                    actions=analysis["actions"],
-                )
-            except Exception:  # noqa: BLE001 – audit nesmí shodit výpis
-                log.exception("Auditní zápis (preview) selhal")
-            embeds = _playersync_embed(analysis, mode="preview", note=note)
-            await _send_embed_pack(interaction.followup, embeds)
-            return
-
-        embeds = _playersync_embed(analysis, mode="apply", note=note)
-        if not analysis["findings"]:
-            await _send_embed_pack(interaction.followup, embeds)
-            return
-        if not analysis["has_actions"]:
-            embeds[0].set_footer(
-                text="Žádné změny nelze aplikovat automaticky – viz nálezy "
-                "(oprava je ruční)."
+        session_factory = getattr(self.bot, "db_session_factory", None)
+        if session_factory is None:
+            embed = discord.Embed(
+                title="❌ /sync discord – PostgreSQL není nakonfigurováno",
+                description=(
+                    "/sync discord vyžaduje DATABASE_URL. Bez PostgreSQL "
+                    "nelze mirror zapisovat – **nic se neměnilo** (ani mirror, "
+                    "ani Discord role)."
+                ),
+                color=0xEF4444,
             )
-            await _send_embed_pack(interaction.followup, embeds)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        view = SyncDiscordConfirmView(analysis=analysis)
-        await _send_embed_pack(interaction.followup, embeds, view=view)
+        members = await guild_members(interaction.guild)
+        try:
+            outcome = await DiscordSyncService().sync_guild(
+                session_factory,
+                members=members,
+                triggered_by=interaction.user.id,
+                triggered_by_name=str(interaction.user),
+            )
+        except Exception as err:  # noqa: BLE001 – selhání DB = tvrdá chyba
+            log.exception("Selhání /sync discord (PostgreSQL)")
+            embed = discord.Embed(
+                title="❌ /sync discord – databáze selhala",
+                description=(
+                    f"Mirror se NEzapsal (`{err}`). Discord role se vůbec "
+                    "neměnily – jsou i nadále jedinou autoritou. Zkuste to "
+                    "znovu; přetrvává-li problém, zkontrolujte PostgreSQL."
+                ),
+                color=0xEF4444,
+            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        embeds = await self._discord_observe_embed(
+            interaction, session_factory, outcome, note=note
+        )
+        await _send_embed_pack(interaction.followup, embeds)
+
+    async def _discord_observe_embed(
+        self,
+        interaction: discord.Interaction,
+        session_factory,
+        outcome: "DiscordSyncOutcome",
+        *,
+        note: str = "",
+    ) -> list:
+        """Embed z výsledku observe-only syncu (per-člen detaily ze sync_actions)."""
+        try:
+            async with transaction(session_factory) as session:
+                actions = await SyncActionRepository().list_for_run(
+                    session, sync_run_id=outcome.sync_run_id
+                )
+        except Exception:  # noqa: BLE001 – výpis nesmí spadnout kvůli detailům
+            log.exception("Čtení sync_actions pro embed selhalo")
+            actions = []
+
+        applied_lines, anomaly_lines, failed_lines = [], [], []
+        for a in actions:
+            member = f"<@{a.member_id}>" if a.member_id is not None else "_?_"
+            if a.status == SYNC_ACTION_APPLIED and a.discord_role_id is not None:
+                applied_lines.append(f"{member} → <@&{a.discord_role_id}>")
+            elif a.status == SYNC_ACTION_APPLIED:
+                applied_lines.append(f"{member} → tier `{a.tier_id}`")
+            elif a.status == SYNC_ACTION_FAILED:
+                err = (a.details or {}).get("error", "?")
+                failed_lines.append(f"{member} · `{err}`")
+            else:
+                cat = a.anomaly_category or a.action_type
+                anomaly_lines.append(f"{member} · `{cat}`")
+
+        status_icon = {
+            SYNC_RUN_SUCCESS: "✅",
+            SYNC_RUN_PARTIAL: "⚠️",
+            SYNC_RUN_FAILED: "❌",
+        }.get(outcome.status, "❓")
+        unknown_roles = (
+            ", ".join(f"`{r}`" for r in outcome.unknown_roles)
+            if outcome.unknown_roles
+            else "**0**"
+        )
+        description = (
+            f"Prozkoumáno členů: **{outcome.scanned_members}**\n"
+            f"Zrcadleno pozorování: **{outcome.observations_applied}**\n"
+            f"Anomálií: **{outcome.anomalies}** · Neznámých hráčů: "
+            f"**{outcome.unknown_members}** · Neznámých rolí: {unknown_roles}\n"
+            f"Chyb: **{outcome.failed_members}**"
+        )
+        sections = []
+        if applied_lines:
+            sections.append(("Zrcadleno do PostgreSQL", applied_lines))
+        if anomaly_lines:
+            sections.append(("⚠️ Anomálie (neopravují se automaticky)", anomaly_lines))
+        if failed_lines:
+            sections.append(("❌ Chyby zpracování", failed_lines))
+
+        embeds = build_embed_pack(
+            title=f"{status_icon} /sync discord – Discord → PostgreSQL mirror",
+            description=description,
+            color=(
+                0x10B981
+                if outcome.status == SYNC_RUN_SUCCESS
+                else 0xF59E0B
+                if outcome.status == SYNC_RUN_PARTIAL
+                else 0xEF4444
+            ),
+            footer=(
+                "Observe-only – Discord role se NEMĚNÍ. Discord je jediná "
+                f"autorita aktuálních tierů. Run: #{outcome.sync_run_id}."
+            ),
+            sections=sections,
+        )
+        _append_note(embeds[0], note)
+        return embeds
 
     # ------------------------------------------------------------------
     # /sync discord-rollback
@@ -1984,9 +1983,9 @@ class Sync(commands.Cog):
     # ------------------------------------------------------------------
     @sync.command(
         name="importdiscord",
-        description="Převezme jednoznačné Discord tiery do DB a pak na web",
+        description="Náhled jednoznačných Discord tierů proti PostgreSQL mirroru (nemění data)",
     )
-    @app_commands.describe(mode="preview = náhled · apply = po potvrzení zapíše DB i web")
+    @app_commands.describe(mode="preview = náhled · apply = jen zopakuje, co by /sync discord změnil")
     @app_commands.choices(
         mode=[
             app_commands.Choice(name="preview", value="preview"),
@@ -2005,7 +2004,12 @@ class Sync(commands.Cog):
             return await interaction.response.send_message(msg, ephemeral=True)
         await interaction.response.defer(ephemeral=True)
 
-        analysis = await _gather_checkweb(interaction.guild)
+        analysis = await _gather_checkweb(
+            interaction.guild,
+            session_factory=getattr(
+                self.bot, "db_session_factory", None
+            ),
+        )
         decisions, skipped = build_discord_import_decisions(analysis["records"])
         lines = [
             f"✏️ **{d['player']}** · **{d['kit_key']}** → **{d['tier']}**"
@@ -2026,8 +2030,9 @@ class Sync(commands.Cog):
         )
         embed.set_footer(
             text=(
-                "Při potvrzení: Discord → data/players.json → web. "
-                "Víc tier rolí se nikdy nevybírá automaticky."
+                "Jen náhled – nic se nezapisuje. Změnu promítne "
+                "/sync discord (Discord → PostgreSQL)."
+                " Víc tier rolí se nikdy nevybírá automaticky."
             )
         )
         if mode == "preview" or not decisions:
@@ -2060,7 +2065,8 @@ class Sync(commands.Cog):
             return await interaction.response.send_message(msg, ephemeral=True)
         await interaction.response.defer(ephemeral=True)
 
-        canonical = load_data("players.json", []) or []
+        session_factory = getattr(getattr(self, "bot", None), "db_session_factory", None)
+        canonical = await _canonical_for_export(session_factory)
         result = await preview_website(
             canonical=canonical,
             actor_id=interaction.user.id,
@@ -2148,7 +2154,12 @@ class Sync(commands.Cog):
             return await interaction.response.send_message(msg, ephemeral=True)
         await interaction.response.defer(ephemeral=True)
 
-        analysis = await _gather_checkweb(interaction.guild)
+        analysis = await _gather_checkweb(
+            interaction.guild,
+            session_factory=getattr(
+                self.bot, "db_session_factory", None
+            ),
+        )
         embeds = _checkweb_embed(analysis, mode="apply", note=note)
 
         resolvable = analysis.get("resolvable") or []
@@ -2173,24 +2184,22 @@ class Sync(commands.Cog):
 
     @playersync.command(
         name="preview",
-        description="DEPRECATED – použij /sync discord mode:preview",
+        description="DEPRECATED – použij /sync discord",
     )
     async def playersync_preview(self, interaction: discord.Interaction) -> None:
         await self._run_discord(
             interaction,
-            mode="preview",
-            note="⚠️ Deprecated – použij /sync discord mode:preview.",
+            note="⚠️ Deprecated – použij /sync discord.",
         )
 
     @playersync.command(
         name="apply",
-        description="DEPRECATED – použij /sync discord mode:apply",
+        description="DEPRECATED – /sync discord je observe-only (role se nemění)",
     )
     async def playersync_apply(self, interaction: discord.Interaction) -> None:
         await self._run_discord(
             interaction,
-            mode="apply",
-            note="⚠️ Deprecated – použij /sync discord mode:apply.",
+            note="⚠️ Deprecated – použij /sync discord.",
         )
 
     websync = app_commands.Group(
@@ -2244,8 +2253,8 @@ class Sync(commands.Cog):
         await self._run_checkweb_apply(
             interaction,
             note=(
-                "⚠️ Deprecated – jediný Discord→DB writer. Kanonický směr je "
-                "DB→Discord→web; doporučuje se /edituser."
+                "⚠️ Deprecated – explicitní Discord→DB zapisovač. "
+                "Preferuje se /edituser (nebo /sync discord mirror)."
             ),
         )
 

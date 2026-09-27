@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 import storage
@@ -46,6 +47,43 @@ class StorageTests(unittest.TestCase):
     def test_strict_mode_missing_file_returns_default(self):
         # strict řeší POŠKOZENÝ soubor; chybějící soubor je v pořádku (default)
         self.assertEqual(storage.load_data("nope.json", [], strict=True), [])
+
+    def test_strict_mode_postgres_outage_raises_not_empty_default(self):
+        """H7 audit fix: a transient PostgreSQL outage must NEVER silently
+        present as 'no players.json data' for a strict/canonical read — it
+        must raise, so callers can't mistake 'DB unreachable' for 'empty
+        player set' (e.g. a mass-role-removal /sync apply computed off a
+        spuriously-empty canonical list)."""
+
+        @contextmanager
+        def _boom():
+            raise RuntimeError("PostgreSQL úložiště není dostupné: boom")
+            yield  # pragma: no cover
+
+        with (
+            mock.patch.object(storage, "DATABASE_URL", "postgresql://x/y"),
+            mock.patch.object(storage, "postgres_connection", _boom),
+        ):
+            with self.assertRaises(RuntimeError):
+                storage.load_data("players.json", [], strict=True)
+
+    def test_non_strict_mode_postgres_outage_still_returns_default(self):
+        """Contrast case: non-strict callers (the historical default) DO
+        still swallow a PG outage into the empty default — this is the
+        exact behavior H7 flags as risky for canonical/authoritative reads,
+        which is why canonical readers must pass strict=True (see
+        services/store.Transaction.get, cogs/edituser.py)."""
+
+        @contextmanager
+        def _boom():
+            raise RuntimeError("PostgreSQL úložiště není dostupné: boom")
+            yield  # pragma: no cover
+
+        with (
+            mock.patch.object(storage, "DATABASE_URL", "postgresql://x/y"),
+            mock.patch.object(storage, "postgres_connection", _boom),
+        ):
+            self.assertEqual(storage.load_data("players.json", []), [])
 
     def test_save_failure_raises_and_keeps_original(self):
         storage.save_data("x.json", {"v": 1})

@@ -21,6 +21,7 @@ from unittest import mock
 
 import storage
 from cogs.results import Results
+from cogs.roles import TierRoleGrant
 from services import results, tickets
 
 NOW = 1_700_000_000_000
@@ -559,6 +560,12 @@ class ResultCogSelfResultTests(unittest.TestCase):
 
     def test_tester_cannot_record_own_result(self):
         cog = Results.__new__(Results)
+        # G0 audit fix: result() now reads self.bot.db_session_factory
+        # earlier (before the self-result guard used to be the only thing
+        # reached) — a real cog always has .bot via __init__; this stub
+        # needs it explicitly. None => legacy JSON mode, matching what
+        # these tests already assume (no DB fixtures set up here).
+        cog.bot = SimpleNamespace(db_session_factory=None)
         inter = self._interaction(user_id=777)
         hrac = SimpleNamespace(id=777, name="AliceMC", display_name="AliceMC")
 
@@ -574,6 +581,12 @@ class ResultCogSelfResultTests(unittest.TestCase):
     def test_tester_can_record_other_players_result(self):
         """Jiný hráč → guard propustí do hlavního toku (defer → validace)."""
         cog = Results.__new__(Results)
+        # G0 audit fix: result() now reads self.bot.db_session_factory
+        # earlier (before the self-result guard used to be the only thing
+        # reached) — a real cog always has .bot via __init__; this stub
+        # needs it explicitly. None => legacy JSON mode, matching what
+        # these tests already assume (no DB fixtures set up here).
+        cog.bot = SimpleNamespace(db_session_factory=None)
         inter = self._interaction(user_id=777)
         hrac = SimpleNamespace(id=999, name="BobMC", display_name="BobMC")
 
@@ -596,6 +609,12 @@ class ResultCogSelfResultTests(unittest.TestCase):
     def test_admin_may_record_own_result(self):
         """Admin (jiný subjekt dohledu) smí zapsat i sobě."""
         cog = Results.__new__(Results)
+        # G0 audit fix: result() now reads self.bot.db_session_factory
+        # earlier (before the self-result guard used to be the only thing
+        # reached) — a real cog always has .bot via __init__; this stub
+        # needs it explicitly. None => legacy JSON mode, matching what
+        # these tests already assume (no DB fixtures set up here).
+        cog.bot = SimpleNamespace(db_session_factory=None)
         inter = self._interaction(user_id=777)
         hrac = SimpleNamespace(id=777, name="AliceMC", display_name="AliceMC")
 
@@ -609,6 +628,119 @@ class ResultCogSelfResultTests(unittest.TestCase):
 
         inter.response.defer.assert_awaited_once()
         self.assertEqual(inter.response.send_message.await_count, 0)
+
+
+class ResultDbMirrorTests(unittest.TestCase):
+    """item 13/5d: cog volá commit_promotion_with_wedge s EXAKTNÍM payloadem
+    jen po úspěšné Discord mutaci (grant.ok) – chytilo by int('LT2')."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _interaction(self, user_id):
+        inter = mock.MagicMock()
+        inter.user = SimpleNamespace(
+            id=user_id,
+            name="tester",
+            display_name="tester",
+            roles=[SimpleNamespace(id=777, name="Tester")],
+            guild_permissions=SimpleNamespace(administrator=True),
+        )
+        inter.guild = mock.MagicMock()
+        inter.guild.get_member.return_value = SimpleNamespace(id=999, voice=None)
+        inter.channel = mock.MagicMock()  # mimo HT ticket → queue cesta
+        inter.response.send_message = mock.AsyncMock()
+        inter.response.defer = mock.AsyncMock()
+        inter.followup.send = mock.AsyncMock()
+        return inter
+
+    def _call(self, cog, inter, *, grant_result):
+        cog.bot.get_channel.return_value.send = mock.AsyncMock()
+        cm = __import__("cogs.results", fromlist=["Results"])
+        with mock.patch.object(cm, "has_tester_role", return_value=True), \
+             mock.patch.object(cm, "validate_result_tier", return_value=(True, "")), \
+             mock.patch.object(cm, "get_kits", return_value=["AnchorPvP"]), \
+             mock.patch.object(
+                 cm, "record_result",
+                 new=mock.AsyncMock(return_value={
+                     "result": "created",
+                     "previous_tier": "LT3",
+                     "record": {"id": "rec-abc", "previousTier": "LT3", "newTier": "LT3"},
+                 }),
+             ), \
+             mock.patch.object(cm, "get_result_channel_id", return_value=123), \
+             mock.patch.object(cm, "today_cz", return_value="01.01.2026"), \
+             mock.patch.object(
+                 cm, "auto_grant_kit_role", new=mock.AsyncMock(return_value=grant_result)
+             ), \
+             mock.patch(
+                 "db.services.commit_promotion_with_wedge",
+                 new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
+             ) as commit_mock:
+            hrac = SimpleNamespace(id=999, name="BobMC", display_name="BobMC")
+            asyncio.run(cog.result.callback(
+                cog,
+                interaction=inter,
+                hrac=hrac,
+                ign="AliceMC",
+                kit="AnchorPvP",
+                tier="LT3",
+                score="3:1",
+                outcome="WON",
+            ))
+            return commit_mock
+
+    def test_queue_promotion_commits_exact_db_kwargs(self):
+        cog = Results.__new__(Results)
+        cog.bot = mock.MagicMock()
+        cog.bot.db_session_factory = None  # JSON režim: viz test_sync helper
+        inter = self._interaction(user_id=777)
+        commit_mock = self._call(
+            cog, inter, grant_result=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+        )
+        commit_mock.assert_awaited_once()
+        kw = commit_mock.await_args.kwargs
+        self.assertIs(kw["session_factory"], cog.bot.db_session_factory)
+        self.assertEqual(kw["result_key"], "result:rec-abc")
+        self.assertEqual(kw["kind"], "queue")
+        self.assertEqual(kw["discord_id"], 999)
+        self.assertEqual(kw["ign"], "AliceMC")
+        self.assertEqual(kw["kit_key"], "anchorpvp")
+        self.assertEqual(kw["new_tier_code"], "LT3")
+        self.assertEqual(kw["discord_role_id"], 202)
+        self.assertEqual(kw["previous_tier_code"], "LT3")
+        self.assertEqual(kw["score"], "3:1")
+        self.assertEqual(kw["outcome"], "WON")
+        self.assertEqual(kw["evaluator_discord_id"], 777)
+        self.assertIsNone(kw["ticket_channel_id"])
+        self.assertIsNone(kw["notes"])
+        self.assertFalse(kw["eval_flag"])
+        self.assertEqual(kw["date"], "01.01.2026")
+        self.assertIsNone(kw["close_ticket_channel_id"])
+        self.assertEqual(kw["audit_actor_id"], 777)
+        self.assertEqual(kw["audit_actor_name"], str(inter.user))
+
+    def test_grant_failed_skips_db_mirror(self):
+        cog = Results.__new__(Results)
+        cog.bot = mock.MagicMock()
+        cog.bot.db_session_factory = None  # JSON režim: viz test_sync helper
+        commit_mock = self._call(
+            cog, self._interaction(user_id=777),
+            grant_result=TierRoleGrant(ok=False, note="nelze", tier_role_id=None),
+        )
+        commit_mock.assert_not_awaited()
+
+    def test_legacy_empty_grant_skips_db_mirror(self):
+        cog = Results.__new__(Results)
+        cog.bot = mock.MagicMock()
+        cog.bot.db_session_factory = None  # JSON režim: viz test_sync helper
+        commit_mock = self._call(
+            cog, self._interaction(user_id=777), grant_result=""
+        )
+        commit_mock.assert_not_awaited()
 
 
 class CanonicalKitKeyTests(unittest.TestCase):

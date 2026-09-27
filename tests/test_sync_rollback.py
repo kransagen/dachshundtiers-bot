@@ -60,6 +60,12 @@ def _interaction(user=None, guild=None):
     inter.followup = mock.MagicMock()
     inter.followup.send = mock.AsyncMock()
     inter.message = SimpleNamespace(edit=mock.AsyncMock())
+    # This test suite exercises the legacy/no-Postgres rollback path — a
+    # bare MagicMock would auto-vivify `.client.db_session_factory` as a
+    # truthy Mock, which apply_rollback_actions' H3 later-promotion guard
+    # (cogs/_shared.py) would then try to use as a real session factory.
+    # Explicitly None to match a bot without DATABASE_URL configured.
+    inter.client.db_session_factory = None
     return inter
 
 
@@ -446,7 +452,11 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
 
         asyncio.run(main())
         embed, _ = _sent(holder["confirm"])
-        self.assertIn("Aplikováno: **1** · Už správně: **0** · Chyby: **1**", embed.description)
+        self.assertIn(
+            "Aplikováno: **1** · Už správně: **0** · "
+            "Přeskočeno (novější /result): **0** · Chyby: **1**",
+            embed.description,
+        )
         self.assertIn("no perms", embed.description)
         # audit zachytil chybu
         rollbacks = storage.load_data(PLAYERSYNC_ROLLBACK_LOG_FILE, [])

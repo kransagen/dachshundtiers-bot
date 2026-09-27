@@ -1170,5 +1170,182 @@ class EditViewMechanicsTests(unittest.TestCase):
         )
 
 
+class TestLinkDiscordCog(unittest.TestCase):
+    """/linkdiscord po Phase D cutoveru: PostgreSQL-first, JSON export-only."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+        _write("players.json", _players())
+        self.cog = EditUser.__new__(EditUser)
+        self.cog.bot = SimpleNamespace(db_session_factory=None)
+        self._admin_roles = mock.patch.object(permissions, "ADMIN_ROLE_IDS", [999])
+        self._admin_roles.start()
+        self.addCleanup(self._admin_roles.stop)
+
+    def _claim(self, inter, player_id, ign):
+        player = SimpleNamespace(id=player_id)
+        async def main():
+            await EditUser.linkdiscord.callback(self.cog, inter, player, ign)
+        asyncio.run(main())
+        return inter
+
+    def _players(self):
+        return storage.load_data("players.json", [])
+
+    def _succeed(self, status):
+        from db.repositories.players import PlayerRepository
+
+        class FakeTransaction:
+            def __init__(self, factory):
+                pass
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *args):
+                return False
+
+        claim_mock = mock.AsyncMock(return_value=(status, object()))
+        self.cog.bot = SimpleNamespace(db_session_factory=object())
+        return mock.patch(
+            "db.services.session.transaction",
+            lambda sf: FakeTransaction(sf),
+        ), mock.patch.object(
+            PlayerRepository, "claim_discord_id", new=claim_mock
+        ), claim_mock
+
+    def test_non_admin_denied(self):
+        inter = self._claim(_interaction(user=_plain_member()), NEW_ID, "CarlMC")
+        inter.response.send_message.assert_awaited_once_with(
+            "❌ Pouze pro administrátory.", ephemeral=True
+        )
+        inter.response.defer.assert_not_awaited()
+
+    def test_outside_guild_denied(self):
+        inter = _interaction(user=_admin_member())
+        inter.guild = None
+        inter = self._claim(inter, NEW_ID, "CarlMC")
+        inter.response.send_message.assert_awaited_once_with(
+            "❌ Pouze na serveru.", ephemeral=True
+        )
+
+    def test_no_db_fails_loudly_no_json_claim(self):
+        players_before = self._players()
+        inter = self._claim(_interaction(user=_admin_member()), NEW_ID, "CarlMC")
+        msg = inter.followup.send.await_args.args[0]
+        self.assertIn("PostgreSQL-first", msg)
+        self.assertIn("no silent fallback", msg)
+        self.assertEqual(self._players(), players_before)
+
+    def test_db_claim_creates_and_exports_json(self):
+        from db.repositories.players import CLAIM_CREATED as DB_CREATED
+
+        success, claim_patch, claim_mock = self._succeed(DB_CREATED)
+        export_mock = mock.AsyncMock(return_value=[])
+        with success, claim_patch, mock.patch(
+            "services.player_export.write_players_export", new=export_mock
+        ):
+            inter = self._claim(
+                _interaction(user=_admin_member()), NEW_ID, "CarlMC"
+            )
+        claim_mock.assert_awaited_once()
+        _, kwargs = claim_mock.await_args
+        self.assertEqual(kwargs["discord_id"], int(NEW_ID))
+        self.assertEqual(kwargs["ign"], "CarlMC")
+        export_mock.assert_awaited_once()
+        self.assertIsNotNone(export_mock.await_args.args[0])
+        embed = inter.followup.send.await_args.kwargs["embed"]
+        self.assertIn("Vytvořen nový hráč", embed.description)
+        self.assertIn("PostgreSQL: claim proveden", embed.description)
+        self.assertIn("players.json export: aktualizováno", embed.description)
+
+    def test_db_conflict_is_loud_and_json_unchanged(self):
+        from db.repositories.players import PlayerIdentityError, PlayerRepository
+
+        class FakeTransaction:
+            def __init__(self, factory):
+                pass
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *args):
+                return False
+
+        players_before = self._players()
+        self.cog.bot = SimpleNamespace(db_session_factory=object())
+        with mock.patch(
+            "db.services.session.transaction",
+            lambda sf: FakeTransaction(sf),
+        ), mock.patch.object(
+            PlayerRepository,
+            "claim_discord_id",
+            new=mock.AsyncMock(
+                side_effect=PlayerIdentityError("IGN patří jinému hráči")
+            ),
+        ):
+            inter = self._claim(
+                _interaction(user=_admin_member()), NEW_ID, "AliceMC"
+            )
+        msg = inter.followup.send.await_args.args[0]
+        self.assertIn("patří jinému hráči", msg)
+        self.assertEqual(self._players(), players_before)
+
+    def test_db_failure_is_loud_json_unchanged(self):
+        from db.repositories.players import PlayerRepository
+
+        class FakeTransaction:
+            def __init__(self, factory):
+                pass
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *args):
+                return False
+
+        players_before = self._players()
+        self.cog.bot = SimpleNamespace(db_session_factory=object())
+        with mock.patch(
+            "db.services.session.transaction",
+            lambda sf: FakeTransaction(sf),
+        ), mock.patch.object(
+            PlayerRepository,
+            "claim_discord_id",
+            new=mock.AsyncMock(side_effect=RuntimeError("db down")),
+        ):
+            inter = self._claim(
+                _interaction(user=_admin_member()), NEW_ID, "CarlMC"
+            )
+        msg = inter.followup.send.await_args.args[0]
+        self.assertIn("NEPROVEDEN", msg)
+        self.assertIn("silent JSON fallback", msg)
+        self.assertEqual(self._players(), players_before)
+
+    def test_json_export_failure_keeps_db_claim(self):
+        from db.repositories.players import CLAIM_CREATED as DB_CREATED
+
+        players = _players()
+        players.append({"username": "CarlMC", "discordId": OTHER_ID,
+                        "modes": {}, "history": {}})
+        _write("players.json", players)
+        success, claim_patch, _ = self._succeed(DB_CREATED)
+        export_mock = mock.AsyncMock(side_effect=RuntimeError("export fail"))
+        with success, claim_patch, mock.patch(
+            "services.player_export.write_players_export", new=export_mock
+        ):
+            inter = self._claim(
+                _interaction(user=_admin_member()), NEW_ID, "CarlMC"
+            )
+        embed = inter.followup.send.await_args.kwargs["embed"]
+        self.assertIn("export selhal", embed.description)
+        self.assertIn("DB claim zůstává", embed.description)
+        carl = next(p for p in self._players() if p["username"] == "CarlMC")
+        self.assertEqual(carl["discordId"], OTHER_ID)  # export se neprovedl
+
+
 if __name__ == "__main__":
     unittest.main()

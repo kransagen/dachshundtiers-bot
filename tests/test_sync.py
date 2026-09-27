@@ -8,10 +8,12 @@ službách):
                        NEPOSÍLÁ do analyze_websync (žádné falešné nálezy),
                        poškozená data → bezpečný abort, idempotence, audity
                        zůstávají ve stávajících checkweb_log/datacheck_log,
-- ``/sync discord``  – preview nic nemění; apply zobrazí potvrzovací view;
-                       potvrzení aplikuje ROLE (nikdy DB), stale → nic,
-                       per-akce chyby (Forbidden) → PARTIAL, retired tiery se
-                       nesynchronizují, po aplikaci idempotentní (žádné akce),
+- ``/sync discord``  – observe-only: Discord → PostgreSQL mirror přes
+                       DiscordSyncService; ROLE SE NIKDY NEMĚNÍ (add_roles /
+                       remove_roles / edit = 0), bez PostgreSQL → tvrdá
+                       chyba (service neběží), DB selhání → loud error,
+                       strukturální kontrakt: cog neobsahuje žádný mutující
+                       helper (apply_role_actions / auto_grant_kit_role),
 - ``/sync web``      – preview nic neposílá; apply → view; potvrzení nahraje
                        přes services.websync (GitHub), failure NIKDY není
                        success, bez GITHUB_TOKEN → nelze, prázdná DB se
@@ -26,6 +28,7 @@ službách):
 """
 
 import asyncio
+import inspect
 import json
 import os
 import tempfile
@@ -39,14 +42,15 @@ import storage
 from services import permissions
 from services.checkweb import CHECKWEB_LOG_FILE
 from services.datacheck import DATACHECK_LOG_FILE
-from services.playersync import PLAYERSYNC_LOG_FILE
 from services.websync import WEBSYNC_LOG_FILE
 from storage import DataCorruptionError
+
+from db.repositories.sync_audit import SYNC_RUN_SUCCESS
+from db.services import DiscordSyncService
 
 from cogs.sync import (
     Sync,
     SyncDataRepairView,
-    SyncDiscordConfirmView,
     SyncWebConfirmView,
     _check_embed,
     _datacheck_embed,
@@ -78,6 +82,9 @@ def _interaction(user=None, guild=None):
     inter = mock.MagicMock()
     inter.user = user if user is not None else _plain_member()
     inter.guild = guild if guild is not None else mock.MagicMock()
+    # DB režim se v single-mode testech aktivuje jen explicitním nastavením;
+    # MagicMock by auto-generoval pravdivý db_session_factory → DB cesta.
+    inter.client.db_session_factory = None
     inter.response = mock.MagicMock()
     inter.response.send_message = mock.AsyncMock()
     inter.response.defer = mock.AsyncMock()
@@ -347,7 +354,7 @@ class SyncCheckTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# /sync discord – DB → Discord role (RoleSyncService)
+# /sync discord – observe-only: Discord → PostgreSQL mirror (DiscordSyncService)
 # ---------------------------------------------------------------------------
 class SyncDiscordTests(unittest.TestCase):
     def setUp(self):
@@ -358,181 +365,128 @@ class SyncDiscordTests(unittest.TestCase):
         patch = mock.patch.object(permissions, "ADMIN_ROLE_IDS", [999])
         patch.start()
         self.addCleanup(patch.stop)
+        storage.save_data("players.json", [])
+        storage.save_data("kit_roles.json", {})
 
-        self.players = [
-            _player("AliceMC", {"randompot": "HT3"}, discord_id="1",
-                    history={"randompot": [{"date": "01.01.2026", "tier": "HT3"}]}),
-        ]
-        storage.save_data("players.json", _deep(self.players))
-        storage.save_data(
-            "kit_roles.json", {"randompot": {"HT3": "101", "HT2": "102"}}
+    def _make_outcome(self, **overrides):
+        base = dict(
+            sync_run_id=7,
+            status=SYNC_RUN_SUCCESS,
+            scanned_members=1,
+            observations_applied=1,
+            anomalies=0,
+            unknown_members=0,
+            failed_members=0,
+            unknown_roles=(),
         )
+        base.update(overrides)
+        return SimpleNamespace(**base)
 
-    def test_preview_reports_but_changes_nothing(self):
+    def test_observe_never_mutates_discord_roles(self):
+        # Kontrakt: add_roles / remove_roles / edit se u /sync discord NESMÍ
+        # nikdy zavolat – Discord zůstává jedinou autoritou aktuálních tierů.
         cog = Sync.__new__(Sync)
-        inter = _interaction(
-            user=_admin_member(), guild=_guild([_member(1, "AliceMC")])
-        )
+        cog.bot = SimpleNamespace(db_session_factory=object())
+        alice = _member(1, "AliceMC")
+        alice.edit = mock.AsyncMock()
+        inter = _interaction(user=_admin_member(), guild=_guild([alice]))
 
         async def main():
-            await Sync.sync_discord.callback(cog, inter, "preview")
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.return_value = self._make_outcome()
+                await Sync.sync_discord.callback(cog, inter)
+
+        asyncio.run(main())
+        alice.add_roles.assert_not_awaited()
+        alice.remove_roles.assert_not_awaited()
+        alice.edit.assert_not_awaited()
+
+    def test_observe_runs_service_and_reports(self):
+        cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
+        alice = _member(1, "AliceMC")
+        inter = _interaction(user=_admin_member(), guild=_guild([alice]))
+
+        async def main():
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.return_value = self._make_outcome()
+                await Sync.sync_discord.callback(cog, inter)
 
         asyncio.run(main())
         embed, _ = _sent(inter)
-        self.assertIn("🔎 /sync discord – náhled", embed.title)
-        self.assertIn("Náhled – žádné změny neaplikovány", embed.footer.text)
-        # audit preview se zapisuje, ale role žádná neproběhla
-        audits = storage.load_data(PLAYERSYNC_LOG_FILE, [])
-        self.assertEqual(len(audits), 1)
-        self.assertEqual(audits[-1]["mode"], "preview")
-        self.assertEqual(storage.load_data("players.json", []), self.players)
+        self.assertIn("Discord → PostgreSQL mirror", embed.title)
+        self.assertIn("Observe-only", embed.footer.text)
 
-    def test_apply_shows_confirm_view_no_side_effects(self):
+    def test_no_db_configured_is_loud_and_never_calls_service(self):
         cog = Sync.__new__(Sync)
-        alice = _member(1, "AliceMC")
-        guild = _guild([alice])
-        inter = _interaction(user=_admin_member(), guild=guild)
+        cog.bot = SimpleNamespace(db_session_factory=None)
+        inter = _interaction(user=_admin_member(), guild=_guild([]))
 
         async def main():
-            await Sync.sync_discord.callback(cog, inter, "apply")
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                await Sync.sync_discord.callback(cog, inter)
+                self.assertEqual(sync_guild.await_count, 0)
 
         asyncio.run(main())
-        embed, kwargs = _sent(inter)
-        self.assertIn("potvrzení změn", embed.title)
-        self.assertIsInstance(kwargs.get("view"), SyncDiscordConfirmView)
+        embed, _ = _sent(inter)
+        self.assertIn("PostgreSQL není nakonfigurováno", embed.title)
+        self.assertIn("nic se neměnilo", embed.description)
+
+    def test_db_failure_is_loud_and_discord_untouched(self):
+        cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
+        alice = _member(1, "AliceMC")
+        alice.edit = mock.AsyncMock()
+        inter = _interaction(user=_admin_member(), guild=_guild([alice]))
+
+        async def main():
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.side_effect = OSError("connection refused")
+                await Sync.sync_discord.callback(cog, inter)
+
+        asyncio.run(main())
+        embed, _ = _sent(inter)
+        self.assertIn("databáze selhala", embed.title)
         alice.add_roles.assert_not_awaited()
-        # žádné apply audity, dokud se nepotvrdí
-        audits = storage.load_data(PLAYERSYNC_LOG_FILE, [])
-        self.assertTrue(all(e.get("mode") != "apply" for e in audits))
+        alice.remove_roles.assert_not_awaited()
+        alice.edit.assert_not_awaited()
 
-    def test_confirm_applies_expected_actions_and_audits(self):
+    def test_permission_denied(self):
         cog = Sync.__new__(Sync)
-        alice = _member(1, "AliceMC")
-        guild = _guild([alice])
-        inter = _interaction(user=_admin_member(), guild=guild)
-
-        async def main():
-            await Sync.sync_discord.callback(cog, inter, "apply")
-            view = inter.followup.send.call_args.kwargs["view"]
-            await view.confirm.callback(_interaction(user=_admin_member(), guild=guild))
-
-        asyncio.run(main())
-        # přesně akce z analýzy – add ROLE 101 (nikdy zápis do DB)
-        alice.add_roles.assert_awaited_once()
-        role = alice.add_roles.await_args.args[0]
-        self.assertEqual(role.id, 101)
-        audits = storage.load_data(PLAYERSYNC_LOG_FILE, [])
-        self.assertTrue(any(e.get("mode") == "apply" for e in audits))
-        self.assertEqual(storage.load_data("players.json", []), self.players)
-
-    def test_confirm_stale_fingerprint_applies_nothing(self):
-        cog = Sync.__new__(Sync)
-        alice = _member(1, "AliceMC")
-        guild = _guild([alice])
-        inter = _interaction(user=_admin_member(), guild=guild)
-        holder = {}
-
-        async def main():
-            await Sync.sync_discord.callback(cog, inter, "apply")
-            view = inter.followup.send.call_args.kwargs["view"]
-            # stav se mezitím změnil – Alice zmizela z DB
-            storage.save_data("players.json", [])
-            holder["confirm"] = _interaction(user=_admin_member(), guild=guild)
-            await view.confirm.callback(holder["confirm"])
-
-        asyncio.run(main())
-        alice.add_roles.assert_not_awaited()
-        embed, _ = _sent(holder["confirm"])
-        self.assertIn("🔄 /sync discord – stav se změnil", embed.title)
-
-    def test_confirm_partial_on_forbidden_never_crashes(self):
-        cog = Sync.__new__(Sync)
-        alice = _member(1, "AliceMC", forbid_add=True)
-        guild = _guild([alice])
-        inter = _interaction(user=_admin_member(), guild=guild)
-        holder = {}
-
-        async def main():
-            await Sync.sync_discord.callback(cog, inter, "apply")
-            view = inter.followup.send.call_args.kwargs["view"]
-            holder["confirm"] = _interaction(user=_admin_member(), guild=guild)
-            await view.confirm.callback(holder["confirm"])
-
-        asyncio.run(main())
-        embed, _ = _sent(holder["confirm"])
-        self.assertIn("Úspěšně: **0 / 1**", embed.description)
-        # audit se zapíše i při chybě (každá akce má ok/error)
-        audits = storage.load_data(PLAYERSYNC_LOG_FILE, [])
-        apply = [e for e in audits if e.get("mode") == "apply"]
-        self.assertEqual(len(apply), 1)
-        self.assertFalse(apply[0]["applied"][0]["ok"])
-
-    def test_retired_tier_never_synced_no_view(self):
-        storage.save_data(
-            "players.json",
-            [
-                _player("OldMC", {"randompot": "RHT2"}, discord_id="1",
-                        history={"randompot": [{"date": "01.01.2024", "tier": "HT3"}]}),
-            ],
-        )
-        cog = Sync.__new__(Sync)
-        inter = _interaction(
-            user=_admin_member(), guild=_guild([_member(1, "OldMC")])
-        )
-
-        async def main():
-            await Sync.sync_discord.callback(cog, inter, "apply")
-
-        asyncio.run(main())
-        embed, kwargs = _sent(inter)
-        self.assertIsNone(kwargs.get("view"))
-        self.assertIn("Žádné změny nelze aplikovat automaticky", embed.footer.text)
-
-    def test_apply_idempotent_after_success(self):
-        cog = Sync.__new__(Sync)
-        alice = _member(1, "AliceMC")
-        guild = _guild([alice])
-        inter = _interaction(user=_admin_member(), guild=guild)
-        holder = {}
-
-        async def main():
-            await Sync.sync_discord.callback(cog, inter, "apply")
-            view = inter.followup.send.call_args.kwargs["view"]
-            await view.confirm.callback(_interaction(user=_admin_member(), guild=guild))
-            # role teď odpovídá DB → druhý běh nemá co dělat
-            alice.roles.append(SimpleNamespace(id=101))
-            holder["inter2"] = _interaction(user=_admin_member(), guild=guild)
-            await Sync.sync_discord.callback(cog, holder["inter2"], "apply")
-
-        asyncio.run(main())
-        embed, kwargs = _sent(holder["inter2"])
-        self.assertIsNone(kwargs.get("view"))
-        self.assertIn("✅ /sync discord – vše v pořádku", embed.title)
-
-    def test_preview_permission_denied(self):
-        cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=None)
         inter = _interaction(user=_plain_member())
 
         async def main():
-            await Sync.sync_discord.callback(cog, inter, "preview")
+            await Sync.sync_discord.callback(cog, inter)
 
         asyncio.run(main())
         inter.response.send_message.assert_awaited_once_with(
             "❌ Pouze pro administrátory.", ephemeral=True
         )
 
-    def test_confirm_view_permission_denied(self):
-        view = SyncDiscordConfirmView(analysis={"fingerprint": "x"})
-        inter = _interaction(user=_plain_member())
 
-        async def main():
-            await view.confirm.callback(inter)
-
-        asyncio.run(main())
-        inter.response.send_message.assert_awaited_once_with(
-            "❌ Pouze pro administrátory.", ephemeral=True
-        )
-        inter.response.defer.assert_not_awaited()
+# ---------------------------------------------------------------------------
+# Strukturální kontrakt: cogs/sync.py nesmí přímo mutovat Discord role
+# ---------------------------------------------------------------------------
+class SyncStructuralContractTests(unittest.TestCase):
+    def test_no_role_mutation_helpers_or_calls_in_cog(self):
+        src = inspect.getsource(Sync)
+        for forbidden in (
+            "apply_role_actions()",
+            "auto_grant_kit_role",
+            ".add_roles(",
+            ".remove_roles(",
+            "member.edit(",
+        ):
+            self.assertNotIn(forbidden, src)
 
 
 # ---------------------------------------------------------------------------
@@ -867,28 +821,49 @@ class DeprecatedAliasTests(unittest.TestCase):
         storage.save_data("kit_roles.json", {})
 
     def test_playersync_alias_end_to_end_announces_deprecated(self):
-        storage.save_data(
-            "players.json",
-            [
-                _player("AliceMC", {"randompot": "HT3"}, discord_id="1",
-                        history={"randompot": [{"date": "01.01.2026", "tier": "HT3"}]}),
-            ],
-        )
         cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         inter = _interaction(
             user=_admin_member(), guild=_guild([_member(1, "AliceMC")])
         )
 
         async def main():
-            await Sync.playersync_preview.callback(cog, inter)
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.return_value = SimpleNamespace(
+                    sync_run_id=7,
+                    status=SYNC_RUN_SUCCESS,
+                    scanned_members=1,
+                    observations_applied=1,
+                    anomalies=0,
+                    unknown_members=0,
+                    failed_members=0,
+                    unknown_roles=(),
+                )
+                await Sync.playersync_preview.callback(cog, inter)
 
         asyncio.run(main())
         embed, _ = _sent(inter)
         self.assertIn(
-            "⚠️ Deprecated – použij /sync discord mode:preview", embed.footer.text
+            "⚠️ Deprecated – použij /sync discord.", embed.footer.text
         )
 
-    def test_playersync_apply_delegates_to_run_discord_apply(self):
+    def test_playersync_preview_delegates_to_run_discord(self):
+        cog = Sync.__new__(Sync)
+        inter = _interaction(user=_admin_member())
+
+        async def main():
+            with mock.patch.object(Sync, "_run_discord", new=mock.AsyncMock()) as run:
+                await Sync.playersync_preview.callback(cog, inter)
+                run.assert_awaited_once_with(
+                    inter,
+                    note="⚠️ Deprecated – použij /sync discord.",
+                )
+
+        asyncio.run(main())
+
+    def test_playersync_apply_delegates_to_run_discord(self):
         cog = Sync.__new__(Sync)
         inter = _interaction(user=_admin_member())
 
@@ -896,8 +871,8 @@ class DeprecatedAliasTests(unittest.TestCase):
             with mock.patch.object(Sync, "_run_discord", new=mock.AsyncMock()) as run:
                 await Sync.playersync_apply.callback(cog, inter)
                 run.assert_awaited_once_with(
-                    inter, mode="apply",
-                    note="⚠️ Deprecated – použij /sync discord mode:apply.",
+                    inter,
+                    note="⚠️ Deprecated – použij /sync discord.",
                 )
 
         asyncio.run(main())

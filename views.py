@@ -11,12 +11,19 @@ import time
 import discord
 
 from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, TIERS_UPPER, get_ht3_ticket_category
+from db.repositories.kits import KitRepository
+from db.repositories.tournaments import TournamentRepository
+from db.services.session import transaction
 from panel import update_panel
+from services.cooldowns import get_cooldowns
+from services.evals import has_eval
 from services.permissions import get_tester_roles
 from services.queue_service import (
     join_queue,
     leave_queue,
+    list_queue_entries,
     pop_for_kit,
+    queue_state,
     remove_by_player_id,
     save_pulled_player,
 )
@@ -27,19 +34,23 @@ from services.tickets import (
     create_ticket,
     effective_ticket_tier,
     find_open_ticket,
-    find_player_tier,
     get_ticket,
     log_ticket_event,
     next_ticket_tier,
+    player_tier,
     reopen_ticket,
     set_panel_message,
     tier_allows_tickets,
     unclaim_ticket,
 )
-from storage import load_data, save_data
-from utils import DEFAULT_KITS, get_kits, has_eval, has_tester_role
+from utils import DEFAULT_KITS, get_kits, has_tester_role
 
 log = logging.getLogger("dachshundtiers")
+
+
+def _session_factory(interaction: discord.Interaction):
+    """session_factory z bota (None v JSON režimu/testech)."""
+    return getattr(getattr(interaction, "client", None), "db_session_factory", None)
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +117,7 @@ class JoinModal(SafeModal):
             self.kit,
             joined_at_ms=time.time() * 1000,
             cooldown_ms=PLAYER_COOLDOWN_MS,
+            session_factory=_session_factory(interaction),
         )
         status = result["result"]
 
@@ -126,7 +138,9 @@ class JoinModal(SafeModal):
                 "❌ V této frontě už jsi zapsaný.", ephemeral=True
             )
 
-        await update_panel(interaction.guild, kit_key)
+        await update_panel(
+            interaction.guild, kit_key, session_factory=_session_factory(interaction)
+        )
         await interaction.response.send_message(
             f"✅ Byl jsi úspěšně přidán do fronty **{self.kit}** s jménem `{ign}`.",
             ephemeral=True,
@@ -167,20 +181,24 @@ class QueueView(SafeView):
     # ---- Join (otevře modál pro IGN) ----
     async def on_join(self, interaction: discord.Interaction) -> None:
         kit_key = self.kit.lower()
-        active_queues = load_data("active_queues.json", {})
-        if not active_queues.get(kit_key):
+        session_factory = _session_factory(interaction)
+        if await queue_state(kit_key, session_factory=session_factory) is None:
             return await interaction.response.send_message(
                 "❌ Tato fronta už byla zavřena.", ephemeral=True
             )
 
         user_id = str(interaction.user.id)
-        cooldowns = load_data("cooldowns.json", {})
-        if user_id in cooldowns and (time.time() * 1000 - cooldowns[user_id]) < PLAYER_COOLDOWN_MS:
+        cooldowns = await get_cooldowns(
+            user_id,
+            session_factory=session_factory,
+            waitlist_cooldown_ms=PLAYER_COOLDOWN_MS,
+        )
+        if cooldowns["waitlist_ms"] is not None:
             return await interaction.response.send_message("❌ Máš cooldown na testy!", ephemeral=True)
 
-        queue = load_data("queue.json")
+        queue = await list_queue_entries(kit_key, session_factory=session_factory)
         if any(
-            p.get("id") == user_id and str(p.get("kit", "")).lower() == kit_key for p in queue
+            str(p.get("id")) == user_id and str(p.get("kit", "")).lower() == kit_key for p in queue
         ):
             return await interaction.response.send_message(
                 "❌ V této frontě už jsi zapsaný.", ephemeral=True
@@ -195,13 +213,17 @@ class QueueView(SafeView):
         kit_key = self.kit.lower()
         user_id = str(interaction.user.id)
 
-        removed = await leave_queue(user_id, kit_key)
+        removed = await leave_queue(
+            user_id, kit_key, session_factory=_session_factory(interaction)
+        )
         if not removed:
             return await interaction.response.send_message(
                 f"❌ Nejsi zapsaný ve frontě pro kit **{self.kit}**.", ephemeral=True
             )
 
-        await update_panel(interaction.guild, kit_key)
+        await update_panel(
+            interaction.guild, kit_key, session_factory=_session_factory(interaction)
+        )
         await interaction.response.send_message(
             f"✅ Úspěšně jsi opustil frontu pro kit **{self.kit}**.", ephemeral=True
         )
@@ -214,8 +236,10 @@ class QueueView(SafeView):
             )
 
         kit_key = self.kit.lower()
-        queue = load_data("queue.json")
-        if not any(str(p.get("kit", "")).lower() == kit_key for p in queue):
+        queue = await list_queue_entries(
+            kit_key, session_factory=_session_factory(interaction)
+        )
+        if not queue:
             return await interaction.response.send_message(
                 "❌ Tato fronta je prázdná, není koho vytáhnout.", ephemeral=True
             )
@@ -245,15 +269,20 @@ class QueueView(SafeView):
         # Atomický pull: odebere se PRVNÍ hráč kitu. Když ho mezitím někdo
         # jiný vyřadil (odešel / pullul jiný tester / /result), řekne se to
         # narovinu a nikdo není vytažený dvakrát.
-        player = await pop_for_kit(kit_key)
+        player = await pop_for_kit(
+            kit_key, session_factory=_session_factory(interaction)
+        )
         if player is None:
             return await interaction.response.send_message(
                 "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
             )
 
-        active_queues = load_data("active_queues.json", {})
-        kit_name = active_queues.get(kit_key, {}).get("name", self.kit)
-        await grant_pull_access(interaction, player, channel_id, kit_name)
+        qdata = await queue_state(kit_key, session_factory=_session_factory(interaction))
+        kit_name = qdata.get("name", self.kit) if qdata else self.kit
+        await grant_pull_access(
+            interaction, player, channel_id, kit_name,
+            session_factory=_session_factory(interaction),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +293,8 @@ async def grant_pull_access(
     player: dict,
     channel_id: int,
     kit_name: str,
+    *,
+    session_factory=None,
 ) -> None:
     """Udělí hráči přístup do roomky, pošle uvítací zprávu a zaloguje pulled player.
 
@@ -307,7 +338,7 @@ async def grant_pull_access(
 
     # Záznam vytaženého hráče (kvůli odebrání práv po /result a kvůli /skip) –
     # nový formát uloží i info o hráči (kit/ign), aby šel vrátit na konec fronty.
-    await save_pulled_player(player, channel_id)
+    await save_pulled_player(player, channel_id, session_factory=session_factory)
 
     if isinstance(channel, discord.TextChannel):
         try:
@@ -317,7 +348,9 @@ async def grant_pull_access(
         except (discord.Forbidden, discord.HTTPException) as err:
             log.warning("Nelze poslat uvítací zprávu do %s: %s", channel_id, err)
 
-    await update_panel(guild, str(player.get("kit", "")).lower())
+    await update_panel(
+        guild, str(player.get("kit", "")).lower(), session_factory=session_factory
+    )
 
     if granted:
         message = (
@@ -358,7 +391,9 @@ class PullChannelSelectView(SafeView):
         # kdyby tester roomku nevybral, hráč zůstane ve frontě). Odebrání je
         # atomické: když hráče mezitím vyřadil někdo jiný (pull/leave/result),
         # přístup se znovu neuděluje (žádný dvojitý pull).
-        removed = await remove_by_player_id(self.player["id"])
+        removed = await remove_by_player_id(
+            self.player["id"], session_factory=_session_factory(interaction)
+        )
         if not removed:
             return await interaction.response.send_message(
                 "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
@@ -369,6 +404,7 @@ class PullChannelSelectView(SafeView):
             self.player,
             int(interaction.data["values"][0]),
             self.kit_name,
+            session_factory=_session_factory(interaction),
         )
 
 
@@ -381,7 +417,8 @@ class PullChannelSelectView(SafeView):
 #
 # (LT5 je nejmenší, HT1 je největší.) „LT3+eval" (v kódu LT3E) je status mezi
 # LT3 a HT3: hráč má pořád roli LT3, ale s evalem může otevírat HT3+ tickety.
-# Evaly se drží v data/evals.json (viz utils.has_eval / set_eval / unset_eval).
+# Evaly se řeší přes services.evals.has_eval (dual-mode: DB Evaluation /
+# data/evals.json).
 
 
 def _apply_ticket_overwrites(guild, *, owner_member):
@@ -446,9 +483,9 @@ def ticket_embed(ticket: dict) -> discord.Embed:
 
 
 class HT3PanelView(SafeView):
-    def __init__(self):
+    def __init__(self, kits: list[str] | None = None):
         super().__init__(timeout=None)
-        kits = get_kits() or list(DEFAULT_KITS)
+        kits = kits or get_kits() or list(DEFAULT_KITS)
         select = discord.ui.Select(
             custom_id="ht3_select_kit",
             placeholder="Vyber kit pro HT3+ ticket...",
@@ -464,12 +501,12 @@ class HT3PanelView(SafeView):
             return
         selected_kit = interaction.data["values"][0]
         user_id = str(interaction.user.id)
-        now = time.time() * 1000
 
-        ht3_cooldowns = load_data("ht3_cooldowns.json", {})
-        user_cd = ht3_cooldowns.get(user_id, {})
-        if user_cd.get(selected_kit) and user_cd[selected_kit] > now:
-            remaining = user_cd[selected_kit] - now
+        user_cd = await get_cooldowns(
+            user_id, session_factory=_session_factory(interaction)
+        )
+        remaining = user_cd["ht3"].get(selected_kit)
+        if remaining:
             days = remaining // (24 * 60 * 60 * 1000)
             hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
             return await interaction.response.send_message(
@@ -514,12 +551,17 @@ class HT3Modal(SafeModal):
             )
 
         # Kontrola limitu: ticket nesmí být na lepší tier, než hráč může.
-        # Hráč je hledaný primárně podle Discord ID (až fallback IGN)
-        # v players.json (stejná data, co posílá /result).
-        current_tier = find_player_tier(
-            ign, kit, discord_id=str(interaction.user.id)
+        # Hráč je hledaný primárně podle Discord ID (až fallback IGN) – DB režim
+        # čte mirror aktuálního tieru, JSON režim players.json (dual-mode).
+        current_tier = await player_tier(
+            ign,
+            kit,
+            discord_id=str(interaction.user.id),
+            session_factory=_session_factory(interaction),
         )
-        eval_ok = has_eval(ign, kit)
+        eval_ok = await has_eval(
+            ign, kit, session_factory=_session_factory(interaction)
+        )
 
         # Brána: HT3+ ticket otevřou jen hráči s „LT3+eval" (nebo HT3 a výš).
         if not eval_ok and not tier_allows_tickets(current_tier):
@@ -548,7 +590,10 @@ class HT3Modal(SafeModal):
         # Prevence duplicit (rychlá kontrola; autoritativní je uvnitř
         # create_ticket v transaction – tam se případné souběžné vytvoření
         # stejného hráče + kitu pozná a přepíše tento kanál).
-        existing = await find_open_ticket(str(interaction.user.id), kit)
+        existing = await find_open_ticket(
+            str(interaction.user.id), kit,
+            session_factory=_session_factory(interaction),
+        )
         if existing is not None:
             return await interaction.followup.send(
                 f"❌ Už máš otevřený HT3+ ticket pro kit **{kit}**: "
@@ -596,6 +641,7 @@ class HT3Modal(SafeModal):
             eval_ok=eval_ok,
             category_id=category_id,
             now=int(time.time() * 1000),
+            session_factory=_session_factory(interaction),
         )
         if result["result"] == "duplicate":
             # Závod: ticket pro stejný kit mezitím vznikl jinde – tenhle kanál
@@ -626,7 +672,10 @@ class HT3Modal(SafeModal):
             log.warning("Nelze zaregistrovat view ticketu %s: %s", channel.id, err)
 
         # Do záznamu doplníme ID panel zprávy (restart-safe readd view)
-        await set_panel_message(channel.id, str(message.id))
+        await set_panel_message(
+            channel.id, str(message.id),
+            session_factory=_session_factory(interaction),
+        )
 
         await log_ticket_event(
             channel.id,
@@ -634,6 +683,7 @@ class HT3Modal(SafeModal):
             str(interaction.user.id),
             interaction.user.display_name or interaction.user.name,
             details=f"Ticket {target_tier} / {kit} (IGN {ign})",
+            session_factory=_session_factory(interaction),
         )
 
         note = ""
@@ -687,7 +737,10 @@ class HTTicketView(SafeView):
 
     @staticmethod
     async def _active_ticket(interaction) -> dict | None:
-        ticket = await get_ticket(interaction.channel_id)
+        ticket = await get_ticket(
+            interaction.channel_id,
+            session_factory=_session_factory(interaction),
+        )
         if ticket is None:
             await _ticket_not_found(interaction)
             return None
@@ -715,7 +768,9 @@ class HTTicketView(SafeView):
         if ticket is None:
             return
         result = await claim_ticket(
-            interaction.channel_id, str(interaction.user.id), interaction.user.display_name
+            interaction.channel_id, str(interaction.user.id),
+            interaction.user.display_name,
+            session_factory=_session_factory(interaction),
         )
         r = result["result"]
         if r == "not_open":
@@ -743,6 +798,7 @@ class HTTicketView(SafeView):
             interaction.channel_id, "claimed", str(interaction.user.id),
             interaction.user.display_name,
             details=f"Claim: {ticket.get('ign')} / {ticket.get('kit')}",
+            session_factory=_session_factory(interaction),
         )
         await self._refresh_ticket_state(interaction, ticket)
         await interaction.response.send_message(
@@ -760,7 +816,8 @@ class HTTicketView(SafeView):
         if ticket is None:
             return
         result = await unclaim_ticket(
-            interaction.channel_id, str(interaction.user.id), force=True
+            interaction.channel_id, str(interaction.user.id), force=True,
+            session_factory=_session_factory(interaction),
         )
         if result["result"] != "unclaimed":
             return await interaction.response.send_message(
@@ -773,6 +830,7 @@ class HTTicketView(SafeView):
             interaction.channel_id, "unclaimed", str(interaction.user.id),
             interaction.user.display_name,
             details=f"Vzdal se: {previous['claimer_name'] or previous['claimer_id']}",
+            session_factory=_session_factory(interaction),
         )
         await self._refresh_ticket_state(interaction, result["ticket"])
         await interaction.response.send_message(
@@ -791,6 +849,7 @@ class HTTicketView(SafeView):
             interaction.channel_id,
             str(interaction.user.id),
             cooldown_ms=HT3_COOLDOWN_MS,
+            session_factory=_session_factory(interaction),
         )
         r = result["result"]
         if r == "already_closed":
@@ -805,6 +864,7 @@ class HTTicketView(SafeView):
             interaction.channel_id, "closed", str(interaction.user.id),
             interaction.user.display_name,
             details="7denní HT3+ cooldown nastaven",
+            session_factory=_session_factory(interaction),
         )
         await self._refresh_ticket_state(interaction, result["ticket"])
         await interaction.response.send_message(
@@ -825,6 +885,7 @@ class HTTicketView(SafeView):
             interaction.channel_id,
             str(interaction.user.id),
             cooldown_ms=HT3_COOLDOWN_MS,
+            session_factory=_session_factory(interaction),
         )
         if result["result"] == "not_closed":
             return await interaction.response.send_message(
@@ -855,6 +916,7 @@ class HTTicketView(SafeView):
         await log_ticket_event(
             interaction.channel_id, "reopened", str(interaction.user.id),
             interaction.user.display_name,
+            session_factory=_session_factory(interaction),
         )
         await self._refresh_ticket_state(interaction, result["ticket"])
         await interaction.response.send_message(
@@ -910,22 +972,35 @@ class TournamentSignupView(SafeView):
         self.add_item(btn)
 
     async def on_signup(self, interaction: discord.Interaction) -> None:
-        tournaments = load_data("tournaments.json", {})
-        tdata = tournaments.get(self.kit_key)
-        if not tdata or tdata.get("ended"):
+        session_factory = getattr(
+            getattr(interaction, "client", None), "db_session_factory", None
+        )
+        if session_factory is None:
             return await interaction.response.send_message(
-                "Přihlašování do tohoto turnaje již skončilo.", ephemeral=True
+                "⚠️ Databáze není dostupná — zkus to později.", ephemeral=True
             )
-
-        user_id = str(interaction.user.id)
-        participants = tdata.setdefault("participants", [])
-        if user_id in participants:
-            return await interaction.response.send_message(
-                "Už jsi v tomto turnaji přihlášen.", ephemeral=True
+        async with transaction(session_factory) as session:
+            kit = await KitRepository().get_by_key(session, self.kit_key)
+            if kit is None:
+                return await interaction.response.send_message(
+                    "Turnaj pro tento kit neexistuje.", ephemeral=True
+                )
+            tournament = await TournamentRepository().get_by_kit(
+                session, kit_id=kit.id
             )
-
-        participants.append(user_id)
-        save_data("tournaments.json", tournaments)
+            if tournament is None or tournament.ended:
+                return await interaction.response.send_message(
+                    "Přihlašování do tohoto turnaje již skončilo.", ephemeral=True
+                )
+            if await TournamentRepository().is_participant(
+                session, tournament_id=tournament.id, player_id=interaction.user.id
+            ):
+                return await interaction.response.send_message(
+                    "Už jsi v tomto turnaji přihlášen.", ephemeral=True
+                )
+            await TournamentRepository().add_participant(
+                session, tournament_id=tournament.id, player_id=interaction.user.id
+            )
         await interaction.response.send_message(
             "Byl jsi úspěšně přihlášen do turnaje! ✅", ephemeral=True
         )

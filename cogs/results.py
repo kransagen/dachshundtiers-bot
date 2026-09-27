@@ -32,19 +32,26 @@ from services.results import (
     record_result,
     validate_result_tier,
 )
+from services.tester_stats import (
+    credit_tester,
+    remove_tester_credit,
+    tester_leaderboard,
+    tester_stats,
+)
+from services.evals import set_eval
+from services.kit_catalog import add_kit, get_kits
 from services.store import transaction
+from storage import using_postgres
 from services.tickets import HT3_TIER_LADDER, get_ticket
-from storage import load_data
 from utils import (
-    add_kit,
-    get_kits,
     has_tester_role,
     kit_autocomplete,
     month_key,
     now_ms,
-    set_eval,
     today_cz,
 )
+
+from cogs.roles import TierRoleGrant, auto_grant_kit_role
 
 log = logging.getLogger("dachshundtiers")
 
@@ -80,7 +87,13 @@ async def tier_autocomplete(
             out.append(app_commands.Choice(name=name, value=value))
     ticket = None
     if isinstance(interaction.channel, discord.TextChannel):
-        ticket = await get_ticket(interaction.channel_id)
+        # G0 audit fix: without session_factory this only ever reads the
+        # legacy JSON ticket store — in DB mode (where tickets are created
+        # via cogs/ht3.py with session_factory) it would always be empty.
+        ticket = await get_ticket(
+            interaction.channel_id,
+            session_factory=getattr(interaction.client, "db_session_factory", None),
+        )
     if ticket is not None:
         for t in HT3_TIER_LADDER:
             if t in RESULT_TIERS:  # LT3+eval už je v TIER_OPTIONS
@@ -189,13 +202,21 @@ class Results(commands.Cog):
 
         notes_clean = (notes or "").strip() or None
 
+        # G0 audit fix (H1 cutover): resolved once, used for every
+        # dual-mode call below — ticket lookup, kit registration, the
+        # canonical record_result write, queue/room cleanup. Previously only
+        # some of these calls received it; record_result and get_ticket
+        # never did, so /result always used the legacy JSON path for the
+        # promotion decision even when PostgreSQL was fully configured.
+        sf = getattr(self.bot, "db_session_factory", None)
+
         # 0) HT ticket jako počátek evaluace: když /result běží v kanálu
         #    HT3+ ticketu, výsledek se propojí s ticketem (idempotence:
         #    1 ticket = max. 1 výsledek) a ticket se po potvrzení zavře.
         #    Mimo ticket jde o klasický queue výsledek.
         ticket = None
         if isinstance(interaction.channel, discord.TextChannel):
-            ticket = await get_ticket(interaction.channel_id)
+            ticket = await get_ticket(interaction.channel_id, session_factory=sf)
 
         # 0a) Validace tieru:
         #     - v HT ticketu: tier ze žebříčku, maximálně cíl ticketu a
@@ -219,8 +240,14 @@ class Results(commands.Cog):
         # 0) Auto-registrace nového kitu (jako /addkit) – aby se hned objevil
         #    v autocomplete /result, HT3+ panelu a u turnajů.
         new_kit_added = False
-        if not any(existing.lower() == kit_key for existing in get_kits()):
-            new_kit_added = add_kit(kit_clean)
+        registered = await get_kits(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        )
+        if not any(existing.lower() == kit_key for existing in registered):
+            new_kit_added = await add_kit(
+                kit_clean,
+                session_factory=getattr(self.bot, "db_session_factory", None),
+            )
             if new_kit_added:
                 try:
                     from cogs.kits import _refresh_ht3_panel
@@ -229,10 +256,12 @@ class Results(commands.Cog):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # 1) Zápis výsledku – atomicky: validace + idempotence + historie
-        #    (data/ht_results.json) + kanonická players.json + cooldowny
-        #    (+ zavření ticketu včetně HT3+ cooldownu a logu). Viz
-        #    services/results.record_result.
+        # 1) Zápis výsledku – atomicky: validace + idempotence + historie.
+        #    V DB režimu (session_factory) jde o kanonický PostgreSQL zápis
+        #    (Result, promotion_status=discord_pending) – players.json se
+        #    NEpíše a nerozhoduje o current tieru (G0 audit fix / H1
+        #    cutover). Bez PostgreSQL (session_factory=None) zůstává
+        #    legacy JSON chování beze změny. Viz services/results.record_result.
         record = await record_result(
             ticket_id=ticket["id"] if ticket is not None else None,
             player_id=target_id,
@@ -251,6 +280,7 @@ class Results(commands.Cog):
             date=today_cz(),
             queue_cooldown_ms=PLAYER_COOLDOWN_MS,
             ht3_cooldown_ms=HT3_COOLDOWN_MS if ticket is not None else 0,
+            session_factory=sf,
         )
         r = record["result"]
         if r == "duplicate":
@@ -324,7 +354,7 @@ class Results(commands.Cog):
         #     tlačítko), aby byla vidět zavřená kartička.
         if ticket is not None:
             try:
-                fresh_ticket = await get_ticket(ticket["id"])
+                fresh_ticket = await get_ticket(ticket["id"], session_factory=sf)
                 if fresh_ticket and fresh_ticket.get("panelMessageId"):
                     from views import ticket_embed
 
@@ -337,17 +367,18 @@ class Results(commands.Cog):
             except Exception:  # noqa: BLE001
                 log.exception("Nelze obnovit embed ticketu po /result")
 
-        # 2) Odebrání z fronty (atomické – viz services.queue_service)
-        removed_from_queue = await leave_queue(target_id, kit_key)
+        # 2) Odebrání z fronty (atomické v obou režimech – viz services; přes
+        #    session_factory i DB režim jde do transakce, bez něj JSON)
+        removed_from_queue = await leave_queue(target_id, kit_key, session_factory=sf)
         if removed_from_queue and interaction.guild is not None:
-            await update_panel(interaction.guild, kit_key)
+            await update_panel(interaction.guild, kit_key, session_factory=sf)
 
         # 3) Odebrání práv z tester roomek – po výsledku hráč nesmí zůstat
         #    v žádné roomce. Pokrývá pull tlačítko / /queue pull (záznam ve
         #    pulled_players.json) i přednastavený přístup přes `/mktesterroom
         #    hrac:` – vždy odstraníme hráčův osobní overwrite ve VŠECH
         #    kanálech serveru.
-        await remove_pulled_player(target_id)
+        await remove_pulled_player(target_id, session_factory=sf)
 
         member = interaction.guild.get_member(int(target_id))
         if member is None:
@@ -402,18 +433,26 @@ class Results(commands.Cog):
                         err,
                     )
 
-        # 4) Statistiky testera (transakčně)
-        month = month_key()
+        # 4) Statistiky testera (transakčně) – jen JSON režim; v DB režimu se
+        #    statistiky odvozují za běhu z Result (viz services.tester_stats).
         current_date = today_cz()
-        await _log_tester_stat(str(interaction.user.id), kit_clean, display_tier, month)
+        if getattr(self.bot, "db_session_factory", None) is None:
+            await _log_tester_stat(
+                str(interaction.user.id), kit_clean, display_tier, month_key()
+            )
 
-        # 5) Kanonická players.json už aktualizoval record_result (krok 1)
-        #    včetně previous_tier – tady už jen navazující kroky.
+        # 5) record_result (krok 1) už uložil kanonický záznam – v DB režimu
+        #    Result (discord_pending), v legacy JSON režimu players.json.
+        #    previous_tier už je vyřešený, tady jen navazující kroky.
 
         # 5a) „LT3 + eval" → status evalu (data/evals.json). Tier/role zůstávají
         #     LT3 – hráč ale nově může otevírat HT3+ tickety.
         eval_note = ""
-        if is_eval and set_eval(ign_clean, kit_clean):
+        if is_eval and await set_eval(
+            ign_clean,
+            kit_clean,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        ):
             eval_note = (
                 f"\n🎖️ **{ign_clean}** dostal **LT3 + eval** pro **{kit_clean}** – "
                 "může otevírat HT3+ tickety."
@@ -443,14 +482,65 @@ class Results(commands.Cog):
         #     výsledku dostane hráč roli nového tieru, staré tiery kitu se
         #     odeberou. Poznámka se připojí k potvrzení.
         role_note = ""
+        grant = None
         try:
-            from cogs.roles import auto_grant_kit_role
-
-            role_note = await auto_grant_kit_role(
-                interaction.guild, target_id, kit_key, stored_tier
+            grant = await auto_grant_kit_role(
+                interaction.guild,
+                target_id,
+                kit_key,
+                stored_tier,
+                session_factory=getattr(self.bot, "db_session_factory", None),
+            )
+            role_note = (
+                grant.note if isinstance(grant, TierRoleGrant) else grant
             )
         except Exception:  # noqa: BLE001
             log.exception("Chyba při automatickém udělování role pro %s", target_id)
+
+        # 5d) PostgreSQL mirror (Discord-first) – volá se jen PO úspěšné
+        #     Discord mutaci (invariant 6). Selže-li DB transakce, událost
+        #     jde do outboxu (promotion_commit, discord_role_confirmed=True)
+        #     a mirror se doplní podle Discordu – nikdy naopak.
+        db_note = ""
+        try:
+            from db.services import commit_promotion_with_wedge
+
+            if (
+                isinstance(grant, TierRoleGrant)
+                and grant.ok
+                and grant.tier_role_id is not None
+            ):
+                wedge = await commit_promotion_with_wedge(
+                    session_factory=getattr(self.bot, "db_session_factory", None),
+                    result_key=f"result:{record['record'].get('id')}",
+                    kind="ticket" if ticket is not None else "queue",
+                    discord_id=int(target_id),
+                    ign=ign_clean,
+                    kit_key=kit_key,
+                    new_tier_code=stored_tier,
+                    discord_role_id=int(grant.tier_role_id),
+                    previous_tier_code=(
+                        previous_tier if previous_tier not in ("N/A", "") else None
+                    ),
+                    score=score,
+                    outcome=outcome,
+                    evaluator_discord_id=interaction.user.id,
+                    ticket_channel_id=(
+                        int(ticket["id"]) if ticket is not None else None
+                    ),
+                    notes=notes_clean or None,
+                    eval_flag=is_eval,
+                    date=current_date,
+                    close_ticket_channel_id=(
+                        int(ticket["id"]) if ticket is not None else None
+                    ),
+                    audit_actor_id=interaction.user.id,
+                    audit_actor_name=str(interaction.user),
+                )
+                if wedge.message:
+                    db_note = f"\n{wedge.message}"
+        except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /result
+            log.exception("PostgreSQL mirror pro %s selhal", target_id)
 
         # 6) Embed s výsledkem
         avatar_url = f"https://minotar.net/armor/bust/{ign_clean}/100.png"
@@ -510,6 +600,8 @@ class Results(commands.Cog):
             saved_msg += eval_note
         if role_note:
             saved_msg += role_note
+        if db_note:
+            saved_msg += db_note
         if ticket is not None:
             saved_msg += (
                 "\n🔒 Ticket byl zavřený – hráč má 7denní HT3+ cooldown na "
@@ -543,8 +635,8 @@ class Results(commands.Cog):
     @app_commands.describe(tester="Select the tester")
     async def testerstats(self, interaction: discord.Interaction, tester: discord.User = None) -> None:
         target = tester or interaction.user
-        stats_db = load_data("testers_stats.json", {})
-        tdata = stats_db.get(str(target.id))
+        session_factory = getattr(self.bot, "db_session_factory", None)
+        tdata = await tester_stats(str(target.id), session_factory=session_factory)
 
         if not tdata or tdata.get("total", 0) == 0:
             return await interaction.response.send_message(
@@ -589,19 +681,8 @@ class Results(commands.Cog):
         ]
     )
     async def testersstats(self, interaction: discord.Interaction, period: str) -> None:
-        stats_db = load_data("testers_stats.json", {})
-        current_month = month_key()
-
-        entries: list = []
-        for tester_id, data in stats_db.items():
-            if period == "all":
-                score = data.get("total", 0)
-            else:
-                score = data.get("monthly", {}).get(current_month, 0)
-            if score > 0:
-                entries.append((tester_id, score))
-
-        entries.sort(key=lambda item: item[1], reverse=True)
+        session_factory = getattr(self.bot, "db_session_factory", None)
+        entries = await tester_leaderboard(period, session_factory=session_factory)
         top10 = entries[:10]
 
         if top10:
@@ -641,18 +722,12 @@ class Results(commands.Cog):
             )
 
         tester_id = str(tester.id)
-
-        async def _run(tx):
-            stats_db = tx.get("testers_stats.json", {})
-            stat = stats_db.setdefault(
-                tester_id,
-                {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
-            )
-            stat["total"] = stat.get("total", 0) + amount
-            stat["monthly"][month] = stat["monthly"].get(month, 0) + amount
-            tx.set("testers_stats.json", stats_db)
-
-        await transaction(("testers_stats.json",), _run)
+        await credit_tester(
+            tester_id,
+            amount,
+            month,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
 
         await interaction.response.send_message(
             f"✅ Úspěšně přidáno **{amount}** historických testů uživateli "
@@ -673,31 +748,11 @@ class Results(commands.Cog):
             )
 
         tester_id = str(user.id)
-        updated_total = 0
-
-        # Upraví celkový součet i aktuální měsíční počet (nikdy pod nulu)
-        async def _run(tx):
-            nonlocal updated_total
-            stats_db = tx.get("testers_stats.json", {})
-            stat = stats_db.get(tester_id)
-            if not stat:
-                stat = {
-                    "total": 0,
-                    "lastTested": "",
-                    "kits": {},
-                    "tiers": {},
-                    "monthly": {},
-                    "hourlyLogs": [],
-                }
-                stats_db[tester_id] = stat
-            stat["total"] = max(0, stat.get("total", 0) - amount)
-            stat["monthly"][month_key()] = max(
-                0, stat["monthly"].get(month_key(), 0) - amount
-            )
-            updated_total = stat["total"]
-            tx.set("testers_stats.json", stats_db)
-
-        await transaction(("testers_stats.json",), _run)
+        updated_total = await remove_tester_credit(
+            tester_id,
+            amount,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
 
         await interaction.response.send_message(
             f"📉 Uživatel **{user.name}** ztratil **{amount}** test(ů). "
@@ -716,6 +771,16 @@ class Results(commands.Cog):
         if not has_admin_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
+            )
+        if using_postgres():
+            return await interaction.response.send_message(
+                "❌ **V PostgreSQL režimu nelze tiery mazat.**\n"
+                "Current tier je zrcadlo toho, co potvrzuje Discord, a zrcadlo "
+                "nemá clear operaci (viz `MirrorRepository`: chybějící role je "
+                "anomálie, ne smazání). Tier zrušíš tak, že **odstraníš Discord "
+                "tier roli** a pak spustíš `/sync discord` (Discord → "
+                "PostgreSQL). Historie zůstává nedotčená.",
+                ephemeral=True,
             )
 
         async def _run(tx):

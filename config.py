@@ -182,3 +182,13 @@ GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 GITHUB_OWNER: str = os.getenv("GITHUB_OWNER", "adrison99")
 GITHUB_REPO: str = os.getenv("GITHUB_REPO", "DachshundTiers")
 GITHUB_FILE_PATH: str = os.getenv("GITHUB_FILE_PATH", "players.json")
+
+# --- Phase E: časově omezený JSON+PG dual-write (návrh §15.7) --------------
+# Po dokončení stabilizačního okna operátor vypne JSON export stranu
+# (`PHASE_E_JSON_EXPORT_ENABLED=0`); bot pak stále čte players.json pro
+# legacy operace, ale žádný potvrzený stav se do něj NENÍ exportován.
+# Watchdog divergence kontrol (services/phase_e/dual_write.py) je vždy
+# observe-only a nikdy nemění Discord ani databázi.
+PHASE_E_JSON_EXPORT_ENABLED: bool = os.getenv(
+    "PHASE_E_JSON_EXPORT_ENABLED", "1"
+).strip().lower() not in {"0", "false", "off", "no"}

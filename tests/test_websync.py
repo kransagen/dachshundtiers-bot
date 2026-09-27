@@ -12,6 +12,7 @@ Pokrývají Phase 5 požadavky:
 """
 
 import asyncio
+import os
 import copy
 import tempfile
 import unittest
@@ -451,6 +452,28 @@ class WebSyncServiceTests(unittest.TestCase):
             self.assertNotEqual(id(built), id(canonical))
             canonical[0]["modes"]["AnchorPvP"] = "LT2"
             self.assertEqual(built[0]["modes"]["AnchorPvP"], "HT3")  # hloubková kopie
+
+        asyncio.run(main())
+
+    def test_apply_never_writes_back_to_canonical_file(self):
+        """EXPORT-only (design §15 d.10): apply jen tlačí na GitHub, NIKDY
+        nezapisuje lokální players.json ani neimportuje web do kanonické DB."""
+        async def main():
+            canonical = _canonical()
+            with mock.patch.object(
+                github_sync, "fetch_players",
+                new=mock.AsyncMock(return_value=self._fetch_ok()),
+            ), mock.patch.object(
+                github_sync, "push_players", new=mock.AsyncMock(return_value=self._push_ok())
+            ):
+                result = await websync.sync_website(
+                    canonical=canonical, message="m", attempts=2, retry_delay_s=0,
+                )
+            self.assertTrue(result["ok"])
+            # kanonický soubor se po apply NEzapsal (žádná zpětná cesta web → storage)
+            self.assertFalse(
+                os.path.exists(os.path.join(storage.DATA_DIR, "players.json"))
+            )
 
         asyncio.run(main())
 

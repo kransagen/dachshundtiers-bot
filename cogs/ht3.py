@@ -16,14 +16,17 @@ closed / reopened) je v ``data/ht_ticket_logs.json`` – restart-safe.
 """
 
 import logging
-import time
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from config import HT3_PANEL_CHANNEL_ID, PLAYER_COOLDOWN_MS
-from services.queue_service import cooldown_remaining
+from services.config_store import set_ht3_panel
+from services.cooldowns import get_cooldowns
+from services.evals import set_eval, unset_eval
+from services.kit_catalog import get_kits
+from services.queue_service import preset_player_room
 from services.tickets import (
     add_member,
     claim_ticket,
@@ -32,8 +35,7 @@ from services.tickets import (
     remove_member,
     unclaim_ticket,
 )
-from storage import load_data, save_data
-from utils import has_tester_role, kit_autocomplete, set_eval, unset_eval
+from utils import has_tester_role, kit_autocomplete
 from views import (
     HT3PanelView,
     grant_channel_access,
@@ -42,8 +44,6 @@ from views import (
 )
 
 log = logging.getLogger("dachshundtiers")
-
-HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
 
 
 async def _sync_ticket_embed(bot, ticket: dict) -> None:
@@ -100,13 +100,17 @@ class HT3(commands.Cog):
             color=0x00FF00,
         )
 
-        view = HT3PanelView()
+        kits = await get_kits(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        )
+        view = HT3PanelView(kits=kits)
         message = await target_channel.send(embed=embed, view=view)
 
         # Uložení zprávy panelu pro re-registraci persistentní view po restartu
-        save_data(
-            HT3_PANEL_MESSAGE_FILE,
-            {"message_id": str(message.id), "channel_id": str(target_channel.id)},
+        await set_ht3_panel(
+            message.id,
+            target_channel.id,
+            session_factory=getattr(self.bot, "db_session_factory", None),
         )
         self.bot.add_view(view, message_id=message.id)
 
@@ -191,18 +195,17 @@ class HT3(commands.Cog):
             )
 
         # Záznam, aby /result hráči práva po testu odebral i v tomhle kanálu
-        pulled = load_data("pulled_players.json", {})
-        pulled[str(hrac.id)] = {
-            "channel": str(channel.id),
-            "player": {
+        await preset_player_room(
+            {
                 "id": str(hrac.id),
                 "username": hrac.display_name,
                 "ign": hrac.display_name,
                 "kit": "",
                 "joinedAt": 0,
             },
-        }
-        save_data("pulled_players.json", pulled)
+            channel.id,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
 
         await interaction.response.send_message(
             f"✅ Hráč **{hrac.display_name}** (<@{hrac.id}>) byl přidán do "
@@ -411,7 +414,11 @@ class HT3(commands.Cog):
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
 
-        if set_eval(ign, kit):
+        if await set_eval(
+            ign,
+            kit,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        ):
             await interaction.response.send_message(
                 f"✅ **{ign.strip()}** dostal „LT3 + eval“ pro kit **{kit.strip()}** – "
                 f"může otevírat HT3+ tickety (role zůstává LT3)."
@@ -433,7 +440,11 @@ class HT3(commands.Cog):
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
 
-        if unset_eval(ign, kit):
+        if await unset_eval(
+            ign,
+            kit,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        ):
             await interaction.response.send_message(
                 f"⛔ **{ign.strip()}** přišel o „LT3 + eval“ pro kit **{kit.strip()}** – "
                 f"HT3+ tickety už otevírat nemůže."
@@ -452,20 +463,17 @@ class HT3(commands.Cog):
     async def cooldown(self, interaction: discord.Interaction, hrac: discord.User = None) -> None:
         target = hrac or interaction.user
         target_id = str(target.id)
-        now = time.time() * 1000
 
-        queue_cooldowns = load_data("cooldowns.json", {})
-        ht3_cooldowns = load_data("ht3_cooldowns.json", {})
-        user_cd = ht3_cooldowns.get(target_id, {})
+        cooldowns = await get_cooldowns(
+            target_id,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+            waitlist_cooldown_ms=int(PLAYER_COOLDOWN_MS),
+        )
+        remaining = cooldowns["waitlist_ms"]
+        user_cd = cooldowns["ht3"]
 
         text = f"**Cooldowny pro {target.name}**\n\n"
 
-        # Waitlist (queue) cooldown – 4 dny mezi testy. cooldowns.json
-        # ukládá čas POSLEDNÍHO testu (ne expiry) – zbývající čas dopočítá
-        # kanonický cooldown_remaining (stejná logika jako u joinů).
-        remaining = cooldown_remaining(
-            queue_cooldowns, target_id, now, PLAYER_COOLDOWN_MS
-        )
         if remaining is not None:
             days = remaining // (24 * 60 * 60 * 1000)
             hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
@@ -477,14 +485,12 @@ class HT3(commands.Cog):
         text += "**HT3+ Ticket Cooldowny:**\n"
         has_cooldown = False
 
-        for kit, expire_time in user_cd.items():
-            if expire_time > now:
-                has_cooldown = True
-                remaining = expire_time - now
-                days = remaining // (24 * 60 * 60 * 1000)
-                hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
-                minutes = (remaining % (60 * 60 * 1000)) // (60 * 1000)
-                text += f"**{kit}:** ⏳ Ještě {days}d {hours}h {minutes}m\n"
+        for kit, remaining in user_cd.items():
+            has_cooldown = True
+            days = remaining // (24 * 60 * 60 * 1000)
+            hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
+            minutes = (remaining % (60 * 60 * 1000)) // (60 * 1000)
+            text += f"**{kit}:** ⏳ Ještě {days}d {hours}h {minutes}m\n"
 
         if not has_cooldown:
             text += "Žádné aktivní HT3+ ticket cooldowny."

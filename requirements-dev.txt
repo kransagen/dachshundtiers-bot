@@ -1,0 +1,6 @@
+# Test/CI dependencies (never required for production runtime).
+pytest>=8.3.0
+pytest-asyncio>=0.24.0
+# Embedded PostgreSQL for tests/CI only — downloads real PostgreSQL binaries.
+# (NOT the IoT "pyembedded" package; see docs/MIGRATION_DESIGN.md §14 deviation.)
+embedded-postgres>=1.1.0

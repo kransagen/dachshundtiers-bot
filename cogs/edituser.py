@@ -50,10 +50,8 @@ from services.edituser import (
     change_kit_tier,
     change_player_discord,
     change_player_ign,
-    cooldown_snapshot,
     execute_player_edit,
     format_duration,
-    ht3_cooldown_remaining,
     normalize_tier_choice,
     retired_tier_choices,
 )
@@ -63,7 +61,6 @@ from services.player_identity import (
     find_by_discord_id,
 )
 from services.permissions import has_admin_role
-from services.queue_service import cooldown_remaining
 from services.websync import sync_website
 from storage import load_data
 from utils import DEFAULT_KITS, get_kits
@@ -90,9 +87,32 @@ def _current_tier(player: dict, kit_key: str) -> str:
     return ""
 
 
+def _cog_session_factory(cog) -> None | object:
+    """session_factory bota nebo None (JSON režim) – vzor cogs/ht3.py."""
+    return getattr(getattr(cog, "bot", None), "db_session_factory", None)
+
+
 def _find_player_sync(player_id: str) -> dict | None:
-    players = load_data("players.json", []) or []
+    players = load_data("players.json", [], strict=True) or []
     return find_by_discord_id(players, player_id) if isinstance(players, list) else None
+
+
+async def _find_player(player_id: str, *, session_factory=None) -> dict | None:
+    """Canonical tvar hráče: DB režim z PostgreSQL, jinak players.json (JSON)."""
+    if session_factory is not None:
+        from db.repositories.players import PlayerRepository
+        from db.services.session import transaction as _db_tx
+        from services.player_export import build_player_shape
+
+        did = int(player_id) if str(player_id).isdigit() else None
+        if did is None:
+            return None
+        async with _db_tx(session_factory) as session:
+            player = await PlayerRepository().get_by_discord_id(session, did)
+            if player is None:
+                return None
+            return await build_player_shape(session, player)
+    return _find_player_sync(player_id)
 
 
 def _editor_embed(player: dict) -> discord.Embed:
@@ -146,20 +166,28 @@ def _tier_select_embed(player: dict, kit_key: str, old: str) -> discord.Embed:
     return embed
 
 
-def _cooldown_embed(player: dict, now: int, kit_key: str | None = None) -> discord.Embed:
+async def _cooldown_embed(
+    player: dict,
+    now: int,
+    kit_key: str | None = None,
+    *,
+    session_factory=None,
+) -> discord.Embed:
     pid = str(player.get("discordId") or "")
-    cooldowns = load_data("cooldowns.json", {}) or {}
-    ht3 = load_data("ht3_cooldowns.json", {}) or {}
-    snapshot = cooldown_snapshot(cooldowns, ht3, pid, now, PLAYER_COOLDOWN_MS)
+    from services.cooldowns import get_cooldowns
+
+    snapshot = await get_cooldowns(
+        pid, session_factory=session_factory, waitlist_cooldown_ms=PLAYER_COOLDOWN_MS
+    )
     lines = [
-        f"**Waitlist (4 d):** {format_duration(snapshot['queue_remaining'])}",
+        f"**Waitlist (4 d):** {format_duration(snapshot['waitlist_ms'])}",
     ]
     ht3_bucket = snapshot.get("ht3") or {}
     if ht3_bucket:
         lines.append("**HT3+ (7 d per kit):**")
         for k in sorted(ht3_bucket):
             marker = "🟡" if k == kit_key else "▫"
-            lines.append(f"  {marker} `{k}`: {ht3_bucket[k]}")
+            lines.append(f"  {marker} `{k}`: {format_duration(ht3_bucket[k])}")
     else:
         lines.append("**HT3+ (7 d per kit):** žádné aktivní cooldowny")
     if kit_key:
@@ -310,7 +338,7 @@ class DiscordIdModal(SafeModal):
             )
         await interaction.response.defer(ephemeral=True)
         new_id = (self.input.value or "").strip()
-        players = load_data("players.json", []) or []
+        players = load_data("players.json", [], strict=True) or []
         p = find_by_discord_id(players, self.player_id)
         if p is None:
             return await interaction.followup.send(
@@ -365,7 +393,7 @@ class IgnModal(SafeModal):
             )
         await interaction.response.defer(ephemeral=True)
         new_ign = (self.input.value or "").strip()
-        players = load_data("players.json", []) or []
+        players = load_data("players.json", [], strict=True) or []
         p = find_by_discord_id(players, self.player_id)
         if p is None:
             return await interaction.followup.send(
@@ -443,7 +471,8 @@ class PlayerEditorView(SafeView):
     async def on_discord(self, interaction, button) -> None:
         if not await self._admin(interaction):
             return
-        if _find_player_sync(self.player_id) is None:
+        sf = _cog_session_factory(self.cog)
+        if await _find_player(self.player_id, session_factory=sf) is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
             )
@@ -455,7 +484,8 @@ class PlayerEditorView(SafeView):
     async def on_ign(self, interaction, button) -> None:
         if not await self._admin(interaction):
             return
-        if _find_player_sync(self.player_id) is None:
+        sf = _cog_session_factory(self.cog)
+        if await _find_player(self.player_id, session_factory=sf) is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
             )
@@ -468,7 +498,7 @@ class PlayerEditorView(SafeView):
         if not await self._admin(interaction):
             return
         view = TierKitSelectView(cog=self.cog, player_id=self.player_id)
-        embed = view._embed()
+        embed = await view._embed()
         await self._swap(interaction, embed, view)
 
     @discord.ui.button(label="⏳ Cooldowny", style=discord.ButtonStyle.primary, custom_id="edituser_cooldown")
@@ -476,16 +506,18 @@ class PlayerEditorView(SafeView):
         if not await self._admin(interaction):
             return
         now = int(time.time() * 1000)
+        sf = _cog_session_factory(self.cog)
         view = CooldownEditView(cog=self.cog, player_id=self.player_id)
-        player = _find_player_sync(self.player_id)
-        embed = _cooldown_embed(player or {}, now)
+        player = await _find_player(self.player_id, session_factory=sf)
+        embed = await _cooldown_embed(player or {}, now, session_factory=sf)
         await self._swap(interaction, embed, view)
 
     @discord.ui.button(label="📜 Historie", style=discord.ButtonStyle.secondary, custom_id="edituser_history")
     async def on_history(self, interaction, button) -> None:
         if not await self._admin(interaction):
             return
-        player = _find_player_sync(self.player_id)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
@@ -528,8 +560,9 @@ class TierKitSelectView(SafeView):
         select.callback = self.on_kit
         self.add_item(select)
 
-    def _embed(self) -> discord.Embed:
-        player = _find_player_sync(self.player_id) or {}
+    async def _embed(self) -> discord.Embed:
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf) or {}
         embed = discord.Embed(
             title="🏆 Změna tieru kitu",
             description=(
@@ -550,7 +583,8 @@ class TierKitSelectView(SafeView):
             return await interaction.response.send_message(
                 "ℹ️ Vyber kit z menu.", ephemeral=True
             )
-        player = _find_player_sync(self.player_id)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
@@ -573,7 +607,8 @@ class TierKitSelectView(SafeView):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        player = _find_player_sync(self.player_id)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
@@ -631,7 +666,7 @@ class TierSelectView(SafeView):
             )
         value = values[0]
         retired = (value or "").startswith("R")
-        players = load_data("players.json", []) or []
+        players = load_data("players.json", [], strict=True) or []
         try:
             _new_players, target, old, outcome = change_kit_tier(
                 players,
@@ -682,7 +717,8 @@ class TierSelectView(SafeView):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        player = _find_player_sync(self.player_id)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
@@ -720,10 +756,11 @@ class CooldownEditView(SafeView):
         select.callback = self.on_kit
         self.add_item(select)
 
-    def _embed(self) -> discord.Embed:
+    async def _embed(self) -> discord.Embed:
         now = int(time.time() * 1000)
-        player = _find_player_sync(self.player_id) or {}
-        return _cooldown_embed(player, now, self.kit_key)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf) or {}
+        return await _cooldown_embed(player, now, self.kit_key, session_factory=sf)
 
     async def on_kit(self, interaction: discord.Interaction) -> None:
         if not has_admin_role(interaction.user):
@@ -742,17 +779,19 @@ class CooldownEditView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=view._embed(), view=view)
+                await interaction.message.edit(embed=await view._embed(), view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (cooldown kit): %s", err)
 
-    def _preview_lines(self, action: str, kit_key: str | None) -> list:
-        now = int(time.time() * 1000)
-        cooldowns = load_data("cooldowns.json", {}) or {}
-        ht3 = load_data("ht3_cooldowns.json", {}) or {}
-        q_old = format_duration(
-            cooldown_remaining(cooldowns, self.player_id, now, PLAYER_COOLDOWN_MS)
+    async def _preview_lines(self, action: str, kit_key: str | None) -> list:
+        from services.cooldowns import get_cooldowns
+
+        snapshot = await get_cooldowns(
+            self.player_id,
+            session_factory=_cog_session_factory(self.cog),
+            waitlist_cooldown_ms=PLAYER_COOLDOWN_MS,
         )
+        q_old = format_duration(snapshot.get("waitlist_ms"))
         if action == "clear_queue":
             return [f"waitlist: `{q_old}` → **žádný**"]
         if action == "set_queue":
@@ -760,9 +799,7 @@ class CooldownEditView(SafeView):
                 f"waitlist: `{q_old}` → **{format_duration(PLAYER_COOLDOWN_MS)} (od teď)**"
             ]
         kit_key = (kit_key or "").strip().lower()
-        h_old = format_duration(
-            ht3_cooldown_remaining(ht3, self.player_id, kit_key, now)
-        )
+        h_old = format_duration((snapshot.get("ht3") or {}).get(kit_key))
         if action == "clear_ht3":
             return [f"HT3 `{kit_key}`: `{h_old}` → **žádný**"]
         if action == "set_ht3":
@@ -780,7 +817,7 @@ class CooldownEditView(SafeView):
             player_id=self.player_id,
             edit=edit,
             title=title,
-            lines=self._preview_lines(action, kit_key),
+            lines=await self._preview_lines(action, kit_key),
             stale=None,
             back_to_main=True,
         )
@@ -844,7 +881,8 @@ class CooldownEditView(SafeView):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        player = _find_player_sync(self.player_id)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
@@ -873,7 +911,8 @@ class HistoryView(SafeView):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        player = _find_player_sync(self.player_id)
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
                 "❌ Hráč už v players.json není.", ephemeral=True
@@ -905,7 +944,8 @@ class ConfirmEditView(SafeView):
         stale = self.payload.get("stale")
         if not stale:
             return None
-        player = _find_player_sync(self.payload["player_id"])
+        sf = _cog_session_factory(self.cog)
+        player = await _find_player(self.payload["player_id"], session_factory=sf)
         if player is None:
             return "Hráč už v players.json není."
         field = stale.get("field")
@@ -964,7 +1004,9 @@ class ConfirmEditView(SafeView):
         role_context = None
         apply_roles = None
         if edit.get("field") == "tier":
-            role_context = self.cog._role_context(interaction.guild, self.payload["player_id"])
+            role_context = await self.cog._role_context(
+                interaction.guild, self.payload["player_id"]
+            )
 
             async def apply_roles(actions):
                 return await self.cog._apply_roles(interaction.guild, actions)
@@ -992,6 +1034,7 @@ class ConfirmEditView(SafeView):
             role_context=role_context,
             apply_roles=apply_roles,
             push_web=push_web,
+            session_factory=_cog_session_factory(self.cog),
         )
 
         self.finished = True
@@ -1007,7 +1050,8 @@ class ConfirmEditView(SafeView):
             )
         self.finished = True
         if self.payload.get("back_to_main"):
-            player = _find_player_sync(self.payload["player_id"])
+            sf = _cog_session_factory(self.cog)
+            player = await _find_player(self.payload["player_id"], session_factory=sf)
             if player is not None:
                 view = PlayerEditorView(cog=self.cog, player_id=self.payload["player_id"])
                 await interaction.response.defer(ephemeral=True)
@@ -1073,7 +1117,10 @@ class EditUser(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
         player_id = str(player.id)
-        record = _find_player_sync(player_id)
+        record = await _find_player(
+            player_id,
+            session_factory=getattr(getattr(self, "bot", None), "db_session_factory", None),
+        )
         if record is None:
             return await interaction.followup.send(
                 embed=_not_found_embed(player), ephemeral=True
@@ -1083,6 +1130,110 @@ class EditUser(commands.Cog):
         await interaction.followup.send(
             embed=_editor_embed(record), view=view, ephemeral=True
         )
+
+    # ------------------------------------------------------------------
+    # /linkdiscord – explicitní propojení IGN ↔ Discord ID (admin claim).
+    # PostgreSQL je PRIMÁRNÍ (Phase D cutover): claim → PostgreSQL; players.json
+    # je export (best effort, hlasitě), nikdy se neprovádí JSON-only claim a
+    # export nikdy nevrací DB claim (no silent fallback).
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="linkdiscord",
+        description="Propojí Minecraft IGN s Discord ID hráče (explicitní claim)",
+    )
+    @app_commands.describe(
+        player="Hráč (Discord uživatel), kterému se IGN přiřazuje",
+        ign="Minecraft IGN, který se k hráči připojí",
+    )
+    async def linkdiscord(
+        self,
+        interaction: discord.Interaction,
+        player: discord.User,
+        ign: str,
+    ) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+
+        ign_clean = (ign or "").strip()
+        if not ign_clean:
+            return await interaction.response.send_message(
+                "❌ IGN nesmí být prázdné.", ephemeral=True
+            )
+
+        await interaction.response.defer(ephemeral=True)
+
+        session_factory = getattr(self.bot, "db_session_factory", None)
+        if session_factory is None:
+            return await interaction.followup.send(
+                "❌ PostgreSQL není nakonfigurováno – /linkdiscord je po Phase D "
+                "cutoveru PostgreSQL-first a bez DB se NEPROVÁDÍ (žádný JSON-only "
+                "claim, no silent fallback).",
+                ephemeral=True,
+            )
+
+        from db.repositories.players import (
+            CLAIM_ADOPTED as DB_ADOPTED,
+            CLAIM_CREATED as DB_CREATED,
+            CLAIM_RENAMED as DB_RENAMED,
+            PlayerIdentityError,
+            PlayerRepository,
+        )
+        from db.services.session import transaction
+
+        try:
+            async with transaction(session_factory) as session:
+                status, _ = await PlayerRepository().claim_discord_id(
+                    session, discord_id=int(player.id), ign=ign_clean
+                )
+        except PlayerIdentityError as err:
+            return await interaction.followup.send(
+                f"❌ **{ign_clean}** – {err} (claim v PostgreSQL selhal).",
+                ephemeral=True,
+            )
+        except Exception:  # noqa: BLE001 – DB primární; selhání = hlasité zastavení
+            log.exception(
+                "DB claim /linkdiscord pro %s selhal (žádný JSON fallback)", ign_clean
+            )
+            return await interaction.followup.send(
+                "❌ PostgreSQL selhalo – claim NEPROVEDEN. Opakujte po obnovení DB "
+                "(žádný silent JSON fallback).",
+                ephemeral=True,
+            )
+
+        outcome_label = {
+            DB_CREATED: "🎉 Vytvořen nový hráč",
+            DB_RENAMED: "✏️ Hráč přejmenován",
+            DB_ADOPTED: "🔗 Propojeno k existujícímu záznamu",
+        }.get(status, "✅ Už propojeno – nic se nezměnilo")
+
+        json_note = ""
+        try:
+            from services.player_export import write_players_export
+
+            await write_players_export(session_factory)
+            json_note = "\n🪟 players.json export: aktualizováno (export-only)."
+        except Exception:  # noqa: BLE001 – export nikdy nevrací DB claim
+            log.exception(
+                "players.json export po /linkdiscord selhal (DB claim zůstává)"
+            )
+            json_note = "\n⚠️ players.json export selhal – DB claim zůstává (export-only)."
+
+        embed = discord.Embed(
+            title="🔗 Propojení identity",
+            description=(
+                f"**`{ign_clean}`** ↔ <@{player.id}> ({outcome_label})"
+                f"\n📦 PostgreSQL: claim proveden."
+                f"{json_note}"
+            ),
+            color=0x10B981,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ------------------------------------------------------------------
     # Discord role (RoleSyncService, best effort) – používá ConfirmEditView
@@ -1110,10 +1261,17 @@ class EditUser(commands.Cog):
                 ):
                     member = None
         member_dict = _member_to_dict(member) if member is not None else None
+        session_factory = getattr(self.bot, "db_session_factory", None)
+        if session_factory is not None:
+            from services.kit_roles import get_all_kit_role_maps
+
+            roles_map = await get_all_kit_role_maps(session_factory=session_factory)
+        else:
+            roles_map = load_data(KIT_ROLES_FILE, {}) or {}
         return {
             "member": member_dict,
-            "roles_map": load_data(KIT_ROLES_FILE, {}) or {},
-            "kit_display": kit_display_map(),
+            "roles_map": roles_map,
+            "kit_display": await kit_display_map(session_factory=session_factory),
         }
 
 

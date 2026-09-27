@@ -9,18 +9,23 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import set_queue_channel_id
+from services.config_store import get_ht3_panel, set_queue_channel_id
+from services.kit_catalog import (
+    add_kit,
+    get_kits,
+    kit_autocomplete,
+    remove_kit,
+)
 from services.permissions import has_admin_role
-from storage import load_data
-from utils import add_kit, get_kits, has_tester_role, kit_autocomplete, remove_kit
+from utils import has_tester_role
 from views import HT3PanelView
-
-HT3_PANEL_MESSAGE_FILE = "ht3_panel_message.json"
 
 
 async def _refresh_ht3_panel(bot) -> bool:
     """Aktualizuje stávající HT3+ panel na nový seznam kitů (pokud existuje)."""
-    panel = load_data(HT3_PANEL_MESSAGE_FILE, {})
+    panel = await get_ht3_panel(
+        session_factory=getattr(bot, "db_session_factory", None)
+    )
     message_id = panel.get("message_id")
     channel_id = panel.get("channel_id")
     if not message_id or not channel_id:
@@ -32,7 +37,10 @@ async def _refresh_ht3_panel(bot) -> bool:
         if channel is None:
             return False
         message = await channel.fetch_message(int(message_id))
-        await message.edit(view=HT3PanelView())
+        kits = await get_kits(
+            session_factory=getattr(bot, "db_session_factory", None)
+        )
+        await message.edit(view=HT3PanelView(kits=kits))
         return True
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
         return False
@@ -60,7 +68,10 @@ class Kits(commands.Cog):
                 "❌ Zadej platný název kitu.", ephemeral=True
             )
 
-        if not add_kit(kit):
+        if not await add_kit(
+            kit,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        ):
             return await interaction.response.send_message(
                 f"❌ Kit **{kit}** už je v seznamu registrovaný.", ephemeral=True
             )
@@ -86,7 +97,10 @@ class Kits(commands.Cog):
             )
 
         kit = kit.strip()
-        if not remove_kit(kit):
+        if not await remove_kit(
+            kit,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        ):
             return await interaction.response.send_message(
                 f"❌ Kit **{kit}** není v seznamu registrovaný.", ephemeral=True
             )
@@ -135,10 +149,17 @@ class Kits(commands.Cog):
                 ephemeral=True,
             )
 
-        set_queue_channel_id(kit_key, channel.id)
+        await set_queue_channel_id(
+            kit_key,
+            channel.id,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
 
+        registered = await get_kits(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        )
         message = f"✅ Panel fronty pro kit **{kit_name}** bude chodit do <#{channel.id}>."
-        if not any(existing.lower() == kit_key for existing in get_kits()):
+        if not any(existing.lower() == kit_key for existing in registered):
             message += (
                 "\n💡 Kit zatím není v seznamu – přidej ho ještě přes `/addkit`, "
                 "ať se objeví v HT3+ panelu a u autocomplete."
@@ -150,7 +171,9 @@ class Kits(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(name="kits", description="Vypíše registrované kity")
     async def kits(self, interaction: discord.Interaction) -> None:
-        kits = get_kits() or []
+        kits = await get_kits(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        )
         if not kits:
             return await interaction.response.send_message(
                 "Žádné kity nejsou registrované. Přidej je přes `/addkit`.", ephemeral=True

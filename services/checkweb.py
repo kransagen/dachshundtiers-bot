@@ -170,7 +170,11 @@ def _record(
 # Analýza (čistá funkce – nic neaplikuje)
 # ---------------------------------------------------------------------------
 def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit_display=None) -> dict:
-    """Porovná Discord role × players.json × web; vrátí záznamy + souhrn.
+    """Porovná Discord role × PostgreSQL mirror × web; vrátí záznamy + souhrn.
+
+    ``players`` je canonical data z DB (v PostgreSQL režimu
+    ``services.player_export.export_players``), nikoli players.json – sloupec
+    ``db`` v záznamech je tedy skutečné zrcadlo v ``player_current_tiers``.
 
     ``website=None`` = web se nepodařilo přečíst (bez GITHUB_TOKEN / chyba) –
     porovnání s webem se přeskočí (status WEBSITE_MISMATCH nikdy nevznikne).
@@ -592,13 +596,15 @@ def build_discord_import_decisions(records) -> tuple[list, list]:
 # Aplikace rozhodnutí (pouze po explicitním potvrzení)
 # ---------------------------------------------------------------------------
 def apply_checkweb_decisions(*, players, records, decisions, kit_display=None) -> tuple:
-    """Aplikuje per-záznamová rozhodnutí na kanonickou players.json.
+    """Spočítá per-záznamová rozhodnutí; NIC nezapisuje (F-FIX).
 
-    - ``use_discord``   → tier v DB := Discord tier (BEZ zápisu do historie!),
-    - ``keep_database`` / ``ignore`` → DB se nemění (rozhodnutí se jen loguje).
+    Čistá funkce: vrací ``(new_players, applied)``, kde každý prvek ``applied``
+    má ``player, kit, kit_key, oldTier, newTier, reason, source, ok, error``.
 
-    Vrací ``(new_players, applied)``; každý prvek ``applied`` má
-    ``player, kit, kit_key, oldTier, newTier, reason, source, ok, error``.
+    F-FIX: žádný produkční caller už výsledek nepersistuje – ``/checkweb apply``
+    a ``/sync importdiscord`` ho použijí jen jako návrh k promítnutí přes
+    ``/sync discord`` (Discord → PostgreSQL mirror). Zápis ``new_players`` do
+    players.json/JSONB by znamenal JSON → current tier, což je zakázané.
     """
     kit_display = kit_display or {}
     index = {}

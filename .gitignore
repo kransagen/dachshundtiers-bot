@@ -26,4 +26,4 @@ data/playersync_rollback_log.json
 data/websync_log.json
 data/datacheck_log.json
 data/checkweb_log.json
-data/.gitkeep
+data/.gitkeepbackups/

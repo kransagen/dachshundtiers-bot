@@ -19,10 +19,11 @@ import logging
 
 import discord
 
+from services.kit_catalog import get_kits
 from services.permissions import has_admin_role
 from services.role_sync import make_member
 from services.store import transaction
-from utils import get_kits
+from storage import using_postgres
 
 log = logging.getLogger("dachshundtiers")
 
@@ -49,9 +50,10 @@ def member_to_dict(member) -> dict:
     )
 
 
-def kit_display_map() -> dict:
+async def kit_display_map(session_factory=None) -> dict:
     """Display-case názvy kitů: lowercase klíč → oficiální název."""
-    return {str(k).lower(): str(k) for k in get_kits()}
+    kits = await get_kits(session_factory=session_factory)
+    return {str(k).lower(): str(k) for k in kits}
 
 
 async def apply_role_actions(guild: discord.Guild, actions: list) -> list:
@@ -103,7 +105,63 @@ async def apply_role_actions(guild: discord.Guild, actions: list) -> list:
     return applied
 
 
-async def apply_rollback_actions(guild: discord.Guild, actions: list) -> list:
+async def _rollback_conflicts_with_later_promotion(
+    session_factory, *, discord_id: int, kit_key: str, target_ts: int
+) -> str | None:
+    """H3 audit fix: has this member been promoted via ``/result``/
+    ``/topresult`` for this kit AFTER the sync being rolled back?
+
+    ``/sync discord-rollback`` only replays ``playersync_log.json`` (scoped
+    to ``/sync discord apply``) — a later, unrelated ``auto_grant_kit_role``
+    promotion is never logged there at all, so rollback's own audit trail
+    has no way to know about it. Reintroducing the old, pre-sync role in
+    that case would silently give the member back a stale tier role
+    alongside their newer, correct one (the exact "multiple tier roles for
+    one kit" conflict ``/sync check`` treats as a serious anomaly) — via the
+    one tool whose entire purpose is safe, audited reversal.
+
+    Returns a human-readable reason string when a later promotion exists
+    (the caller must then SKIP this action, not apply it), or ``None`` when
+    it's safe to proceed. Returns ``None`` (no guard) when PostgreSQL isn't
+    configured — this check is a DB-mirror-only safety net.
+    """
+    if session_factory is None:
+        return None
+    from datetime import datetime, timezone
+
+    from db.repositories.kits import KitRepository
+    from db.repositories.players import PlayerRepository
+    from db.repositories.tiers import TierHistoryRepository
+    from db.services.session import transaction as db_transaction
+
+    target_dt = datetime.fromtimestamp(target_ts / 1000, tz=timezone.utc)
+    async with db_transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, int(discord_id))
+        if player is None:
+            return None
+        kit = await KitRepository().get_by_key(session, (kit_key or "").strip().lower())
+        if kit is None:
+            return None
+        history = await TierHistoryRepository().list_for_player(
+            session, player_id=player.id, kit_id=kit.id, limit=20
+        )
+    for h in history:
+        if h.source == "promotion" and h.changed_at > target_dt:
+            return (
+                f"přeskočeno – hráč byl po cíleném syncu ({target_dt.isoformat()}) "
+                f"znovu povýšen přes /result ({h.changed_at.isoformat()}); "
+                "návrat staré role by ji nechal vedle nové"
+            )
+    return None
+
+
+async def apply_rollback_actions(
+    guild: discord.Guild,
+    actions: list,
+    *,
+    session_factory=None,
+    target_ts: int | None = None,
+) -> list:
     """Aplikuje rollback akce (inverze provedeného syncu); každá zvlášť.
 
     Oproti ``apply_role_actions`` navíc rozlišuje idempotentní stavy
@@ -112,6 +170,11 @@ async def apply_rollback_actions(guild: discord.Guild, actions: list) -> list:
     - op ``add`` a role už je přítomná  → ``already_correct``, bez volání API,
     - op ``remove`` a role nepřítomná   → ``already_correct``, bez volání API,
     - jinak provede zásah (``applied``) / selže (``failed`` + error).
+
+    H3 audit fix: pokud (``session_factory``/``target_ts`` dodané) hráč byl
+    po cíleném syncu znovu povýšen přes ``/result`` pro stejný kit, akce se
+    PŘESKOČÍ (``skipped_newer_promotion``) místo aplikace – viz
+    ``_rollback_conflicts_with_later_promotion``.
 
     Identita je výhradně přes ``member_id`` / ``role_id`` z auditního logu.
     Chyby (člen/role nenalezen, Forbidden, HTTP) se nikdy nešíří dál.
@@ -149,6 +212,21 @@ async def apply_rollback_actions(guild: discord.Guild, actions: list) -> list:
             record["error"] = "člen není na serveru"
         elif role is None:
             record["error"] = "role neexistuje"
+        elif (
+            session_factory is not None
+            and target_ts is not None
+            and member_id.isdigit()
+            and (
+                conflict := await _rollback_conflicts_with_later_promotion(
+                    session_factory,
+                    discord_id=int(member_id),
+                    kit_key=action.get("kit") or "",
+                    target_ts=target_ts,
+                )
+            )
+        ):
+            record["status"] = "skipped_newer_promotion"
+            record["error"] = conflict
         else:
             held = {str(r.id) for r in (getattr(member, "roles", None) or [])}
             if op == "add" and role_id in held:
@@ -178,7 +256,18 @@ def admin_gate_error(interaction) -> str | None:
 
 
 async def save_players(players: list) -> None:
-    """Atomický zápis players.json (transakce; korupce → DataCorruptionError)."""
+    """DEPRECATED (F4/F-FIX): players.json je export-only a už nemá koho.
+
+    F-FIX odstranil poslední produkční čtenáře/zapisovatele JSON-first cest
+    (/sync importdiscord, /checkweb apply, /sync data tier normalizace).
+    Zbývající JSON režim (bez PostgreSQL) je jediné, co tady smí zapisovat.
+    """
+    if using_postgres():
+        raise RuntimeError(
+            "F-FIX: players.json se v PostgreSQL režimu nepíše. Jediný "
+            "zapisovač je services.player_export.write_players_export "
+            "(canonical export z PostgreSQL)."
+        )
 
     async def _run(tx):
         tx.set("players.json", players)

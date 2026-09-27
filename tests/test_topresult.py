@@ -25,9 +25,11 @@ samotnou permisní logiku).
 import asyncio
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import storage
+from cogs.roles import TierRoleGrant
 from services import results, tickets
 from services import topresult
 
@@ -1023,6 +1025,10 @@ class TopResultCogBridgeTests(unittest.TestCase):
     def _call(self, record_result, *, bridge="LT2"):
         cm = self.cog_module
         with mock.patch.object(
+            cm,
+            "get_kits",
+            new=mock.AsyncMock(return_value=["MolePVP"]),
+        ), mock.patch.object(
             cm, "record_ht_fight", new=mock.AsyncMock(return_value=record_result)
         ) as rec_mock, mock.patch.object(
             cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
@@ -1100,6 +1106,241 @@ class TopResultCogBridgeTests(unittest.TestCase):
         self.assertIn("LT3", msg)
         # nic se neposlalo do kanálu a žádná role se neudělovala
         channel.send.assert_not_awaited()
+
+
+class TopResultDbMirrorTests(unittest.TestCase):
+    """item 13: 1a2 – cog volá commit_promotion_with_wedge s EXAKTNÍM payloadem
+    jen když grant prošel (chytilo by chybu z rodiny int('LT2'))."""
+
+    CHANNEL_ID = 5555
+    ROLE_ID = 6666
+
+    def setUp(self):
+        self.cog_module = __import__("cogs.topresult", fromlist=["TopResult"])
+        cm = self.cog_module
+        self._patches = [
+            mock.patch.object(cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
+            mock.patch.object(cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
+            mock.patch.object(cm, "has_tester_role", return_value=True),
+            mock.patch.object(cm, "validate_topresult_config", return_value=(True, "")),
+            mock.patch.object(cm, "is_registered_kit", return_value=True),
+            mock.patch.object(cm, "validate_ht_fight_tier", return_value=(True, "")),
+            mock.patch.object(cm, "validate_ht_fight_score", return_value=(True, "")),
+            mock.patch.object(cm, "validate_ht_fight_status", return_value=(True, "")),
+        ]
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+    def _call(self, record_result, *, grant_result):
+        cm = self.cog_module
+        with mock.patch.object(
+            cm, "get_kits", new=mock.AsyncMock(return_value=["MolePVP"])
+        ), mock.patch.object(
+            cm, "record_ht_fight", new=mock.AsyncMock(return_value=record_result)
+        ) as rec_mock, mock.patch.object(
+            cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
+        ), mock.patch.object(
+            cm, "auto_grant_kit_role", new=mock.AsyncMock(return_value=grant_result)
+        ) as grant_mock, mock.patch.object(
+            cm, "get_ticket", new=mock.AsyncMock(return_value=None)
+        ), mock.patch(
+            "db.services.commit_promotion_with_wedge",
+            new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
+        ) as commit_mock:
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
+            bot = mock.MagicMock()
+            bot.get_channel.return_value = channel
+            inter = mock.MagicMock()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
+            inter.user.name = "tester"
+            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
+            inter.channel_id = 9999
+
+            cog = cm.TopResult(bot)
+            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
+            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
+            asyncio.run(cog.topresult.callback(
+                cog,
+                interaction=inter,
+                fight_tier="HT3",
+                outcome="Won",
+                score="4-1",
+                opponent=opp,
+                tier_status="Povýšen na LT2",
+                hrac=hrac,
+                ign="mendu__",
+                kit="MolePVP",
+                bridge="LT2",
+            ))
+            return inter, rec_mock, grant_mock, commit_mock
+
+    @staticmethod
+    def _record():
+        return {
+            "result": "created",
+            "record": {
+                "id": "x",
+                "previousTier": "LT3",
+                "newTier": "LT2",
+                "bridgeTier": "LT2",
+                "opponentId": "2",
+                "opponentName": "souper",
+                "date": "25.09.2026",
+            },
+        }
+
+    def test_win_promotion_commits_exact_db_kwargs(self):
+        inter, rec_mock, grant_mock, commit_mock = self._call(
+            self._record(), grant_result=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+        )
+        commit_mock.assert_awaited_once()
+        kw = commit_mock.await_args.kwargs
+        # bezprostřední spojení: role id, které vrátil grant, jde do DB
+        self.assertEqual(grant_mock.await_args.kwargs["tier_up"], "LT2")
+        self.assertEqual(kw["result_key"], "ht_fight:x")
+        self.assertEqual(kw["kind"], "ht_fight")
+        self.assertEqual(kw["discord_id"], 1)
+        self.assertEqual(kw["ign"], "mendu__")
+        self.assertEqual(kw["kit_key"], "MolePVP")
+        self.assertEqual(kw["new_tier_code"], "LT2")
+        self.assertEqual(kw["discord_role_id"], 202)
+        self.assertEqual(kw["previous_tier_code"], "LT3")
+        self.assertEqual(kw["bridge_tier_code"], "LT2")
+        self.assertEqual(kw["tier_status"], "Povýšen na LT2")
+        self.assertEqual(kw["score"], "4-1")
+        self.assertEqual(kw["outcome"], "Won")
+        self.assertEqual(kw["opponent_id"], 2)
+        self.assertEqual(kw["opponent_name"], "souper")
+        self.assertEqual(kw["date"], "25.09.2026")
+        self.assertEqual(kw["audit_actor_id"], inter.user.id)
+
+    def test_grant_failed_skips_db_mirror(self):
+        _, _, _, commit_mock = self._call(
+            self._record(), grant_result=TierRoleGrant(ok=False, note="nelze", tier_role_id=None)
+        )
+        commit_mock.assert_not_awaited()
+
+    def test_legacy_empty_grant_skips_db_mirror(self):
+        _, _, _, commit_mock = self._call(self._record(), grant_result="")
+        commit_mock.assert_not_awaited()
+
+    def test_unknown_bridge_code_still_commits_as_code(self):
+        rec = self._record()
+        rec["record"]["bridgeTier"] = "WR9"
+        _, _, _, commit_mock = self._call(
+            rec, grant_result=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+        )
+        commit_mock.assert_awaited_once()
+        self.assertEqual(commit_mock.await_args.kwargs["bridge_tier_code"], "WR9")
+
+    def test_discord_grant_raises_no_commit_no_guess(self):
+        """Failure matrix 1/4: Discord nedostupný (grant RAISES) → žádný
+        tier commit, žádný dohad, hlasitá zpráva, oznámení pokračuje."""
+        cm = self.cog_module
+        with mock.patch.object(
+            cm,
+            "get_kits",
+            new=mock.AsyncMock(return_value=["MolePVP"]),
+        ), mock.patch.object(
+            cm, "record_ht_fight", new=mock.AsyncMock(return_value=self._record())
+        ), mock.patch.object(
+            cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
+        ), mock.patch.object(
+            cm, "auto_grant_kit_role",
+            new=mock.AsyncMock(
+                side_effect=cm.discord.HTTPException(mock.MagicMock(), "discord down")
+            ),
+        ) as grant_mock, mock.patch.object(
+            cm, "get_ticket", new=mock.AsyncMock(return_value=None)
+        ), mock.patch(
+            "db.services.commit_promotion_with_wedge",
+            new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
+        ) as commit_mock:
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
+            bot = mock.MagicMock()
+            bot.get_channel.return_value = channel
+            inter = mock.MagicMock()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
+            inter.user.name = "tester"
+            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
+            inter.channel_id = 9999
+
+            cog = cm.TopResult(bot)
+            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
+            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
+            asyncio.run(cog.topresult.callback(
+                cog,
+                interaction=inter,
+                fight_tier="HT3",
+                outcome="Won",
+                score="4-1",
+                opponent=opp,
+                tier_status="Povýšen na LT2",
+                hrac=hrac,
+                ign="mendu__",
+                kit="MolePVP",
+                bridge="LT2",
+            ))
+        grant_mock.assert_awaited_once()
+        commit_mock.assert_not_awaited()
+        channel.send.assert_awaited_once()
+        reply = inter.followup.send.await_args.args[0]
+        self.assertIn("Tier roli se nepodařilo udělit", reply)
+
+    def test_pg_unavailable_real_commit_surfaces_loud_message(self):
+        """Failure matrix 2: PostgreSQL nedostupný PO úspěšném Discord grantu →
+        skutečný commit_promotion_with_wedge vrátí hlasitou zprávu (bez wedge,
+        Discord se NEvrací), reply ji obsahuje."""
+        cm = self.cog_module
+        with mock.patch.object(
+            cm, "record_ht_fight", new=mock.AsyncMock(return_value=self._record())
+        ), mock.patch.object(
+            cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
+        ), mock.patch.object(
+            cm, "auto_grant_kit_role",
+            new=mock.AsyncMock(
+                return_value=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+            ),
+        ) as grant_mock, mock.patch.object(
+            cm, "get_ticket", new=mock.AsyncMock(return_value=None)
+        ):
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
+            bot = mock.MagicMock()
+            bot.db_session_factory = None
+            bot.get_channel.return_value = channel
+            inter = mock.MagicMock()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
+            inter.user.name = "tester"
+            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
+            inter.channel_id = 9999
+
+            cog = cm.TopResult(bot)
+            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
+            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
+            asyncio.run(cog.topresult.callback(
+                cog,
+                interaction=inter,
+                fight_tier="HT3",
+                outcome="Won",
+                score="4-1",
+                opponent=opp,
+                tier_status="Povýšen na LT2",
+                hrac=hrac,
+                ign="mendu__",
+                kit="MolePVP",
+                bridge="LT2",
+            ))
+        grant_mock.assert_awaited_once()
+        reply = inter.followup.send.await_args.args[0]
+        self.assertIn("PostgreSQL není nakonfigurováno", reply)
+        self.assertIn("bez DB nelze ani outbox", reply)
 
 
 if __name__ == "__main__":

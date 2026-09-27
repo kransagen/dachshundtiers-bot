@@ -1,7 +1,7 @@
 """Kontrola integrity dat – /datacheck (čistá logika, bez discord.py).
 
-Projede VŠECHNY místní databáze (kanonická players.json je zdroj pravdy,
-nic se nekopíruje do druhé databáze) a hlásí problémy:
+Projede VŠECHNY místní databáze (players.json je v PostgreSQL režimu jen
+generovaný export, ne zdroj pravdy) a hlásí problémy:
 
   - duplicate_players           – players.json: stejný username vícekrát
   - duplicate_discord_ids       – jeden ownerId s víc IGN / duplicitní ID v testers.json
@@ -27,6 +27,7 @@ import time
 from services.store import read as store_read, transaction
 from services.tickets import HT_TICKETS_FILE, HT3_TIER_LADDER, STATUS_CLOSED
 from services.playersync import is_retired_tier
+from storage import using_postgres
 
 log = logging.getLogger("dachshundtiers")
 
@@ -706,7 +707,9 @@ async def perform_repairs(
 
     - ``close_ticket_ids`` – zavře otevřené osamocené tickety (záznam zůstává),
     - ``tier_fixes``       – normalizuje zápisy tierů na kanonickou podobu
-      (players.json: modes/history).
+      (players.json: modes/history). V PostgreSQL režimu odmítnuto – current
+      tier žije v tabulce ``player_current_tiers`` a players.json je
+      generovaný export, ne autorita.
 
     Nikdy nic nemaže. Vrací přehled provedených oprav a chyb.
     """
@@ -719,6 +722,22 @@ async def perform_repairs(
             "closed": [],
             "normalized": [],
             "errors": [],
+        }
+    if fixes and using_postgres():
+        return {
+            "ok": False,
+            "message": (
+                "Normalizace tierů je v PostgreSQL režimu zakázaná: current tier "
+                "je v player_current_tiers a players.json je jen export."
+            ),
+            "closed": [],
+            "normalized": [],
+            "errors": [
+                {
+                    "target": "players.json",
+                    "error": "JSON není autorita – oprav tier přes /edituser",
+                }
+            ],
         }
     if now is None:
         now = _now_ms()

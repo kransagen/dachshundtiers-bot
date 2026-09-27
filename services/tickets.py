@@ -33,6 +33,19 @@ Tvar ticketu::
     }
 """
 
+from datetime import datetime, timezone
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from db.models import Kit, TierDefinition
+from db.repositories.cooldowns import COOLDOWN_HT3, CooldownRepository
+from db.repositories.kits import KitRepository, TierDefinitionRepository
+from db.repositories.players import PlayerIdentityError, PlayerRepository
+from db.repositories.sync_audit import AuditRepository
+from db.repositories.tickets import Ticket, TicketMemberRepository, TicketRepository
+from db.repositories.tiers import MirrorRepository
+from db.services.session import transaction
 from services import store
 from storage import load_data
 
@@ -157,21 +170,73 @@ def find_player_tier(ign: str, kit: str, discord_id=None) -> str | None:
     return str(tier).strip().upper() if tier else None
 
 
+async def player_tier(
+    ign: str,
+    kit: str,
+    discord_id=None,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> str | None:
+    """Aktuální tier hráče pro daný kit (dual-mode).
+
+    DB režim: zdroj pravdy je mirror tabulky aktuálního tieru (Discord-confirmed;
+    viz F10 – stávající tier se v DB neodvozuje z JSON). JSON režim deleguje na
+    sync ``find_player_tier`` (players.json, legacy).
+    """
+    if session_factory is not None:
+        async with transaction(session_factory) as session:
+            discord_int = int(discord_id) if discord_id else None
+            player, _source = await PlayerRepository().resolve(
+                session,
+                discord_id=discord_int,
+                ign=(ign or "").strip() or None,
+            )
+            if player is None:
+                return None
+            kit_row = await KitRepository().get_by_name(session, (kit or "").strip())
+            if kit_row is None:
+                return None
+            mirror = await MirrorRepository().get_current(
+                session, player_id=player.id, kit_id=kit_row.id
+            )
+            if mirror is None:
+                return None
+            tier = await TierDefinitionRepository().get_by_id(
+                session, mirror.tier_id
+            )
+            return tier.code if tier is not None else None
+
+    return find_player_tier(ign, kit, discord_id=discord_id)
+
+
 # ---------------------------------------------------------------------------
 # Čtení stavu
 # ---------------------------------------------------------------------------
-async def get_tickets() -> dict:
+async def get_tickets(session_factory: async_sessionmaker[AsyncSession] | None = None) -> dict:
+    if session_factory is not None:
+        return await _db_get_tickets(session_factory)
     return await store.read(HT_TICKETS_FILE, {})
 
 
-async def get_ticket(channel_id) -> dict | None:
+async def get_ticket(
+    channel_id,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> dict | None:
     """Vrátí ticket podle ID kanálu (nebo None)."""
+    if session_factory is not None:
+        return await _db_get_ticket(session_factory, channel_id)
     tickets = await store.read(HT_TICKETS_FILE, {})
     return tickets.get(str(channel_id))
 
 
-async def find_open_ticket(owner_id, kit: str) -> dict | None:
+async def find_open_ticket(
+    owner_id,
+    kit: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> dict | None:
     """Otevřený ticket hráče na daný kit (prevence duplicit)."""
+    if session_factory is not None:
+        return await _db_find_open_ticket(session_factory, owner_id, kit)
     owner_id = str(owner_id)
     kit_key = str(kit).strip().lower()
     tickets = await store.read(HT_TICKETS_FILE, {})
@@ -241,6 +306,7 @@ async def create_ticket(
     panel_message_id=None,
     ticket_type: str = TICKET_TYPE_EVAL,
     now: int,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict:
     """Transakčně vytvoří ticket (prevence duplicit uvnitř kritického úseku).
 
@@ -250,6 +316,23 @@ async def create_ticket(
     owner_id = str(owner_id)
     kit_key = str(kit).strip().lower()
     channel_id = str(channel_id)
+
+    if session_factory is not None:
+        return await _db_create_ticket(
+            session_factory,
+            channel_id=channel_id,
+            owner_id=owner_id,
+            owner_name=owner_name,
+            ign=ign,
+            kit=kit,
+            target_tier=target_tier,
+            current_tier=current_tier,
+            eval_ok=eval_ok,
+            category_id=category_id,
+            panel_message_id=panel_message_id,
+            ticket_type=ticket_type,
+            now=now,
+        )
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -288,10 +371,18 @@ async def create_ticket(
     return await store.transaction((HT_TICKETS_FILE,), _run)
 
 
-async def claim_ticket(channel_id, actor_id: str, actor_name: str) -> dict:
-    """Tester si převezme ticket (Claim HT). Vrací dict s klíčem ``result``."""
+async def claim_ticket(
+    channel_id,
+    actor_id: str,
+    actor_name: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> dict:
+    """Ticket si převezme tester (actor); bez přepisu cizího claimu."""
     channel_id = str(channel_id)
     actor_id = str(actor_id)
+
+    if session_factory is not None:
+        return await _db_claim_ticket(session_factory, channel_id, actor_id, actor_name)
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -316,10 +407,21 @@ async def claim_ticket(channel_id, actor_id: str, actor_name: str) -> dict:
     return await store.transaction((HT_TICKETS_FILE,), _run)
 
 
-async def unclaim_ticket(channel_id, actor_id: str, *, force: bool = False) -> dict:
-    """Vzdát se ticketu (jen aktuální claimer; ``force`` = kdokoli tester)."""
+async def unclaim_ticket(
+    channel_id,
+    actor_id: str,
+    *,
+    force: bool = False,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> dict:
+    """Zruší claim ticketu; bez ``force`` jen aktér sám (kontrola claimera)."""
     channel_id = str(channel_id)
     actor_id = str(actor_id)
+
+    if session_factory is not None:
+        return await _db_unclaim_ticket(
+            session_factory, channel_id, actor_id, force=force
+        )
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -346,10 +448,20 @@ async def unclaim_ticket(channel_id, actor_id: str, *, force: bool = False) -> d
     return await store.transaction((HT_TICKETS_FILE,), _run)
 
 
-async def add_member(channel_id, member_id: str) -> dict:
-    """Přidá hráče mezi členy ticketu (přístup mu udělí Discord vrstva)."""
+async def add_member(
+    channel_id,
+    member_id: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    member_name: str | None = None,
+) -> dict:
+    """Přidá člena týmu ticketu; jen vlastník-id a otevřený ticket."""
     channel_id = str(channel_id)
     member_id = str(member_id)
+
+    if session_factory is not None:
+        return await _db_add_member(
+            session_factory, channel_id, member_id, member_name
+        )
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -370,10 +482,17 @@ async def add_member(channel_id, member_id: str) -> dict:
     return await store.transaction((HT_TICKETS_FILE,), _run)
 
 
-async def remove_member(channel_id, member_id: str) -> dict:
-    """Odebere hráče z ticketu (přístup mu Discord vrstva zruší)."""
+async def remove_member(
+    channel_id,
+    member_id: str,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> dict:
+    """Odebere člena týmu ticketu; jen vlastník-id a otevřený ticket."""
     channel_id = str(channel_id)
     member_id = str(member_id)
+
+    if session_factory is not None:
+        return await _db_remove_member(session_factory, channel_id, member_id)
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -400,6 +519,7 @@ async def close_ticket(
     *,
     cooldown_ms: int = 0,
     now: int = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict:
     """Zavře ticket + nastaví HT3+ cooldown vlastníkovi (7 dní).
 
@@ -411,6 +531,11 @@ async def close_ticket(
     actor_id = str(actor_id)
     if now is None:
         now = _now_ms()
+
+    if session_factory is not None:
+        return await _db_close_ticket(
+            session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
+        )
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -453,7 +578,12 @@ def _cooldown_remaining_ms(
 
 
 async def reopen_ticket(
-    channel_id, actor_id: str, *, cooldown_ms: int = 0, now: int = None
+    channel_id,
+    actor_id: str,
+    *,
+    cooldown_ms: int = 0,
+    now: int = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict:
     """Znovu otevře zavřený ticket (Reopen).
 
@@ -466,6 +596,11 @@ async def reopen_ticket(
     actor_id = str(actor_id)
     if now is None:
         now = _now_ms()
+
+    if session_factory is not None:
+        return await _db_reopen_ticket(
+            session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
+        )
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -514,10 +649,22 @@ async def log_ticket_event(
     actor_name: str = "",
     details: str = None,
     now: int = None,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> None:
     """Připíše událost do logu ticketu (append-only)."""
     if now is None:
         now = _now_ms()
+
+    if session_factory is not None:
+        return await _db_log_ticket_event(
+            session_factory,
+            ticket_id,
+            action=action,
+            actor_id=actor_id,
+            actor_name=actor_name,
+            details=details,
+            now=now,
+        )
 
     async def _run(tx):
         logs = tx.get(HT_TICKET_LOGS_FILE, {})
@@ -536,14 +683,25 @@ async def log_ticket_event(
     return await store.transaction((HT_TICKET_LOGS_FILE,), _run)
 
 
-async def get_ticket_logs(ticket_id) -> list:
+async def get_ticket_logs(
+    ticket_id,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> list:
     """Vrátí události daného ticketu (nejstarší první)."""
+    if session_factory is not None:
+        return await _db_get_ticket_logs(session_factory, ticket_id)
     logs = await store.read(HT_TICKET_LOGS_FILE, {})
     return logs.get(str(ticket_id), [])
 
 
-async def set_panel_message(channel_id, message_id) -> None:
+async def set_panel_message(
+    channel_id,
+    message_id,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> None:
     """Doplní ``panelMessageId`` do záznamu ticketu (po vytvoření zprávy)."""
+    if session_factory is not None:
+        return await _db_set_panel_message(session_factory, channel_id, message_id)
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -555,6 +713,558 @@ async def set_panel_message(channel_id, message_id) -> None:
         return rec
 
     return await store.transaction((HT_TICKETS_FILE,), _run)
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL režim (session_factory) – JSON-mód zůstává beze změny výše
+# ---------------------------------------------------------------------------
+def _db_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _ms_to_dt(ms: int | None) -> datetime | None:
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+
+
+def _dt_to_ms(dt: datetime | None) -> int | None:
+    if dt is None:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+async def _db_resolve_kit(session: AsyncSession, name: str) -> Kit | None:
+    clean = (name or "").strip()
+    if not clean:
+        return None
+    kit = await KitRepository().get_by_name(session, clean)
+    if kit is not None:
+        return kit
+    return await KitRepository().get_or_create(
+        session, key=clean.lower(), name=clean
+    )
+
+
+async def _db_resolve_tier(
+    session: AsyncSession, code: str | None
+) -> TierDefinition | None:
+    if not code or not str(code).strip():
+        return None
+    code = str(code).strip().upper()
+    tier = await TierDefinitionRepository().get_by_code(session, code)
+    if tier is not None:
+        return tier
+    return await TierDefinitionRepository().get_or_create(
+        session,
+        code=code,
+        kind="virtual" if code == "LT3E" else "ladder",
+        display_name=code,
+    )
+
+
+async def _db_ticket_to_dict(session: AsyncSession, t: Ticket) -> dict:
+    owner = await PlayerRepository().get_by_id(session, t.player_id)
+    claimer = (
+        await PlayerRepository().get_by_id(session, t.claimer_id)
+        if t.claimer_id is not None
+        else None
+    )
+    kit = await KitRepository().get_by_id(session, t.kit_id)
+    target_tier = (
+        await TierDefinitionRepository().get_by_id(session, t.target_tier_id)
+        if t.target_tier_id is not None
+        else None
+    )
+    current_tier = (
+        await TierDefinitionRepository().get_by_id(session, t.current_tier_id)
+        if t.current_tier_id is not None
+        else None
+    )
+    members = [
+        m
+        for m in await TicketMemberRepository().list_for_ticket(
+            session, ticket_id=t.id
+        )
+        if m.removed_at is None
+    ]
+    member_ids: list[str] = []
+    for m in members:
+        mp = await PlayerRepository().get_by_id(session, m.player_id)
+        did = mp.discord_id if mp is not None else None
+        member_ids.append(str(did if did is not None else m.player_id))
+    owner_did = owner.discord_id if owner is not None else None
+    claimer_did = claimer.discord_id if claimer is not None else None
+    return {
+        "id": str(t.channel_id),
+        "status": t.status,
+        "ownerId": str(owner_did if owner_did is not None else t.player_id),
+        "ownerName": t.owner_name or "",
+        "ign": t.ign or "",
+        "kit": kit.name if kit is not None else "",
+        "targetTier": target_tier.code if target_tier is not None else "",
+        "currentTier": current_tier.code if current_tier is not None else None,
+        "eval": bool(t.eval),
+        "claimerId": (
+            str(claimer_did) if claimer_did is not None else None
+        ),
+        "claimerName": t.claimer_name or "",
+        "members": member_ids,
+        "categoryId": t.category_id,
+        "panelMessageId": (
+            str(t.panel_message_id) if t.panel_message_id else None
+        ),
+        "ticketType": t.ticket_type,
+        "createdAt": _dt_to_ms(t.created_at) or 0,
+        "closedAt": _dt_to_ms(t.closed_at),
+    }
+
+
+async def _db_get_tickets(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> dict:
+    async with transaction(session_factory) as session:
+        out: dict = {}
+        for t in await TicketRepository().list_all(session):
+            out[str(t.channel_id)] = await _db_ticket_to_dict(session, t)
+        return out
+
+
+async def _db_get_ticket(
+    session_factory: async_sessionmaker[AsyncSession], channel_id
+) -> dict | None:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        return await _db_ticket_to_dict(session, t) if t is not None else None
+
+
+async def _db_find_open_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    owner_id,
+    kit: str,
+) -> dict | None:
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(
+            session, int(owner_id)
+        )
+        if player is None:
+            return None
+        kit_row = await KitRepository().get_by_name(session, kit)
+        if kit_row is None:
+            return None
+        rows = await TicketRepository().list_open(
+            session, player_id=player.id, kit_id=kit_row.id
+        )
+        return await _db_ticket_to_dict(session, rows[0]) if rows else None
+
+
+async def _db_create_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    channel_id,
+    owner_id: str,
+    owner_name: str,
+    ign: str,
+    kit: str,
+    target_tier: str,
+    current_tier: str | None,
+    eval_ok: bool,
+    category_id: int,
+    panel_message_id=None,
+    ticket_type: str = TICKET_TYPE_EVAL,
+    now: int,
+) -> dict:
+    async with transaction(session_factory) as session:
+        try:
+            _, player = await PlayerRepository().claim_discord_id(
+                session,
+                discord_id=int(owner_id),
+                ign=(ign or "").strip() or (owner_name or "").strip() or str(owner_id),
+            )
+        except PlayerIdentityError as err:
+            return {"result": "identity_conflict", "message": str(err)}
+        kit_row = await _db_resolve_kit(session, kit)
+        if kit_row is None:
+            return {"result": "invalid_kit", "message": "Kit je prázdný."}
+        target = await _db_resolve_tier(session, target_tier)
+        cur = await _db_resolve_tier(session, current_tier)
+        existing = await TicketRepository().list_open(
+            session, player_id=player.id, kit_id=kit_row.id
+        )
+        if existing:
+            return {
+                "result": "duplicate",
+                "ticket": await _db_ticket_to_dict(session, existing[0]),
+            }
+        # M5 audit fix: list_open() above (read) then open() below (write)
+        # is a TOCTOU race — two concurrent create_ticket calls for the
+        # same player+kit can both pass the pre-check and race on INSERT.
+        # The partial unique index (uq_tickets_open_player_kit) correctly
+        # rejects the loser at the DB level, but without this SAVEPOINT +
+        # catch, that raw IntegrityError propagated uncaught all the way to
+        # the Discord command handler (a generic "unexpected error" instead
+        # of a clean "you already have an open ticket").
+        try:
+            async with session.begin_nested():
+                t = await TicketRepository().open(
+                    session,
+                    channel_id=int(channel_id),
+                    player_id=player.id,
+                    ign=(ign or "").strip(),
+                    kit_id=kit_row.id,
+                    target_tier_id=target.id if target is not None else None,
+                    current_tier_id=cur.id if cur is not None else None,
+                    eval=bool(eval_ok),
+                    ticket_type=ticket_type or TICKET_TYPE_EVAL,
+                    created_at=_ms_to_dt(now) or _db_now(),
+                    owner_name=owner_name or "",
+                    category_id=int(category_id) if category_id else None,
+                    panel_message_id=(
+                        int(panel_message_id) if panel_message_id else None
+                    ),
+                )
+        except IntegrityError:
+            winner = await TicketRepository().list_open(
+                session, player_id=player.id, kit_id=kit_row.id
+            )
+            if winner:
+                return {
+                    "result": "duplicate",
+                    "ticket": await _db_ticket_to_dict(session, winner[0]),
+                }
+            raise
+        return {"result": "created", "ticket": await _db_ticket_to_dict(session, t)}
+
+
+async def _db_claim_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    actor_id: str,
+    actor_name: str,
+) -> dict:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        if t is None:
+            return {"result": "not_found"}
+        if t.status != STATUS_OPEN:
+            return {"result": "not_open"}
+        owner = await PlayerRepository().get_by_id(session, t.player_id)
+        if (
+            owner is not None
+            and owner.discord_id is not None
+            and str(owner.discord_id) == actor_id
+        ):
+            return {"result": "own_ticket"}
+        if t.claimer_id is not None:
+            claimer = await PlayerRepository().get_by_id(session, t.claimer_id)
+            if claimer is None or str(claimer.discord_id) != actor_id:
+                return {
+                    "result": "already_claimed",
+                    "claimer_id": (
+                        str(claimer.discord_id)
+                        if claimer is not None and claimer.discord_id is not None
+                        else str(t.claimer_id)
+                    ),
+                    "claimer_name": t.claimer_name or "",
+                }
+        try:
+            actor = await PlayerRepository().get_or_create_by_discord_id(
+                session,
+                discord_id=int(actor_id),
+                ign=(actor_name or "").strip() or str(actor_id),
+            )
+        except PlayerIdentityError as err:
+            return {"result": "identity_conflict", "message": str(err)}
+        row = await TicketRepository().claim(
+            session,
+            ticket_id=t.id,
+            claimer_id=actor.id,
+            claimer_name=actor_name or "",
+        )
+        return {"result": "claimed", "ticket": await _db_ticket_to_dict(session, row)}
+
+
+async def _db_unclaim_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    actor_id: str,
+    *,
+    force: bool = False,
+) -> dict:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        if t is None:
+            return {"result": "not_found"}
+        if t.claimer_id is None:
+            return {"result": "not_claimed"}
+        claimer = await PlayerRepository().get_by_id(session, t.claimer_id)
+        if not force and (
+            claimer is None or str(claimer.discord_id) != actor_id
+        ):
+            return {
+                "result": "not_claimer",
+                "claimer_id": (
+                    str(claimer.discord_id)
+                    if claimer is not None and claimer.discord_id is not None
+                    else str(t.claimer_id)
+                ),
+                "claimer_name": t.claimer_name or "",
+            }
+        previous = {
+            "claimer_id": (
+                str(claimer.discord_id)
+                if claimer is not None and claimer.discord_id is not None
+                else str(t.claimer_id)
+            ),
+            "claimer_name": t.claimer_name or "",
+        }
+        row = await TicketRepository().claim(
+            session, ticket_id=t.id, claimer_id=None, claimer_name=None
+        )
+        return {
+            "result": "unclaimed",
+            "ticket": await _db_ticket_to_dict(session, row),
+            "previous": previous,
+        }
+
+
+async def _db_add_member(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    member_id: str,
+    member_name: str | None,
+) -> dict:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        if t is None:
+            return {"result": "not_found"}
+        if t.status != STATUS_OPEN:
+            return {"result": "not_open"}
+        owner = await PlayerRepository().get_by_id(session, t.player_id)
+        if (
+            owner is not None
+            and owner.discord_id is not None
+            and str(owner.discord_id) == member_id
+        ):
+            return {"result": "is_owner"}
+        member = await PlayerRepository().get_by_discord_id(
+            session, int(member_id)
+        )
+        if member is None:
+            if not (member_name or "").strip():
+                return {
+                    "result": "player_not_found",
+                    "ticket": await _db_ticket_to_dict(session, t),
+                }
+            try:
+                member = await PlayerRepository().get_or_create_by_discord_id(
+                    session,
+                    discord_id=int(member_id),
+                    ign=(member_name or "").strip(),
+                )
+            except PlayerIdentityError as err:
+                return {"result": "identity_conflict", "message": str(err)}
+        if await TicketMemberRepository().has_member(
+            session, ticket_id=t.id, player_id=member.id
+        ):
+            return {
+                "result": "already_member",
+                "ticket": await _db_ticket_to_dict(session, t),
+            }
+        await TicketMemberRepository().add(
+            session, ticket_id=t.id, player_id=member.id
+        )
+        return {"result": "added", "ticket": await _db_ticket_to_dict(session, t)}
+
+
+async def _db_remove_member(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    member_id: str,
+) -> dict:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        if t is None:
+            return {"result": "not_found"}
+        owner = await PlayerRepository().get_by_id(session, t.player_id)
+        if (
+            owner is not None
+            and owner.discord_id is not None
+            and str(owner.discord_id) == member_id
+        ):
+            return {"result": "is_owner"}
+        member = await PlayerRepository().get_by_discord_id(
+            session, int(member_id)
+        )
+        member_row = None
+        if member is not None:
+            member_row = await TicketMemberRepository().get(
+                session, ticket_id=t.id, player_id=member.id
+            )
+        if t.claimer_id is not None:
+            claimer = await PlayerRepository().get_by_id(session, t.claimer_id)
+            if (
+                claimer is not None
+                and claimer.discord_id is not None
+                and str(claimer.discord_id) == member_id
+            ):
+                return {"result": "is_claimer"}
+        if member_row is None:
+            return {
+                "result": "not_member",
+                "ticket": await _db_ticket_to_dict(session, t),
+            }
+        await TicketMemberRepository().remove(
+            session, ticket_id=t.id, player_id=member.id
+        )
+        return {"result": "removed", "ticket": await _db_ticket_to_dict(session, t)}
+
+
+async def _db_close_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    actor_id: str,
+    *,
+    cooldown_ms: int = 0,
+    now: int,
+) -> dict:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        if t is None:
+            return {"result": "not_found"}
+        if t.status == STATUS_CLOSED:
+            return {
+                "result": "already_closed",
+                "ticket": await _db_ticket_to_dict(session, t),
+            }
+        row = await TicketRepository().close_by_channel(
+            session, channel_id=int(channel_id), closed_at=_ms_to_dt(now)
+        )
+        if cooldown_ms > 0 and row is not None:
+            await CooldownRepository().upsert(
+                session,
+                player_id=row.player_id,
+                cooldown_type=COOLDOWN_HT3,
+                kit_id=row.kit_id,
+                expires_at=_ms_to_dt(now + int(cooldown_ms)) or _db_now(),
+                source="ticket_close",
+            )
+        return {
+            "result": "closed",
+            "ticket": await _db_ticket_to_dict(session, row),
+        }
+
+
+async def _db_reopen_ticket(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    actor_id: str,
+    *,
+    cooldown_ms: int = 0,
+    now: int,
+) -> dict:
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        if t is None:
+            return {"result": "not_found"}
+        if t.status != STATUS_CLOSED:
+            return {
+                "result": "not_closed",
+                "ticket": await _db_ticket_to_dict(session, t),
+            }
+        if cooldown_ms > 0:
+            now_dt = _ms_to_dt(now)
+            active = await CooldownRepository().get_active(
+                session,
+                player_id=t.player_id,
+                cooldown_type=COOLDOWN_HT3,
+                kit_id=t.kit_id,
+                now=now_dt,
+            )
+            if active:
+                remaining_ms = int(
+                    (active[0].expires_at - now_dt).total_seconds() * 1000
+                )
+                kit = await KitRepository().get_by_id(session, t.kit_id)
+                return {
+                    "result": "cooldown",
+                    "remaining_ms": max(remaining_ms, 0),
+                    "kit": kit.name if kit is not None else "",
+                    "ticket": await _db_ticket_to_dict(session, t),
+                }
+        row = await TicketRepository().reopen_by_channel(
+            session, channel_id=int(channel_id)
+        )
+        return {
+            "result": "reopened",
+            "ticket": await _db_ticket_to_dict(session, row),
+        }
+
+
+async def _db_log_ticket_event(
+    session_factory: async_sessionmaker[AsyncSession],
+    ticket_id,
+    *,
+    action: str,
+    actor_id: str,
+    actor_name: str,
+    details: str | None,
+    now: int,
+) -> None:
+    async with transaction(session_factory) as session:
+        await AuditRepository().append(
+            session,
+            action=action or "",
+            actor_id=int(actor_id) if actor_id else None,
+            actor_name=actor_name or "",
+            entity_type="ticket",
+            entity_id=str(ticket_id),
+            details={"details": details, "ts": int(now)},
+        )
+
+
+async def _db_get_ticket_logs(
+    session_factory: async_sessionmaker[AsyncSession], ticket_id
+) -> list:
+    async with transaction(session_factory) as session:
+        rows = await AuditRepository().list(
+            session,
+            entity_type="ticket",
+            entity_id=str(ticket_id),
+            limit=500,
+        )
+        rows_sorted = sorted(rows, key=lambda r: r.created_at)
+        out = []
+        for r in rows_sorted:
+            raw_details = r.details if isinstance(r.details, dict) else None
+            out.append(
+                {
+                    "ts": _dt_to_ms(r.created_at) or 0,
+                    "action": r.action or "",
+                    "actorId": (
+                        str(r.actor_id) if r.actor_id is not None else ""
+                    ),
+                    "actorName": r.actor_name or "",
+                    "details": (
+                        raw_details.get("details") if raw_details else None
+                    ),
+                }
+            )
+        return out
+
+
+async def _db_set_panel_message(
+    session_factory: async_sessionmaker[AsyncSession],
+    channel_id,
+    message_id,
+) -> dict | None:
+    async with transaction(session_factory) as session:
+        row = await TicketRepository().set_panel_message(
+            session,
+            channel_id=int(channel_id),
+            message_id=int(message_id),
+        )
+        return await _db_ticket_to_dict(session, row) if row else None
 
 
 def _now_ms() -> int:

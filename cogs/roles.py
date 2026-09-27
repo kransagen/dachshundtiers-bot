@@ -19,20 +19,45 @@ Po `/result` se hráči automaticky dá role nového tieru a odeberou se ostatn�
 tier role stejného kitu.
 """
 
+import asyncio
 import logging
+from dataclasses import dataclass
+from typing import Optional
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
+from services.kit_roles import (
+    get_all_kit_role_maps,
+    get_kit_role_map,
+    set_kit_role,
+    unset_kit_role,
+)
 from services.permissions import has_admin_role, has_tester_role
-from services.store import transaction
-from storage import load_data
 from utils import kit_autocomplete
 
 log = logging.getLogger("dachshundtiers")
 
-KIT_ROLES_FILE = "kit_roles.json"
+
+@dataclass(frozen=True)
+class TierRoleGrant:
+    """Výsledek atomického udělení tier role (single ``member.edit``).
+
+    ``ambiguous`` (H6 audit fix): ``True`` znamená, že se ``ok=False``
+    vrátilo NE proto, že mutace jistě selhala (Forbidden, chybějící
+    mapování/role/člen), ale protože klientský request selhal (timeout /
+    spojení) A následné ověření aktuálního stavu Discordu se také
+    nepodařilo — tedy nevíme, jestli Discord roli ve skutečnosti změnil.
+    Volající NESMÍ v tomhle případě předpokládat ani úspěch, ani neúspěch
+    (nikdy nepsat PG mirror jako potvrzený, nikdy neprovádět inverzní
+    opravu) a měl by nechat pozdější pozorování/``/sync discord`` rozhodnout.
+    """
+
+    ok: bool
+    note: str = ""
+    tier_role_id: Optional[int] = None
+    ambiguous: bool = False
 
 
 async def auto_grant_kit_role(
@@ -40,26 +65,29 @@ async def auto_grant_kit_role(
     member_id: str,
     kit_key: str,
     tier_up: str,
-) -> str:
-    """Automaticky dá hráči roli tieru kitu a odebere ostatní tiery kitu.
+    *,
+    session_factory=None,
+) -> TierRoleGrant:
+    """Atomicky nastaví hráči roli tieru kitu (jediné ``member.edit``).
 
-    Vrací krátkou poznámku pro potvrzovací zprávu `/result` (``""`` = nic).
-    Zápis výsledku nikdy nenaruší – všechny chyby se jen zalogují.
+    Discord je jedinou autoritou aktuálních tierů – role se mění JEDNÍM
+    API voláním (žádné add_roles + remove_roles zvlášť, žádný mezistav).
+    Vrací :class:`TierRoleGrant` – ``ok=False`` znamená, že se role
+    NEzměnila (volající pak nesmí zapisovat DB mirror jako potvrzený).
     """
-    # Klíče v kit_roles.json jsou vždy lowercase (ukládá je /setkitrole);
-    # volající (/result i /topresult) sem ale můžou poslat display-case název
-    # kitu (např. "MolePVP") – sjednocení na jednom místě.
     kit_key = (kit_key or "").strip().lower()
-    roles_map = load_data(KIT_ROLES_FILE, {})
-    kit_map = roles_map.get(kit_key)
+    kit_map = await get_kit_role_map(kit_key, session_factory=session_factory)
     if not kit_map:
-        return ""
+        return TierRoleGrant(ok=False)
 
     role_id = kit_map.get(tier_up)
     if role_id is None:
-        return (
-            f"\n💡 Pro kit **{kit_key}** nemáš namapovanou roli tieru **{tier_up}** "
-            f"– nastav ji přes `/setkitrole kit:{kit_key} tier:{tier_up} role:@Role`."
+        return TierRoleGrant(
+            ok=False,
+            note=(
+                f"\n💡 Pro kit **{kit_key}** nemáš namapovanou roli tieru **{tier_up}** "
+                f"– nastav ji přes `/setkitrole kit:{kit_key} tier:{tier_up} role:@Role`."
+            ),
         )
 
     member = guild.get_member(int(member_id))
@@ -69,37 +97,97 @@ async def auto_grant_kit_role(
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             member = None
     if member is None:
-        return (
-            f"\n⚠️ Role **<@&{role_id}>** se nedá dát – hráč <@{member_id}> není na serveru."
+        return TierRoleGrant(
+            ok=False,
+            note=(
+                f"\n⚠️ Role **<@&{role_id}>** se nedá dát – hráč <@{member_id}> není na serveru."
+            ),
         )
 
     role_obj = guild.get_role(int(role_id))
     if role_obj is None:
         log.warning("Role %s pro kit %s tier %s neexistuje", role_id, kit_key, tier_up)
-        return (
-            f"\n⚠️ Role <@&{role_id}> se nenašla – smaž ji a namapuj znovu přes "
-            "`/setkitrole`."
+        return TierRoleGrant(
+            ok=False,
+            note=(
+                f"\n⚠️ Role <@&{role_id}> se nenašla – smaž ji a namapuj znovu přes "
+                "`/setkitrole`."
+            ),
         )
 
+    kit_other_tier_ids = {
+        int(rid) for tier, rid in kit_map.items() if tier != tier_up
+    }
+    target = [r for r in member.roles if r.id not in kit_other_tier_ids]
+    if role_obj not in target:
+        target.append(role_obj)
+    if {r.id for r in member.roles} == {r.id for r in target}:
+        return TierRoleGrant(ok=True, note="", tier_role_id=int(role_id))
+
     try:
-        await member.add_roles(role_obj)
-
-        # Odebrání ostatních tier rolí stejného kitu (hráč má vždy jen jeden tier)
-        other_roles = [
-            guild.get_role(int(rid))
-            for tier, rid in kit_map.items()
-            if tier != tier_up
-        ]
-        to_remove = [r for r in other_roles if r is not None and r in member.roles]
-        if to_remove:
-            await member.remove_roles(*to_remove)
-
-        return f"\n🎖️ Hráči byla dána role **{role_obj.mention}**."
-    except (discord.Forbidden, discord.HTTPException) as err:
+        await member.edit(roles=target)
+        return TierRoleGrant(
+            ok=True,
+            note=f"\n🎖️ Hráči byla dána role **{role_obj.mention}**.",
+            tier_role_id=int(role_id),
+        )
+    except discord.Forbidden as err:
+        # Definitive: the bot lacks permission — the mutation certainly did
+        # not happen, no ambiguity, never worth re-verifying.
         log.warning("Nelze udělit roli %s pro %s: %s", role_id, member_id, err)
-        return (
-            f"\n⚠️ Roli <@&{role_id}> se nepovedlo udělit – zkontroluj oprávnění "
-            "bota (Manage Roles a hierarchii rolí)."
+        return TierRoleGrant(
+            ok=False,
+            note=(
+                f"\n⚠️ Roli <@&{role_id}> se nepovedlo udělit – zkontroluj oprávnění "
+                "bota (Manage Roles a hierarchii rolí)."
+            ),
+        )
+    except (discord.HTTPException, asyncio.TimeoutError, OSError) as err:
+        # H6 audit fix: an HTTP-level failure, client-side timeout, or
+        # connection error does NOT mean the edit definitely failed —
+        # Discord may have applied it before the response/connection was
+        # lost. Re-fetch the member and check whether the intended role set
+        # actually landed before concluding anything.
+        log.warning(
+            "Nejistá odpověď při udělování role %s pro %s (%s) – ověřuji "
+            "aktuální stav rolí",
+            role_id,
+            member_id,
+            err,
+        )
+        try:
+            verified = await guild.fetch_member(int(member_id))
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+            asyncio.TimeoutError,
+            OSError,
+        ):
+            verified = None
+        if verified is not None:
+            held_after = {r.id for r in verified.roles}
+            target_ids = {r.id for r in target}
+            if held_after == target_ids:
+                # Discord DID apply it — never treat a confirmed change as
+                # a failure just because the original response was lost.
+                return TierRoleGrant(
+                    ok=True,
+                    note=f"\n🎖️ Hráči byla dána role **{role_obj.mention}**.",
+                    tier_role_id=int(role_id),
+                )
+        # Neither the original call nor re-verification could confirm the
+        # outcome — report this as genuinely UNKNOWN, not as a plain
+        # failure: the caller must never write a false PG mirror state and
+        # must never attempt a blind inverse mutation based on this alone.
+        return TierRoleGrant(
+            ok=False,
+            ambiguous=True,
+            note=(
+                f"\n⚠️ Roli <@&{role_id}> se nepovedlo potvrdit (timeout) a ani "
+                "zpětně ověřit – stav je NEJISTÝ. Zkontroluj ručně nebo spusť "
+                "`/sync discord` (Discord zůstává jediným zdrojem pravdy)."
+            ),
         )
 
 
@@ -140,13 +228,18 @@ class Roles(commands.Cog):
                 "❌ Zadej platný název kitu a tieru.", ephemeral=True
             )
 
-        async def _run(tx):
-            roles_map = tx.get(KIT_ROLES_FILE, {})
-            kit_map = roles_map.setdefault(kit_key, {})
-            kit_map[tier_up] = str(role.id)
-            tx.set(KIT_ROLES_FILE, roles_map)
-
-        await transaction((KIT_ROLES_FILE,), _run)
+        ok = await set_kit_role(
+            kit_key,
+            tier_up,
+            role.id,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
+        if not ok:
+            return await interaction.response.send_message(
+                f"❌ Kit **{kit_name}** (nebo tier **{tier_up}**) není registrovaný "
+                "– namapování nelze uložit.",
+                ephemeral=True,
+            )
 
         await interaction.response.send_message(
             f"✅ Role **{role.mention}** je namapovaná na kit **{kit_name}** — "
@@ -179,18 +272,11 @@ class Roles(commands.Cog):
         kit_key = kit.strip().lower()
         tier_up = tier.strip().upper()
 
-        async def _run(tx):
-            roles_map = tx.get(KIT_ROLES_FILE, {})
-            kit_map = roles_map.get(kit_key, {})
-            if tier_up not in kit_map:
-                return False
-            del kit_map[tier_up]
-            if not kit_map:
-                roles_map.pop(kit_key, None)
-            tx.set(KIT_ROLES_FILE, roles_map)
-            return True
-
-        removed = await transaction((KIT_ROLES_FILE,), _run)
+        removed = await unset_kit_role(
+            kit_key,
+            tier_up,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
         if not removed:
             return await interaction.response.send_message(
                 f"❌ Pro kit **{kit.strip()}** a tier **{tier_up}** žádné "
@@ -216,7 +302,9 @@ class Roles(commands.Cog):
                 "❌ Pouze pro testery.", ephemeral=True
             )
 
-        roles_map = load_data(KIT_ROLES_FILE, {})
+        roles_map = await get_all_kit_role_maps(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        )
         if not roles_map:
             return await interaction.response.send_message(
                 "ℹ️ Žádné role zatím nejsou namapované. Použij `/setkitrole`.",

@@ -33,6 +33,21 @@ Vlastnosti:
 import logging
 import time
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from db.models import Result
+from db.repositories.cooldowns import COOLDOWN_HT3, COOLDOWN_WAITLIST, CooldownRepository
+from db.repositories.kits import KitRepository, TierDefinitionRepository
+from db.repositories.players import PlayerIdentityError, PlayerRepository
+from db.repositories.results import (
+    PROMOTION_COMMITTED,
+    PROMOTION_DISCORD_PENDING,
+    ResultRepository,
+)
+from db.repositories.sync_audit import AuditRepository
+from db.repositories.tickets import TICKET_OPEN, TicketRepository
+from db.repositories.tiers import MirrorRepository
+from db.services.session import transaction as db_transaction
 from services.player_identity import PlayerIdentityConflict, claim_ign
 from services.store import read as store_read, transaction
 from services.tickets import (
@@ -42,6 +57,11 @@ from services.tickets import (
     HT_TICKET_LOGS_FILE,
     STATUS_CLOSED,
     STATUS_OPEN,
+    _db_resolve_kit,
+    _db_resolve_tier,
+    _db_ticket_to_dict,
+    _dt_to_ms,
+    _ms_to_dt,
 )
 from utils import migrate_mode_keys
 
@@ -373,6 +393,7 @@ async def record_result(
     date: str = "",
     queue_cooldown_ms: int = 0,
     ht3_cooldown_ms: int = 0,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict:
     """Zapíše výsledek evaluace atomicky (validace + idempotence + zápis).
 
@@ -387,6 +408,10 @@ async def record_result(
     - dokud má hráč aktivní cooldown (``queue_cooldown_ms``), je odeslání
       považované za duplicitu a nepřepíše se.
 
+    ``session_factory`` (async_sessionmaker) → zápis do PostgreSQL (result se
+    vloží se stavem ``discord_pending``; Discord-first potvrzení dotáhne
+    ``commit_promotion_with_wedge`` se stejným ``result_key``).
+
     Vrací:
       - ``{"result": "created", "record": {...}, "previous_tier": ...}``
       - ``{"result": "duplicate", "existing": {...}|None}``
@@ -395,6 +420,27 @@ async def record_result(
       - ``{"result": "invalid_tier", "message"}``
       - ``{"result": "identity_conflict", "message"}`` (IGN patří jinému Diskordu)
     """
+    if session_factory is not None:
+        return await _db_record_result(
+            session_factory,
+            ticket_id=ticket_id,
+            player_id=player_id,
+            player_name=player_name,
+            ign=ign,
+            evaluator_id=evaluator_id,
+            evaluator_name=evaluator_name,
+            kit=kit,
+            new_tier=new_tier,
+            display_tier=display_tier,
+            score=score,
+            outcome=outcome,
+            notes=notes,
+            eval_flag=eval_flag,
+            now=now,
+            date=date,
+            queue_cooldown_ms=queue_cooldown_ms,
+            ht3_cooldown_ms=ht3_cooldown_ms,
+        )
     if now is None:
         now = _now_ms()
     player_id = str(player_id)
@@ -518,14 +564,22 @@ async def record_result(
 # ---------------------------------------------------------------------------
 # Čtení historie (restart-safe)
 # ---------------------------------------------------------------------------
-async def get_result_by_ticket(ticket_id) -> dict | None:
+async def get_result_by_ticket(
+    ticket_id, session_factory: async_sessionmaker[AsyncSession] | None = None
+) -> dict | None:
     """Výsledek pro daný HT ticket (podle ID kanálu), nebo None."""
+    if session_factory is not None:
+        return await _db_get_result_by_ticket(session_factory, ticket_id)
     results = await store_read(HT_RESULTS_FILE, {})
     return results.get(str(ticket_id))
 
 
-async def get_results_for_player(player_id) -> list:
+async def get_results_for_player(
+    player_id, session_factory: async_sessionmaker[AsyncSession] | None = None
+) -> list:
     """Všechny výsledky hráče v chronologickém pořadí (historie evaluací)."""
+    if session_factory is not None:
+        return await _db_get_results_for_player(session_factory, player_id)
     results = await store_read(HT_RESULTS_FILE, {})
     out = [
         r
@@ -536,7 +590,322 @@ async def get_results_for_player(player_id) -> list:
     return out
 
 
-async def get_all_results() -> list:
+async def get_all_results(
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+) -> list:
     """Všechny výsledky (historie evaluací) v pořadí zápisu."""
+    if session_factory is not None:
+        return await _db_get_all_results(session_factory)
     results = await store_read(HT_RESULTS_FILE, {})
     return [r for r in results.values() if isinstance(r, dict)]
+
+
+# ---------------------------------------------------------------------------
+# DB mode (PostgreSQL) — result_key = f"result:{result_id}" tak, aby
+# commit_promotion_with_wedge (cog) našel řádek po Discord mutaci.
+# ---------------------------------------------------------------------------
+async def _db_record_result(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    ticket_id=None,
+    player_id: str,
+    player_name: str,
+    ign: str,
+    evaluator_id: str,
+    evaluator_name: str,
+    kit: str,
+    new_tier: str,
+    display_tier: str,
+    score: str,
+    outcome: str,
+    notes: str = None,
+    eval_flag: bool = False,
+    now: int = None,
+    date: str = "",
+    queue_cooldown_ms: int = 0,
+    ht3_cooldown_ms: int = 0,
+) -> dict:
+    if now is None:
+        now = _now_ms()
+    player_id = str(player_id)
+    evaluator_id = str(evaluator_id)
+    stored_tier = "LT3" if eval_flag else normalize_tier(new_tier)
+
+    async with db_transaction(session_factory) as session:
+        results = ResultRepository()
+
+        # --- Idempotence / ochrana před duplicitami ---
+        if ticket_id is not None:
+            tid = str(ticket_id)
+            existing = await results.get_by_key(session, f"result:{tid}")
+            if existing is not None:
+                if existing.promotion_status == PROMOTION_COMMITTED:
+                    return {
+                        "result": "duplicate",
+                        "existing": await _db_result_to_dict(session, existing),
+                    }
+                # H2 audit fix: a row stuck at discord_pending (or any other
+                # non-committed status) means the previous attempt's Discord
+                # role grant never succeeded — commit_after_discord_success
+                # (which alone would create mirror/history/cooldown rows) is
+                # NEVER called unless the grant succeeds, so nothing of
+                # value exists yet for this key. Treating it as "duplicate"
+                # would permanently block every future retry while telling
+                # the tester it already succeeded. Discard and retry clean.
+                await session.delete(existing)
+                await session.flush()
+            result_id = tid
+            kind = "ticket"
+            ticket_key = f"result:{tid}"
+        else:
+            player = await PlayerRepository().get_by_discord_id(
+                session, int(player_id)
+            )
+            if player is not None and queue_cooldown_ms > 0:
+                active = await CooldownRepository().is_active(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_WAITLIST,
+                    kit_id=None,
+                    now=_ms_to_dt(now),
+                )
+                if active:
+                    latest = await results.list_for_player(
+                        session, player_id=player.id, limit=1
+                    )
+                    return {
+                        "result": "duplicate",
+                        "existing": (
+                            await _db_result_to_dict(session, latest[0])
+                            if latest
+                            else None
+                        ),
+                    }
+            result_id = f"{QUEUE_RESULT_PREFIX}{player_id}-{now}"
+            kind = "queue"
+            ticket_key = f"result:{result_id}"
+
+        # --- Validace ---
+        kit_row = await _db_resolve_kit(session, kit)
+        if ticket_id is not None:
+            tid = str(ticket_id)
+            ticket = await TicketRepository().get_by_channel(session, int(tid))
+            if ticket is None:
+                return {"result": "not_found"}
+            if ticket.status != TICKET_OPEN:
+                return {
+                    "result": "ticket_closed",
+                    "ticket": await _db_ticket_to_dict(session, ticket),
+                }
+            owner = await PlayerRepository().get_by_id(session, ticket.player_id)
+            owner_did = owner.discord_id if owner is not None else None
+            if str(owner_did if owner_did is not None else ticket.player_id) != player_id:
+                return {
+                    "result": "wrong_player",
+                    "ticket": await _db_ticket_to_dict(session, ticket),
+                }
+            if (
+                kit_row is None
+                or ticket.kit_id is None
+                or ticket.kit_id != kit_row.id
+            ):
+                return {
+                    "result": "wrong_kit",
+                    "ticket": await _db_ticket_to_dict(session, ticket),
+                }
+            target_tier = (
+                await TierDefinitionRepository().get_by_id(session, ticket.target_tier_id)
+                if ticket.target_tier_id is not None
+                else None
+            )
+            current_tier = (
+                await TierDefinitionRepository().get_by_id(session, ticket.current_tier_id)
+                if ticket.current_tier_id is not None
+                else None
+            )
+            ok_validate, msg_validate = validate_result_tier(
+                new_tier,
+                target_tier=target_tier.code if target_tier else None,
+                current_tier=current_tier.code if current_tier else None,
+            )
+            if not ok_validate:
+                return {"result": "invalid_tier", "message": msg_validate}
+        else:
+            if kit_row is None:
+                return {"result": "invalid_tier", "message": f"Neznámý kit: {kit}"}
+            ok_validate, msg_validate = validate_result_tier(new_tier)
+            if not ok_validate:
+                return {"result": "invalid_tier", "message": msg_validate}
+
+        # --- Identita hráče (claim; IGN patřící jinému Diskordu → konflikt) ---
+        try:
+            _outcome, player = await PlayerRepository().claim_discord_id(
+                session, discord_id=int(player_id), ign=(ign or "").strip()
+            )
+        except PlayerIdentityError as exc:
+            return {"result": "identity_conflict", "message": str(exc)}
+
+        # --- Předchozí tier: zdroj pravdy = mirror (Discord-confirmed) ---
+        previous = "N/A"
+        mirror = await MirrorRepository().get_current(
+            session, player_id=player.id, kit_id=kit_row.id
+        )
+        if mirror is not None:
+            prev_tier = await TierDefinitionRepository().get_by_id(
+                session, mirror.tier_id
+            )
+            if prev_tier is not None:
+                previous = prev_tier.code
+        prev_tier_row = (
+            await _db_resolve_tier(session, previous) if previous != "N/A" else None
+        )
+        new_tier_row = await _db_resolve_tier(session, stored_tier)
+        evaluator = (
+            await PlayerRepository().get_by_discord_id(session, int(evaluator_id))
+            if evaluator_id and evaluator_id.isdigit()
+            else None
+        )
+
+        # --- Historie výsledků (append-only; stav = discord_pending) ---
+        row = await results.insert(
+            session,
+            result_key=ticket_key,
+            kind=kind,
+            player_id=player.id,
+            kit_id=kit_row.id,
+            subtype=None,
+            evaluator_id=evaluator.id if evaluator is not None else None,
+            ticket_channel_id=int(tid) if ticket_id is not None else None,
+            previous_tier_id=prev_tier_row.id if prev_tier_row is not None else None,
+            new_tier_id=new_tier_row.id if new_tier_row is not None else None,
+            score=score,
+            outcome=outcome,
+            notes=(notes or "").strip() or None,
+            eval_flag=eval_flag,
+            date=date,
+            recorded_at=_ms_to_dt(now),
+            promotion_status=PROMOTION_DISCORD_PENDING,
+        )
+
+        # --- Cooldown hráče (queue, 4 dny; i ticket výsledek ho prodlužuje) ---
+        if queue_cooldown_ms > 0:
+            await CooldownRepository().upsert(
+                session,
+                player_id=player.id,
+                cooldown_type=COOLDOWN_WAITLIST,
+                kit_id=None,
+                expires_at=_ms_to_dt(now + int(queue_cooldown_ms)),
+                source="result",
+            )
+
+        # --- Ticket: zavření + HT3+ cooldown + event log (atomicky) ---
+        if ticket_id is not None:
+            await TicketRepository().close_by_channel(
+                session, channel_id=int(tid), closed_at=_ms_to_dt(now)
+            )
+            if ht3_cooldown_ms > 0:
+                await CooldownRepository().upsert(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_HT3,
+                    kit_id=kit_row.id,
+                    expires_at=_ms_to_dt(now + int(ht3_cooldown_ms)),
+                    source="ticket_close",
+                )
+            await AuditRepository().append(
+                session,
+                action="result",
+                actor_id=int(evaluator_id) if evaluator_id.isdigit() else None,
+                actor_name=evaluator_name or "",
+                entity_type="ticket",
+                entity_id=str(tid),
+                details={
+                    "details": f"{previous} → {normalize_tier(new_tier)}",
+                    "ts": int(now),
+                },
+            )
+
+        record = await _db_result_to_dict(session, row)
+        return {"result": "created", "record": record, "previous_tier": previous}
+
+
+async def _db_result_to_dict(session: AsyncSession, row: Result) -> dict:
+    """Rekonstrukce JSON tvaru záznamu z DB řádku (kompatibilní dict)."""
+    player = await PlayerRepository().get_by_id(session, row.player_id)
+    evaluator = (
+        await PlayerRepository().get_by_id(session, row.evaluator_id)
+        if row.evaluator_id is not None
+        else None
+    )
+    kit = await KitRepository().get_by_id(session, row.kit_id)
+    previous = (
+        await TierDefinitionRepository().get_by_id(session, row.previous_tier_id)
+        if row.previous_tier_id is not None
+        else None
+    )
+    new_tier = (
+        await TierDefinitionRepository().get_by_id(session, row.new_tier_id)
+        if row.new_tier_id is not None
+        else None
+    )
+    player_did = player.discord_id if player is not None else None
+    result_id = row.result_key.removeprefix("result:").removeprefix("ht_fight:")
+    record = {
+        "id": result_id,
+        "kind": row.kind,
+        "ticketId": str(row.ticket_channel_id) if row.ticket_channel_id else None,
+        "playerId": str(player_did if player_did is not None else row.player_id),
+        "playerName": player.ign if player is not None else "",
+        "ign": player.ign if player is not None else "",
+        "evaluatorId": str(evaluator.discord_id) if evaluator is not None and evaluator.discord_id else "",
+        "evaluatorName": evaluator.ign if evaluator is not None else "",
+        "kit": kit.name if kit is not None else "",
+        "previousTier": previous.code if previous is not None else "N/A",
+        "newTier": new_tier.code if new_tier is not None else "",
+        "displayTier": "LT3 + eval" if row.eval_flag else (new_tier.code if new_tier is not None else ""),
+        "score": row.score or "",
+        "outcome": row.outcome or "",
+        "notes": (row.notes or "").strip() or None,
+        "eval": bool(row.eval_flag),
+        "resultType": "ht_fight" if row.kind == "ht_fight" else "normal",
+        "timestamp": _dt_to_ms(row.recorded_at) or 0,
+        "date": row.date or "",
+    }
+    if row.kind == "ht_fight":
+        record["fightTier"] = normalize_tier(row.subtype) if row.subtype else ""
+        record["tierStatus"] = (row.tier_status or "").strip()
+        record["opponentId"] = str(row.opponent_id) if row.opponent_id else None
+        record["opponentName"] = row.opponent_name or ""
+        record["announcement"] = row.announcement_status or ANNOUNCEMENT_PENDING
+    return record
+
+
+async def _db_get_result_by_ticket(
+    session_factory: async_sessionmaker[AsyncSession], ticket_id
+) -> dict | None:
+    async with db_transaction(session_factory) as session:
+        row = await ResultRepository().get_by_key(session, f"result:{ticket_id}")
+        return await _db_result_to_dict(session, row) if row is not None else None
+
+
+async def _db_get_results_for_player(
+    session_factory: async_sessionmaker[AsyncSession], player_id
+) -> list:
+    async with db_transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, int(player_id))
+        if player is None:
+            return []
+        rows = await ResultRepository().list_for_player(
+            session, player_id=player.id, limit=1000
+        )
+        out = [await _db_result_to_dict(session, r) for r in rows]
+        out.sort(key=lambda r: r.get("timestamp", 0))
+        return out
+
+
+async def _db_get_all_results(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> list:
+    async with db_transaction(session_factory) as session:
+        rows = await ResultRepository().list_all(session)
+        return [await _db_result_to_dict(session, r) for r in rows]

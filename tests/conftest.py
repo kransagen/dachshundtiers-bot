@@ -9,6 +9,7 @@ event loop as the test (pytest-asyncio creates a fresh loop per test).
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -18,8 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# EMBEDDED_PG_DIR override lets a machine pin a persistent pgdata location
+# (faster repeat local runs); the default is a portable per-machine temp path
+# so a fresh CI runner (no pre-existing /tmp layout) always works.
 EMBEDDED_PG_DIR = Path(
-    os.environ.get("EMBEDDED_PG_DIR", "/tmp/opencode/pip-test/pgembedded")
+    os.environ.get(
+        "EMBEDDED_PG_DIR",
+        str(Path(tempfile.gettempdir()) / "dachshundtiers-embedded-pg"),
+    )
 )
 
 ALL_TABLES = (
@@ -80,6 +87,10 @@ def _create_fresh_database(socket_dir: str, name: str) -> None:
 def embedded_pg() -> Iterator[str]:
     from embedded_postgres import get_server
 
+    # get_server() requires its parent directory to already exist (it only
+    # creates the leaf pgdata dir itself) — a fresh machine/CI runner won't
+    # have EMBEDDED_PG_DIR.parent yet.
+    EMBEDDED_PG_DIR.parent.mkdir(parents=True, exist_ok=True)
     server = get_server(EMBEDDED_PG_DIR, cleanup_mode="stop")
     socket_dir = str(server.get_postmaster_info().socket_dir)
     yield socket_dir

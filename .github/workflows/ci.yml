@@ -18,7 +18,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install -r requirements.txt -r requirements-dev.txt
           pip install ruff==0.16.8
 
       - name: Lint (ruff – pyflakes + E4/E7/E9)
@@ -27,5 +27,5 @@ jobs:
       - name: Syntax check (py_compile)
         run: python -m compileall -q .
 
-      - name: Tests (unittest)
-        run: python -m unittest discover -s tests -p "test_*.py" -v
+      - name: Tests (pytest)
+        run: python -m pytest -v

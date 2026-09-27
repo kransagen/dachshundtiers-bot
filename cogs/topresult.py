@@ -81,12 +81,24 @@ async def fight_tier_autocomplete(
 class HTFightRetryView(discord.ui.View):
     """Retry odeslání HT Fight oznámení po selhání (záznam zůstal v historii)."""
 
-    def __init__(self, *, result_id, result_channel, content, allowed_mentions):
+    def __init__(
+        self,
+        *,
+        result_id,
+        result_channel,
+        content,
+        allowed_mentions,
+        session_factory=None,
+    ):
         super().__init__(timeout=300)
         self.result_id = result_id
         self.result_channel = result_channel
         self.content = content
         self.allowed_mentions = allowed_mentions
+        # G0: v DB režimu se stav oznámení zapisuje do PostgreSQL, ne do
+        # `ht_results.json` – jinak by retry zapisoval do JSONu, zatímco
+        # zbytek běží v PG.
+        self.session_factory = session_factory
 
     @discord.ui.button(label="🔄 Zkusit odeslat znovu", style=discord.ButtonStyle.primary)
     async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -105,7 +117,10 @@ class HTFightRetryView(discord.ui.View):
                 ephemeral=True,
             )
         await set_ht_fight_announcement(
-            self.result_id, ANNOUNCEMENT_SENT, message_id=sent.id
+            self.result_id,
+            ANNOUNCEMENT_SENT,
+            message_id=sent.id,
+            session_factory=self.session_factory,
         )
         button.disabled = True
         await interaction.response.edit_message(
@@ -474,6 +489,9 @@ class TopResult(commands.Cog):
         )
         allowed = discord.AllowedMentions(everyone=False, users=True, roles=[target_role])
         announce_result_id = rec.get("id")
+        # Historie žije tam, kde skutečně byla zapsána (G0 – v DB režimu je to
+        # PostgreSQL, `ht_results.json` je jen legacy/export).
+        history_label = "PostgreSQL" if sf is not None else "`ht_results.json`"
         try:
             sent = await result_channel.send(content=message, allowed_mentions=allowed)
         except (discord.Forbidden, discord.HTTPException) as err:
@@ -481,7 +499,11 @@ class TopResult(commands.Cog):
                 "Nelze poslat HT Fight výsledek do %s: %s", TOP_RESULT_CHANNEL_ID, err
             )
             try:
-                await set_ht_fight_announcement(announce_result_id, ANNOUNCEMENT_FAILED)
+                await set_ht_fight_announcement(
+                    announce_result_id,
+                    ANNOUNCEMENT_FAILED,
+                    session_factory=sf,
+                )
             except Exception:  # noqa: BLE001
                 log.exception("Nelze označit oznámení jako failed")
             view = HTFightRetryView(
@@ -489,16 +511,20 @@ class TopResult(commands.Cog):
                 result_channel=result_channel,
                 content=message,
                 allowed_mentions=allowed,
+                session_factory=sf,
             )
             return await interaction.followup.send(
                 f"❌ HT Fight výsledek se nepodařilo odeslat do <#{TOP_RESULT_CHANNEL_ID}> "
-                "(záznam zůstal v historii `ht_results.json`, oznámení je ve stavu "
+                f"(záznam zůstal v historii {history_label}, oznámení je ve stavu "
                 "**failed**) – můžeš to zkusit znovu tlačítkem.",
                 ephemeral=True,
                 view=view,
             )
         await set_ht_fight_announcement(
-            announce_result_id, ANNOUNCEMENT_SENT, message_id=sent.id
+            announce_result_id,
+            ANNOUNCEMENT_SENT,
+            message_id=sent.id,
+            session_factory=sf,
         )
 
         reply = (

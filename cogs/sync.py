@@ -168,7 +168,7 @@ DATACHECK_AREA = {
     "orphaned_results": "data",
 }
 
-AREAS = ("all", "identity", "tiers", "roles", "web", "data")
+AREAS = ("all", "identity", "tiers", "roles", "web", "data", "db")
 AREA_LABELS = {
     "all": "Vše",
     "identity": "Identita",
@@ -176,6 +176,7 @@ AREA_LABELS = {
     "roles": "Discord role",
     "web": "Web",
     "data": "Data / účty",
+    "db": "PostgreSQL",
 }
 
 
@@ -852,6 +853,92 @@ def _check_embed(
     )
     _append_note(embeds[0], note)
     return embeds
+
+
+HEALTH_COLORS = {
+    "healthy": 0x10B981,
+    "degraded": 0xF59E0B,
+    "failed": 0xEF4444,
+}
+HEALTH_STATUS_LABELS = {
+    "healthy": "🟢 healthy",
+    "degraded": "🟡 degraded",
+    "failed": "🔴 failed",
+}
+HEALTH_CHECK_LABELS = {
+    "observation_freshness": "🕐 Freshness Discord pozorování",
+    "last_mirror_sync": "🔁 Poslední úspěšný mirror sync",
+    "unresolved_identities": "🧩 Nevyřešené importní identity",
+    "sync_anomalies": "⚠️ Sync anomálie",
+    "outbox_backlog": "📮 Outbox backlog",
+    "outbox_stale_claims": "⏳ Rozbité (stale) outbox claimy",
+    "unresolved_promotions": "🏆 Nevyřešená povýšení (discord_pending)",
+    "recent_db_failures": "💥 Selhané DB operace (24 h)",
+}
+
+
+def _health_embed(report: dict) -> discord.Embed:
+    """Embed s ``db.services.health.build_health_report`` — read-only.
+
+    Tento report je jediný způsob, jak se operátor dozví o skutečně
+    nevyřešených povýšeních (``unresolved_promotions``) a o mrtvém
+    outboxu – obojí je dnes vidět jen přímo v DB. Je PŘÍMOČARÝ výstup
+    jediné implementace, žádná duplikace logiky.
+    """
+    status = report.get("status", "failed")
+    lines = []
+    for check in report.get("checks", []):
+        label = HEALTH_CHECK_LABELS.get(check["key"], check["label"])
+        badge = HEALTH_STATUS_LABELS.get(check["status"], check["status"])
+        lines.append(f"{badge} · **{label}** — {check['detail']}")
+    embed = discord.Embed(
+        title="🩺 /sync check — PostgreSQL mirror health",
+        description="\n".join(lines) or "Žádné kontroly nebyly vráceny.",
+        color=HEALTH_COLORS.get(status, 0xEF4444),
+    )
+    embed.set_footer(
+        text=(
+            f"Stav: {HEALTH_STATUS_LABELS.get(status, status)} · "
+            f"{report.get('generated_at', '')} · read-only, nic se nemění"
+        )
+    )
+    return embed
+
+
+async def _db_health_embed(session_factory) -> list:
+    """Health pack pro /sync check; prázdný list, když DB není nebo selhala.
+
+    Selhání health reportu NESMÍ shodit celou `/sync check` – je to doplňková
+    diagnostika, ne podmínka pro ostatní části výpisu.
+    """
+    if session_factory is None:
+        return [
+            discord.Embed(
+                title="🩺 /sync check — PostgreSQL mirror health",
+                description=(
+                    "PostgreSQL není nakonfigurováno (`DATABASE_URL` chybí) – "
+                    "mirror health nelze ověřit. Tento běh pracuje v legacy "
+                    "JSON režimu."
+                ),
+                color=0xF59E0B,
+            )
+        ]
+    try:
+        from db.services.health import build_health_report
+
+        return [_health_embed(await build_health_report(session_factory))]
+    except Exception:  # noqa: BLE001 – health je doplňková diagnostika
+        log.exception("PostgreSQL health report selhal")
+        return [
+            discord.Embed(
+                title="🩺 /sync check — PostgreSQL mirror health",
+                description=(
+                    "Health report se nepodařilo sestavit – viz logy. Ostatní "
+                    "části `/sync check` zůstávají platné."
+                ),
+                color=0xEF4444,
+            )
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1695,6 +1782,14 @@ class Sync(commands.Cog):
             repairable_count=dc["repairable_count"],
             note=note,
         )
+        # G0: health report z `db.services.health` dostává v /sync check svého
+        # prvního produkčního volajícího. Přidává se jako SAMOSTATNÝ embed
+        # (ne jako položka `items`), takže filtrování podle oblasti i počty
+        # severit zůstávají přesně tam, kde byly.
+        if area in ("all", "db"):
+            embeds = embeds + await _db_health_embed(
+                getattr(interaction.client, "db_session_factory", None)
+            )
         await _send_embed_pack(interaction.followup, embeds)
 
     # ------------------------------------------------------------------

@@ -67,24 +67,21 @@ CURRENT_TIER_FILES = ("players.json",)
 #                                  ``using_postgres()`` check in this
 #                                  function or its only caller) — dead
 #                                  whenever the bot runs in DB mode
-#   json_first_write_pending_db_gate — LIVE in every deployment, DB-mode
-#                                  included (H1 audit finding): ``/result``
-#                                  and ``/topresult`` never pass
-#                                  ``session_factory`` into ``record_result``/
-#                                  ``record_ht_fight``, so this write to
-#                                  players.json ALWAYS runs first, before the
-#                                  Discord role grant is even attempted. The
-#                                  PG mirror commit is a separate,
-#                                  independently-gated step later in the same
-#                                  command. This tag marks the site as
-#                                  reviewed-and-tracked, NOT as safe — it is
-#                                  the exact mechanism behind H1 and remains
-#                                  an open finding; do not extend this flow
-#                                  to any other site without re-reviewing H1.
 #
 # Entries below were captured directly from a real scan of this working tree
 # (not hand-guessed) — see the H5 fix notes in the audit report for how each
 # was reviewed.
+#
+# G0 note on the former ``json_first_write_pending_db_gate`` flow: that class
+# existed ONLY to record the H1 finding — that ``/result`` and ``/topresult``
+# reached the JSON branch because the commands never passed
+# ``session_factory`` into ``record_result``/``record_ht_fight``, so
+# players.json was written first and unconditionally, in every deployment.
+# The commands now pass the session factory (the DB dispatcher is taken
+# first), so these four sites are genuinely dead whenever PostgreSQL is
+# configured and are classified as ``json_legacy_mode_only_pg_gated``. The
+# regression that would resurrect H1 is pinned by an AST/qualname test in
+# ``tests/test_g0_promotion_cutover.py``, not by a permanent allowlist label.
 SAFE_TIER_READER_FLOWS: dict[tuple[str, str, str], str] = {
     ("cogs.edituser", "_find_player_sync", "load_data"): "json_ui_read",
     ("cogs.edituser", "DiscordIdModal.on_submit", "load_data"): "json_ui_read",
@@ -102,10 +99,10 @@ SAFE_TIER_READER_FLOWS: dict[tuple[str, str, str], str] = {
     ("services.edituser", "apply_player_edit._run", "tx.set"): "json_legacy_mode_only_pg_gated",
     ("services.edituser", "execute_player_edit", "_store_read"): "json_legacy_mode_only_pg_gated",
     ("services.tickets", "find_player_tier", "load_data"): "json_legacy_mode_only_pg_gated",
-    ("services.results", "record_result._run", "tx.get"): "json_first_write_pending_db_gate",
-    ("services.results", "record_result._run", "tx.set"): "json_first_write_pending_db_gate",
-    ("services.topresult", "record_ht_fight._run", "tx.get"): "json_first_write_pending_db_gate",
-    ("services.topresult", "record_ht_fight._run", "tx.set"): "json_first_write_pending_db_gate",
+    ("services.results", "record_result._run", "tx.get"): "json_legacy_mode_only_pg_gated",
+    ("services.results", "record_result._run", "tx.set"): "json_legacy_mode_only_pg_gated",
+    ("services.topresult", "record_ht_fight._run", "tx.get"): "json_legacy_mode_only_pg_gated",
+    ("services.topresult", "record_ht_fight._run", "tx.set"): "json_legacy_mode_only_pg_gated",
 }
 
 FORBIDDEN_FLOWS = {"json_tier_to_discord", "json_tier_to_pg"}

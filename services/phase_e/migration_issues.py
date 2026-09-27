@@ -23,6 +23,8 @@ from db.models import MigrationImportIssue
 from services.phase_d.import_data import (
     CAT_COOLDOWN_INVALID_EXPIRY,
     CAT_COOLDOWN_INVALID_KEY,
+    CAT_COOLDOWN_KIT_UNKNOWN,
+    CAT_COOLDOWN_KIT_UNATTRIBUTABLE,
     CAT_COOLDOWN_UNRESOLVED,
     CAT_HISTORY_INVALID_DATE,
     CAT_HISTORY_UNKNOWN_KIT,
@@ -71,10 +73,15 @@ BUCKET_COOLDOWN = {
         CAT_COOLDOWN_UNRESOLVED,
         CAT_COOLDOWN_INVALID_KEY,
         CAT_COOLDOWN_INVALID_EXPIRY,
+        CAT_COOLDOWN_KIT_UNATTRIBUTABLE,
+        CAT_COOLDOWN_KIT_UNKNOWN,
     ],
     "action": (
         "Přiřadit hráče JEN explicitním /linkdiscord nebo opravit klíč/expiraci "
-        "v cooldowns.json. Neúplné záznamy zůstávají otevřené."
+        "v cooldowns.json. Neúplné záznamy zůstávají otevřené. Cooldown bez jednoznačného "
+        "kitu (category cooldown_kit_unattributable / cooldown_kit_unknown_in_registry) "
+        "zůstává záměrně globální a do vypršení blokuje všechny kity — opravit nebo "
+        "explicitně zrušit, žádný kit se nehádá."
     ),
 }
 BUCKET_HT3 = {

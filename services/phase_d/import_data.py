@@ -13,6 +13,13 @@ Authority invariants enforced here (design §16/§17, authority model):
   ONLY for players that are already linked (``players.discord_id``). Every
   unresolved key is recorded as ``MigrationImportIssue`` — never guessed,
   never auto-matched, never fuzzy-resolved.
+* ``cooldowns.json`` is kit-less, but the kit IS derivable: the legacy writer
+  set ``cooldowns[playerId] = now`` in the same transaction as the result
+  carrying that ``now`` and its ``kit``. An unambiguous ``(playerId, timestamp)``
+  match is converted to a per-kit row; anything else (no match, several kits at
+  the same instant, unknown kit) is kept as an explicitly-flagged legacy global
+  row with an open ``MigrationImportIssue``. Legacy rows are never deleted and
+  never guessed. ``ht3_cooldowns.json`` is already per-kit and stays per-kit.
 * All writes are idempotent: kits/tiers/players use get-or-create, history and
   issues dedupe on natural keys, cooldowns/testers upsert. A second run on the
   same database changes nothing.
@@ -36,6 +43,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
+    Kit,
     MigrationImportIssue,
     Tester,
     TierHistory,
@@ -58,6 +66,8 @@ CAT_HISTORY_UNKNOWN_TIER = "player_history_unknown_tier"
 CAT_COOLDOWN_UNRESOLVED = "cooldown_unresolved_player"
 CAT_COOLDOWN_INVALID_KEY = "cooldown_invalid_key"
 CAT_COOLDOWN_INVALID_EXPIRY = "cooldown_invalid_expiry"
+CAT_COOLDOWN_KIT_UNATTRIBUTABLE = "cooldown_kit_unattributable"
+CAT_COOLDOWN_KIT_UNKNOWN = "cooldown_kit_unknown_in_registry"
 CAT_HT3_UNRESOLVED = "ht3_cooldown_unresolved_player"
 CAT_HT3_UNKNOWN_KIT = "ht3_cooldown_unknown_kit"
 CAT_HT3_INVALID_KEY = "ht3_cooldown_invalid_key"
@@ -68,6 +78,7 @@ SRC_PLAYERS = "players.json"
 SRC_COOLDOWNS = "cooldowns.json"
 SRC_HT3 = "ht3_cooldowns.json"
 SRC_TESTERS = "testers.json"
+SRC_RESULTS = "ht_results.json"
 
 HISTORY_REASON = "import z players.json (Phase D) — historický stav, nikoli aktuální tier"
 
@@ -320,6 +331,88 @@ async def _import_players_and_history(
                 report["history_imported"] += 1
 
 
+def _load_result_kit_index(data_dir: Path) -> dict[tuple[str, int], set[str]]:
+    """Index legacy results by ``(discord_id, timestamp_ms)`` -> {kit_key}.
+
+    Legacy ``cooldowns.json`` is kit-less (``{discord_id: expires_ms}``) —
+    the old bot had ONE global 4-day cooldown. The kit is nevertheless
+    *derivable*: ``cooldowns[playerId] = now`` was written in the very same
+    transaction as the result that triggered it, and that result records both
+    ``playerId``, ``kit`` and ``timestamp = now``. So an exact
+    ``(playerId, timestamp)`` match is a derivation, not a guess.
+
+    Only *unambiguous* matches count — see :func:`_resolve_cooldown_kit`.
+    A missing/unreadable file yields an empty index, which degrades safely:
+    every cooldown then falls back to the legacy global row + an open issue.
+    """
+    path = data_dir / SRC_RESULTS
+    index: dict[tuple[str, int], set[str]] = {}
+    if not path.exists():
+        return index
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return index
+    if not isinstance(raw, dict):
+        return index
+    for record in raw.values():
+        if not isinstance(record, dict):
+            continue
+        player_id = str(record.get("playerId") or "").strip()
+        kit = str(record.get("kit") or "").strip()
+        if not player_id or not kit:
+            continue
+        try:
+            ts = int(record.get("timestamp"))
+        except (TypeError, ValueError):
+            continue
+        index.setdefault((player_id, ts), set()).add(kit)
+    return index
+
+
+# ``_resolve_cooldown_kit`` status values.
+KIT_OK = "attributed"
+KIT_NO_RESULT = "no_result"
+KIT_AMBIGUOUS = "ambiguous"
+KIT_UNKNOWN_REGISTRY = "unknown_registry"
+
+
+def _resolve_cooldown_kit(
+    index: dict[tuple[str, int], set[str]], discord_id: int, ms
+) -> tuple[Optional[str], str]:
+    """Resolve the kit of a legacy kit-less waitlist cooldown.
+
+    Returns ``(kit_key, status)``. ``kit_key`` is only non-``None`` when
+    ``status == KIT_OK``, i.e. when exactly one distinct kit produced the
+    cooldown. Every other outcome keeps the row global (never deleted, never
+    guessed) and is reported as an explicit migration issue.
+    """
+    try:
+        ts = int(ms)
+    except (TypeError, ValueError):
+        return None, KIT_NO_RESULT
+    kits = index.get((str(discord_id), ts))
+    if not kits:
+        return None, KIT_NO_RESULT
+    if len(kits) > 1:
+        return None, KIT_AMBIGUOUS
+    return next(iter(kits)), KIT_OK
+
+
+async def _lookup_kit(
+    kit_repo: KitRepository, session: AsyncSession, name: str
+) -> Optional[Kit]:
+    """Exact kit lookup for a legacy name — by key, then by display name.
+
+    Legacy ``ht_results.json`` stores the kit *display name* while ``kits.json``
+    seeds ``Kit.key``. The case-insensitive name match is exact (not fuzzy) and
+    is the same comparison the ticket/result validation already performs; a kit
+    that resolves to nothing is reported, never approximated.
+    """
+    kit = await kit_repo.get_by_key(session, name)
+    return kit if kit is not None else await kit_repo.get_by_name(session, name)
+
+
 async def _import_link_keyed_stores(
     session: AsyncSession,
     *,
@@ -330,6 +423,7 @@ async def _import_link_keyed_stores(
     cooldown_repo: CooldownRepository,
 ) -> None:
     path = data_dir / SRC_COOLDOWNS
+    result_kit_index = _load_result_kit_index(data_dir)
     if path.exists():
         raw = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
@@ -372,12 +466,72 @@ async def _import_link_keyed_stores(
                         payload={"discord_id": str(discord_id), "expires_at_ms": ms},
                     )
                     continue
+
+                # --- Kit attribution -------------------------------------
+                # cooldowns.json has no kit dimension. The kit is derivable
+                # ONLY when exactly one legacy result at the very same
+                # instant produced the cooldown. Anything less is left
+                # global and reported — never guessed, never dropped.
+                kit_key, kit_status = _resolve_cooldown_kit(
+                    result_kit_index, discord_id, ms
+                )
+                kit_id: Optional[int] = None
+                if kit_status == KIT_OK:
+                    kit = await _lookup_kit(kit_repo, session, kit_key)
+                    if kit is None:
+                        kit_status = KIT_UNKNOWN_REGISTRY
+                    else:
+                        kit_id = kit.id
+
+                if kit_id is not None:
+                    report["cooldowns_imported_per_kit"] += 1
+                else:
+                    report["cooldowns_kept_global"] += 1
+                    if kit_status == KIT_UNKNOWN_REGISTRY:
+                        report["cooldowns_kit_unknown_registry"] += 1
+                        reason = (
+                            f"Cooldown hráče `{discord_id}` byl jednoznačně "
+                            f"přiřazen ke kitu `{kit_key}`, ale tento kit není "
+                            "v registru kits. Řádek zůstává globální (bez kit_id)."
+                        )
+                        category = CAT_COOLDOWN_KIT_UNKNOWN
+                    else:
+                        report["cooldowns_kit_unattributable"] += 1
+                        if kit_status == KIT_AMBIGUOUS:
+                            reason = (
+                                f"Cooldown hráče `{discord_id}` nelze jednoznačně "
+                                "přiřadit ke kitu: ve stejném okamžiku "
+                                f"(timestamp {ms}) existuje více výsledků s různými "
+                                "kity. Řádek zůstává globální (bez kit_id)."
+                            )
+                        else:
+                            reason = (
+                                f"Cooldown hráče `{discord_id}` nelze přiřadit "
+                                f"ke kitu: v {SRC_RESULTS} není žádný výsledek "
+                                f"s `playerId` a `timestamp` {ms}. Řádek zůstává "
+                                "globální (bez kit_id)."
+                            )
+                        category = CAT_COOLDOWN_KIT_UNATTRIBUTABLE
+                    report["issues_recorded"] += await _record_issue(
+                        session,
+                        category=category,
+                        source_file=SRC_COOLDOWNS,
+                        source_key=str(discord_id),
+                        reason=reason,
+                        payload={
+                            "discord_id": str(discord_id),
+                            "expires_at_ms": ms,
+                            "kit_key": kit_key,
+                            "attribution": kit_status,
+                        },
+                    )
+
                 await cooldown_repo.upsert(
                     session,
                     player_id=player.id,
                     cooldown_type=COOLDOWN_WAITLIST,
                     expires_at=expires_at,
-                    kit_id=None,
+                    kit_id=kit_id,
                     source="migration",
                 )
                 report["cooldowns_imported"] += 1
@@ -515,6 +669,10 @@ async def run_import(session: AsyncSession, *, data_dir: Path) -> dict:
         "history_unknown_kit": 0,
         "history_unknown_tier": 0,
         "cooldowns_imported": 0,
+        "cooldowns_imported_per_kit": 0,
+        "cooldowns_kept_global": 0,
+        "cooldowns_kit_unattributable": 0,
+        "cooldowns_kit_unknown_registry": 0,
         "cooldowns_unresolved": 0,
         "cooldowns_invalid_key": 0,
         "cooldowns_invalid_expiry": 0,

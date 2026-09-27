@@ -56,6 +56,10 @@ class Cooldown(Base):
             postgresql_where=text("kit_id IS NOT NULL"),
         ),
         Index("ix_cooldowns_expiry", "expires_at"),
+        # The naming convention (`db/base.py`: "ck": "ck_%(table_name)s_%(constraint_name)s")
+        # expands this to `ck_cooldowns_type`, which is exactly what migration
+        # 63bdbcfda74a creates. The bare suffix is the correct declaration —
+        # spelling the full name here would yield `ck_cooldowns_ck_cooldowns_type`.
         CheckConstraint(
             "cooldown_type IN ('waitlist', 'ht3')", name="type"
         ),

@@ -22,6 +22,8 @@ from db.repositories.players import PlayerRepository
 from services.phase_d.import_data import (
     AUDIT_ACTION_IMPORT,
     BOT_CONFIG_IMPORT_KEY,
+    CAT_COOLDOWN_KIT_UNKNOWN,
+    CAT_COOLDOWN_KIT_UNATTRIBUTABLE,
     CAT_COOLDOWN_UNRESOLVED,
     CAT_TESTER_UNRESOLVED,
     import_json_data,
@@ -71,9 +73,22 @@ PLAYERS = [
 
 LINKED_DID = 111111111111111111
 UNLINKED_DID = 222222222222222222
-COOLDOWNS = {str(LINKED_DID): 1780593929525, str(UNLINKED_DID): 1780593929525}
+COOLDOWN_MS = 1780593929525
+COOLDOWNS = {str(LINKED_DID): COOLDOWN_MS, str(UNLINKED_DID): COOLDOWN_MS}
 HT3 = {str(LINKED_DID): {"IronAxe": 1785769543952, "NoSuchKit": 1}}
 TESTERS = [str(LINKED_DID), "999999999999999999"]
+# The legacy bot wrote `cooldowns[playerId] = now` in the SAME transaction as
+# the result carrying that `now` and its kit — so the kit-less waitlist
+# cooldown below is derivable and must land per-kit, not global.
+RESULTS = {
+    "r1": {
+        "id": "r1",
+        "playerId": str(LINKED_DID),
+        "kit": "IronAxe",
+        "timestamp": COOLDOWN_MS,
+        "date": "04.06.2026",
+    }
+}
 
 
 def _write(data_dir, files: dict) -> None:
@@ -92,6 +107,7 @@ def _write_all(data_dir) -> None:
             "kits.json": KITS,
             "cooldowns.json": COOLDOWNS,
             "ht3_cooldowns.json": HT3,
+            "ht_results.json": RESULTS,
             "testers.json": TESTERS,
         },
     )
@@ -112,6 +128,20 @@ async def _count(session_factory, model) -> int:
             select(func.count()).select_from(model)
         )
         return result.scalar_one()
+
+
+async def _global_cooldowns(session_factory) -> int:
+    """Legacy kit-less rows — must only ever exist as a flagged edge case."""
+    async with session_factory() as session:
+        result = await session.execute(
+            select(func.count()).select_from(Cooldown).where(Cooldown.kit_id.is_(None))
+        )
+        return result.scalar_one()
+
+
+async def _cooldowns(session_factory) -> list[Cooldown]:
+    async with session_factory() as session:
+        return list((await session.execute(select(Cooldown))).scalars().all())
 
 
 async def _get_report(session_factory) -> dict:
@@ -145,6 +175,10 @@ async def test_import_full_flow(tmp_path, session_factory, clean_db):
     assert report["history_invalid_dates"] == 1  # nobody_here
     assert report["history_unknown_kit"] == 1  # guest / NoSuchKit
     assert report["cooldowns_imported"] == 1
+    assert report["cooldowns_imported_per_kit"] == 1  # derived from ht_results
+    assert report["cooldowns_kept_global"] == 0
+    assert report["cooldowns_kit_unattributable"] == 0
+    assert report["cooldowns_kit_unknown_registry"] == 0
     assert report["cooldowns_unresolved"] == 1
     assert report["ht3_imported"] == 1
     assert report["ht3_unknown_kit"] == 1
@@ -154,6 +188,7 @@ async def test_import_full_flow(tmp_path, session_factory, clean_db):
     assert await _count(session_factory, Kit) == len(KITS)
     assert await _count(session_factory, TierHistory) == 4
     assert await _count(session_factory, Cooldown) == 2  # waitlist + ht3
+    assert await _global_cooldowns(session_factory) == 0  # derived, never global
     from db.models import Tester
 
     assert await _count(session_factory, Tester) == 1
@@ -180,6 +215,235 @@ async def test_import_full_flow(tmp_path, session_factory, clean_db):
         ).scalar_one()
         assert ht.previous_tier_id is None
         assert ht.changed_at == datetime(2026, 5, 16, tzinfo=timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_imported_waitlist_cooldown_is_scoped_to_the_derived_kit(
+    tmp_path, session_factory, clean_db
+):
+    """cooldowns.json has no kit column; the kit is derivable and must be used."""
+    await _link(session_factory, discord_id=LINKED_DID, ign="Atrajmix_")
+    _write_all(tmp_path)
+
+    await import_json_data(session_factory, data_dir=tmp_path)
+
+    rows = [c for c in await _cooldowns(session_factory) if c.cooldown_type == "waitlist"]
+    assert len(rows) == 1
+    assert rows[0].kit_id is not None  # NOT the legacy global shape
+
+    async with session_factory() as session:
+        kit = (
+            await session.execute(select(Kit).where(Kit.key == "IronAxe"))
+        ).scalar_one()
+        assert rows[0].kit_id == kit.id
+        assert rows[0].source == "migration"
+        assert rows[0].expires_at == datetime.fromtimestamp(
+            COOLDOWN_MS / 1000.0, tz=timezone.utc
+        )
+
+    async with session_factory() as session:
+        issues = (
+            (
+                await session.execute(
+                    select(MigrationImportIssue).where(
+                        MigrationImportIssue.category.in_(
+                            (CAT_COOLDOWN_KIT_UNATTRIBUTABLE, CAT_COOLDOWN_KIT_UNKNOWN)
+                        )
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert issues == []  # derivation succeeded -> nothing to flag
+
+
+@pytest.mark.asyncio
+async def test_kitless_cooldown_without_matching_result_stays_global_and_is_flagged(
+    tmp_path, session_factory, clean_db
+):
+    """No derivable kit -> keep the row, never delete it, never guess, flag it."""
+    await _link(session_factory, discord_id=LINKED_DID, ign="Atrajmix_")
+    _write(
+        tmp_path,
+        {
+            "players.json": PLAYERS,
+            "kits.json": KITS,
+            "cooldowns.json": {str(LINKED_DID): COOLDOWN_MS},
+            # ht_results.json deliberately absent: the cooldown cannot be traced
+        },
+    )
+
+    report = await import_json_data(session_factory, data_dir=tmp_path)
+
+    assert report["cooldowns_imported"] == 1
+    assert report["cooldowns_kept_global"] == 1
+    assert report["cooldowns_kit_unattributable"] == 1
+    assert report["cooldowns_imported_per_kit"] == 0
+    assert await _global_cooldowns(session_factory) == 1  # preserved, not dropped
+
+    async with session_factory() as session:
+        issue = (
+            (
+                await session.execute(
+                    select(MigrationImportIssue).where(
+                        MigrationImportIssue.category
+                        == CAT_COOLDOWN_KIT_UNATTRIBUTABLE
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert issue.status == "open"
+        assert issue.source_file == "cooldowns.json"
+        assert issue.source_key == str(LINKED_DID)
+        assert issue.payload["attribution"] == "no_result"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_kit_attribution_stays_global_and_is_flagged(
+    tmp_path, session_factory, clean_db
+):
+    """Two kits at the same instant is ambiguous -> global row + open issue."""
+    await _link(session_factory, discord_id=LINKED_DID, ign="Atrajmix_")
+    _write(
+        tmp_path,
+        {
+            "players.json": PLAYERS,
+            "kits.json": KITS,
+            "cooldowns.json": {str(LINKED_DID): COOLDOWN_MS},
+            "ht_results.json": {
+                "r1": {
+                    "id": "r1",
+                    "playerId": str(LINKED_DID),
+                    "kit": "IronAxe",
+                    "timestamp": COOLDOWN_MS,
+                },
+                "r2": {
+                    "id": "r2",
+                    "playerId": str(LINKED_DID),
+                    "kit": "MolePVP",
+                    "timestamp": COOLDOWN_MS,
+                },
+            },
+        },
+    )
+
+    report = await import_json_data(session_factory, data_dir=tmp_path)
+
+    assert report["cooldowns_kept_global"] == 1
+    assert report["cooldowns_kit_unattributable"] == 1
+    assert await _global_cooldowns(session_factory) == 1
+
+    async with session_factory() as session:
+        issue = (
+            (
+                await session.execute(
+                    select(MigrationImportIssue).where(
+                        MigrationImportIssue.category
+                        == CAT_COOLDOWN_KIT_UNATTRIBUTABLE
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert issue.payload["attribution"] == "ambiguous"
+
+
+@pytest.mark.asyncio
+async def test_derived_kit_missing_from_registry_stays_global_and_is_flagged(
+    tmp_path, session_factory, clean_db
+):
+    """Unambiguous kit, but absent from `kits` -> flag, do not invent a kit."""
+    await _link(session_factory, discord_id=LINKED_DID, ign="Atrajmix_")
+    _write(
+        tmp_path,
+        {
+            "players.json": PLAYERS,
+            "kits.json": KITS,  # no "GhostKit"
+            "cooldowns.json": {str(LINKED_DID): COOLDOWN_MS},
+            "ht_results.json": {
+                "r1": {
+                    "id": "r1",
+                    "playerId": str(LINKED_DID),
+                    "kit": "GhostKit",
+                    "timestamp": COOLDOWN_MS,
+                }
+            },
+        },
+    )
+
+    report = await import_json_data(session_factory, data_dir=tmp_path)
+
+    assert report["cooldowns_kept_global"] == 1
+    assert report["cooldowns_kit_unknown_registry"] == 1
+    assert report["cooldowns_kit_unattributable"] == 0
+    assert await _global_cooldowns(session_factory) == 1
+    assert await _count(session_factory, Kit) == len(KITS)  # nothing invented
+
+    async with session_factory() as session:
+        issue = (
+            (
+                await session.execute(
+                    select(MigrationImportIssue).where(
+                        MigrationImportIssue.category == CAT_COOLDOWN_KIT_UNKNOWN
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert issue.payload["attribution"] == "unknown_registry"
+        assert issue.payload["kit_key"] == "GhostKit"
+
+
+@pytest.mark.asyncio
+async def test_global_cooldown_fallback_when_results_file_is_unreadable(
+    tmp_path, session_factory, clean_db
+):
+    """A corrupt results file must never lose a cooldown nor crash the import."""
+    await _link(session_factory, discord_id=LINKED_DID, ign="Atrajmix_")
+    _write(
+        tmp_path,
+        {
+            "players.json": PLAYERS,
+            "kits.json": KITS,
+            "cooldowns.json": {str(LINKED_DID): COOLDOWN_MS},
+        },
+    )
+    (tmp_path / "ht_results.json").write_text("{not json", encoding="utf-8")
+
+    report = await import_json_data(session_factory, data_dir=tmp_path)
+
+    assert report["cooldowns_imported"] == 1
+    assert report["cooldowns_kept_global"] == 1
+    assert await _global_cooldowns(session_factory) == 1
+
+
+@pytest.mark.asyncio
+async def test_kit_attribution_is_idempotent(tmp_path, session_factory, clean_db):
+    """A second import run must not add rows, issues, or drop the kit scope."""
+    await _link(session_factory, discord_id=LINKED_DID, ign="Atrajmix_")
+    _write_all(tmp_path)
+
+    await import_json_data(session_factory, data_dir=tmp_path)
+    first = await _cooldowns(session_factory)
+    issues_after_first = await _count(session_factory, MigrationImportIssue)
+
+    second = await import_json_data(session_factory, data_dir=tmp_path)
+
+    assert second["cooldowns_imported"] == 1
+    assert second["cooldowns_imported_per_kit"] == 1
+    assert second["issues_recorded"] == 0
+    assert second["cooldowns_kept_global"] == 0
+
+    again = await _cooldowns(session_factory)
+    assert len(again) == len(first) == 2
+    assert await _count(session_factory, MigrationImportIssue) == issues_after_first
+    assert await _global_cooldowns(session_factory) == 0
+    assert sorted(c.id for c in again) == sorted(c.id for c in first)
 
 
 @pytest.mark.asyncio

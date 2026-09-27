@@ -21,7 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import HT3_PANEL_CHANNEL_ID, PLAYER_COOLDOWN_MS
+from config import HT3_PANEL_CHANNEL_ID
 from services.config_store import set_ht3_panel
 from services.cooldowns import get_cooldowns
 from services.evals import set_eval, unset_eval
@@ -467,20 +467,28 @@ class HT3(commands.Cog):
         cooldowns = await get_cooldowns(
             target_id,
             session_factory=getattr(self.bot, "db_session_factory", None),
-            waitlist_cooldown_ms=int(PLAYER_COOLDOWN_MS),
         )
-        remaining = cooldowns["waitlist_ms"]
+        waitlist_cd = cooldowns["waitlist"]
+        legacy_global_ms = cooldowns["waitlist_legacy_global_ms"]
         user_cd = cooldowns["ht3"]
 
-        text = f"**Cooldowny pro {target.name}**\n\n"
-
-        if remaining is not None:
+        def _fmt(remaining: int) -> str:
             days = remaining // (24 * 60 * 60 * 1000)
             hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
             minutes = (remaining % (60 * 60 * 1000)) // (60 * 1000)
-            text += f"**Waitlist cooldown:** ⏳ Ještě {days}d {hours}h {minutes}m\n\n"
-        else:
-            text += "**Waitlist cooldown:** žádný\n\n"
+            return f"⏳ Ještě {days}d {hours}h {minutes}m"
+
+        text = f"**Cooldowny pro {target.name}**\n\n"
+
+        text += "**Waitlist cooldowny:**\n"
+        if waitlist_cd:
+            for kit, remaining in waitlist_cd.items():
+                text += f"**{kit}:** {_fmt(remaining)}\n"
+        if legacy_global_ms is not None:
+            text += f"**(starý obecný cooldown, blokuje všechny kity):** {_fmt(legacy_global_ms)}\n"
+        if not waitlist_cd and legacy_global_ms is None:
+            text += "žádný\n"
+        text += "\n"
 
         text += "**HT3+ Ticket Cooldowny:**\n"
         has_cooldown = False

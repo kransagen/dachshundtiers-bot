@@ -2,10 +2,8 @@
 
 import discord
 
-from config import get_queue_channel_id
-from services.config_store import get_queue_channel_id as get_queue_channel_id_async
+from services.config_store import get_queue_channel_id
 from services.queue_service import list_queue_entries, panel_message_id, queue_state
-from storage import load_data
 
 
 def create_queue_embed(kit_name: str, current_queue, testers_list) -> discord.Embed:
@@ -34,37 +32,20 @@ def create_queue_embed(kit_name: str, current_queue, testers_list) -> discord.Em
     )
 
 
-async def update_panel(guild, kit_key: str, *, session_factory=None) -> None:
+async def update_panel(guild, kit_key: str, *, session_factory) -> None:
     """Aktualizuje embed živého panelu pro daný kit.
 
     Panel se hledá v určeném kanálu kitu (QUEUE_CHANNELS), ne v kanálu příkazu.
-    S ``session_factory`` čte stav fronty z DB (services), jinak z JSON souborů.
     """
     if guild is None:
         return
 
-    if session_factory is not None:
-        active = await queue_state(kit_key, session_factory=session_factory)
-        entries = await list_queue_entries(kit_key, session_factory=session_factory)
-        message_id = await panel_message_id(kit_key, session_factory=session_factory)
-        channel_id = await get_queue_channel_id_async(
-            kit_key, session_factory=session_factory
-        )
-        kit_name = active.get("name", kit_key) if active else kit_key
-        testers = active.get("testers", []) if active else []
-    else:
-        queue_messages = load_data("queue_messages.json", {})
-        active_queues = load_data("active_queues.json", {})
-        entry = queue_messages.get(kit_key)
-        active = active_queues.get(kit_key)
-
-        if not entry or not active:
-            return
-
-        message_id = entry.get("message_id") if isinstance(entry, dict) else entry
-        channel_id = get_queue_channel_id(kit_key)
-        kit_name = active.get("name", kit_key)
-        testers = active.get("testers", [])
+    active = await queue_state(kit_key, session_factory=session_factory)
+    entries = await list_queue_entries(kit_key, session_factory=session_factory)
+    message_id = await panel_message_id(kit_key, session_factory=session_factory)
+    channel_id = await get_queue_channel_id(kit_key, session_factory=session_factory)
+    kit_name = active.get("name", kit_key) if active else kit_key
+    testers = active.get("testers", []) if active else []
 
     if not message_id or not channel_id:
         return

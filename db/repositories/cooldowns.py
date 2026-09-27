@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import text
@@ -17,8 +17,13 @@ COOLDOWN_HT3 = "ht3"
 
 
 class CooldownRepository:
-    """Per-player cooldowns; partial unique indexes make waitlist (kit NULL)
-    and kit-bound variants mutually exclusive upsert targets."""
+    """Per-player cooldowns, always scoped to (player_id, kit_id, cooldown_type).
+
+    ``uq_cooldowns_kit`` is the enforced identity. The partial
+    ``uq_cooldowns_waitlist`` target exists solely for Phase D legacy rows
+    imported from the kit-less ``cooldowns.json`` (see
+    ``services/cooldowns.py``) — no runtime writer ever passes ``kit_id=None``.
+    """
 
     async def upsert(
         self,
@@ -76,6 +81,37 @@ class CooldownRepository:
             stmt = stmt.where(Cooldown.kit_id == kit_id)
         result = await session.execute(stmt.order_by(Cooldown.expires_at.desc()))
         return list(result.scalars())
+
+    async def get_active_waitlist(
+        self,
+        session: AsyncSession,
+        *,
+        player_id: int,
+        kit_id: int,
+        now: Optional[datetime] = None,
+    ) -> list[Cooldown]:
+        """Active waitlist cooldown rows blocking this (player, kit).
+
+        Waitlist cooldowns are per-kit (business rule: a kit's cooldown must
+        never block another kit) — but a Phase D legacy row with ``kit_id IS
+        NULL`` is a GLOBAL cooldown (the original bot had one 4-day cooldown
+        across every kit). The importer derives the kit from ``ht_results.json``
+        when the match is unambiguous; rows that stay global are flagged with an
+        open ``MigrationImportIssue`` and are never dropped or rewritten. They
+        simply keep blocking every kit until they naturally expire.
+        """
+        now = now if now is not None else func.now()
+        stmt = (
+            select(Cooldown)
+            .where(
+                Cooldown.player_id == player_id,
+                Cooldown.cooldown_type == COOLDOWN_WAITLIST,
+                Cooldown.expires_at > now,
+                or_(Cooldown.kit_id == kit_id, Cooldown.kit_id.is_(None)),
+            )
+            .order_by(Cooldown.expires_at.desc())
+        )
+        return list((await session.execute(stmt)).scalars())
 
     async def is_active(
         self,

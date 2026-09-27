@@ -174,12 +174,22 @@ async def _cooldown_embed(
     pid = str(player.get("discordId") or "")
     from services.cooldowns import get_cooldowns
 
-    snapshot = await get_cooldowns(
-        pid, session_factory=session_factory, waitlist_cooldown_ms=PLAYER_COOLDOWN_MS
-    )
-    lines = [
-        f"**Waitlist (4 d):** {format_duration(snapshot['waitlist_ms'])}",
-    ]
+    snapshot = await get_cooldowns(pid, session_factory=session_factory)
+    waitlist_bucket = snapshot.get("waitlist") or {}
+    lines = []
+    if waitlist_bucket:
+        lines.append("**Waitlist (4 d per kit):**")
+        for k in sorted(waitlist_bucket):
+            marker = "🟡" if k == kit_key else "▫"
+            lines.append(f"  {marker} `{k}`: {format_duration(waitlist_bucket[k])}")
+    else:
+        lines.append("**Waitlist (4 d per kit):** žádné aktivní cooldowny")
+    legacy_global_ms = snapshot.get("waitlist_legacy_global_ms")
+    if legacy_global_ms is not None:
+        lines.append(
+            f"  ⚠️ starý globální cooldown (blokuje VŠECHNY kity): "
+            f"{format_duration(legacy_global_ms)}"
+        )
     ht3_bucket = snapshot.get("ht3") or {}
     if ht3_bucket:
         lines.append("**HT3+ (7 d per kit):**")
@@ -189,7 +199,7 @@ async def _cooldown_embed(
     else:
         lines.append("**HT3+ (7 d per kit):** žádné aktivní cooldowny")
     if kit_key:
-        lines.append(f"\n🟡 Vybrán kit **`{kit_key}`** pro HT3+ úpravu.")
+        lines.append(f"\n🟡 Vybrán kit **`{kit_key}`** pro cooldown úpravu.")
     embed = discord.Embed(
         title=f"⏳ Cooldowny – <@{pid}> (`{player.get('username') or '—'}`)",
         description="\n".join(lines),
@@ -785,16 +795,15 @@ class CooldownEditView(SafeView):
         from services.cooldowns import get_cooldowns
 
         snapshot = await get_cooldowns(
-            self.player_id,
-            session_factory=_cog_session_factory(self.cog),
-            waitlist_cooldown_ms=PLAYER_COOLDOWN_MS,
+            self.player_id, session_factory=_cog_session_factory(self.cog)
         )
-        q_old = format_duration(snapshot.get("waitlist_ms"))
-        if action == "clear_queue":
-            return [f"waitlist: `{q_old}` → **žádný**"]
-        if action == "set_queue":
+        if action in ("clear_queue", "set_queue"):
+            q_old = format_duration((snapshot.get("waitlist") or {}).get(kit_key))
+            if action == "clear_queue":
+                return [f"waitlist {kit_key}: `{q_old}` → **žádný**"]
             return [
-                f"waitlist: `{q_old}` → **{format_duration(PLAYER_COOLDOWN_MS)} (od teď)**"
+                f"waitlist {kit_key}: `{q_old}` → "
+                f"**{format_duration(PLAYER_COOLDOWN_MS)} (od teď)**"
             ]
         kit_key = (kit_key or "").strip().lower()
         h_old = format_duration((snapshot.get("ht3") or {}).get(kit_key))
@@ -829,13 +838,19 @@ class CooldownEditView(SafeView):
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (cooldown): %s", err)
 
-    @discord.ui.button(label="🧹 Smazat waitlist", style=discord.ButtonStyle.secondary, custom_id="edituser_cd_clear_q")
+    @discord.ui.button(label="🧹 Smazat waitlist kitu", style=discord.ButtonStyle.secondary, custom_id="edituser_cd_clear_q")
     async def on_clear_queue(self, interaction, button) -> None:
         if not has_admin_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        await self._to_confirm(interaction, "clear_queue", None, "Smazat waitlist cooldown")
+        if not self.kit_key:
+            return await interaction.response.send_message(
+                "ℹ️ Nejdřív vyber kit v menu nahoře.", ephemeral=True
+            )
+        await self._to_confirm(
+            interaction, "clear_queue", self.kit_key, f"Smazat waitlist cooldown – {self.kit_key}"
+        )
 
     @discord.ui.button(label="⏱️ Waitlist na 4 d", style=discord.ButtonStyle.secondary, custom_id="edituser_cd_set_q")
     async def on_set_queue(self, interaction, button) -> None:
@@ -843,7 +858,13 @@ class CooldownEditView(SafeView):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        await self._to_confirm(interaction, "set_queue", None, "Nastavit waitlist cooldown 4 d")
+        if not self.kit_key:
+            return await interaction.response.send_message(
+                "ℹ️ Nejdřív vyber kit v menu nahoře.", ephemeral=True
+            )
+        await self._to_confirm(
+            interaction, "set_queue", self.kit_key, f"Nastavit waitlist cooldown 4 d – {self.kit_key}"
+        )
 
     @discord.ui.button(label="🧹 Smazat HT3 cooldown kitu", style=discord.ButtonStyle.secondary, custom_id="edituser_cd_clear_ht3")
     async def on_clear_ht3(self, interaction, button) -> None:

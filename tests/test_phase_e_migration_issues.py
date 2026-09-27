@@ -26,6 +26,8 @@ from services.phase_e.migration_issues import (
     build_migration_issues_report,
 )
 from services.phase_d.import_data import (
+    CAT_COOLDOWN_KIT_UNKNOWN,
+    CAT_COOLDOWN_KIT_UNATTRIBUTABLE,
     CAT_COOLDOWN_UNRESOLVED,
     CAT_HISTORY_INVALID_DATE,
     CAT_HT3_UNRESOLVED,
@@ -108,6 +110,41 @@ async def test_every_known_category_maps_to_exactly_one_bucket(
     assert len(bucket_categories) == len(set(bucket_categories)), (
         "Kategorie náleží do více než jednoho bucketu"
     )
+
+
+@pytest.mark.asyncio
+async def test_legacy_global_cooldown_issues_surface_in_the_cooldown_bucket(
+    session_factory, clean_db
+):
+    """A kit-less legacy cooldown must be visible in the operator report.
+
+    The global (kit_id IS NULL) row keeps blocking every kit, so its cause has
+    to reach the operator under an actionable bucket — not hide in BUCKET_OTHER.
+    """
+    repo = MigrationIssueRepository()
+    async with session_factory() as session:
+        for category in (CAT_COOLDOWN_KIT_UNATTRIBUTABLE, CAT_COOLDOWN_KIT_UNKNOWN):
+            await repo.record(
+                session,
+                category=category,
+                source_file="cooldowns.json",
+                source_key="99",
+                reason="Test fixture issue",
+                payload={"discord_id": "99", "attribution": "no_result"},
+            )
+        await session.commit()
+
+    report = await build_migration_issues_report(session_factory)
+    bucket = {b["name"]: b for b in report["buckets"]}[BUCKET_COOLDOWN["name"]]
+
+    assert bucket["count"] == 2
+    assert {s["category"] for s in bucket["samples"]} == {
+        CAT_COOLDOWN_KIT_UNATTRIBUTABLE,
+        CAT_COOLDOWN_KIT_UNKNOWN,
+    }
+    action = bucket["action"].lower()
+    assert "globální" in action  # the operator must learn it blocks all kits
+    assert "nehádá" in action or "nehádat" in action  # ...and nothing is guessed
 
 
 @pytest.mark.asyncio

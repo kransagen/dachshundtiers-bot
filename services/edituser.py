@@ -869,31 +869,49 @@ async def _apply_player_edit_db(
             action = edit.get("action")
             kit_key = str(edit.get("kit") or "").strip().lower()
             if action in ("clear_queue", "set_queue"):
-                active = await CooldownRepository().get_active(
-                    session,
-                    player_id=player.id,
-                    cooldown_type=COOLDOWN_WAITLIST,
-                    now=ts_dt,
+                # Business rule: waitlist cooldown je per kit, stejně jako HT3
+                # (uq_cooldowns_kit) — admin akce proto vždy potřebuje vybraný
+                # kit, jinak by nebylo jasné, který kit se má vyčistit/nastavit.
+                if not kit_key:
+                    return _db_error("Pro waitlist cooldown je potřeba kit.")
+                kit = await _resolve_kit(kit_key)
+                if kit is None:
+                    kits = await KitRepository().list(session)
+                    names = ", ".join(k.name for k in kits) or "—"
+                    return _db_error(f"Kit `{kit_key}` není v databázi (známé: {names}).")
+                active = await CooldownRepository().get_active_waitlist(
+                    session, player_id=player.id, kit_id=kit.id, now=ts_dt,
                 )
                 old_ms = int(active[0].expires_at.timestamp() * 1000) - now if active else None
-                old_desc = f"waitlist: {format_duration(old_ms)}"
+                old_desc = f"waitlist {kit_key}: {format_duration(old_ms)}"
+                legacy_global_note = (
+                    " (pozor: aktivní je i starý globální cooldown blokující "
+                    "všechny kity – ten se touto akcí nemění)"
+                    if active and active[0].kit_id is None
+                    else ""
+                )
                 if action == "clear_queue":
-                    if not active:
+                    if not active or active[0].kit_id is None:
+                        # Nic ke smazání PRO TENTO KIT (per-kit řádek žádný;
+                        # případný legacy globální řádek se nikdy nemaže
+                        # naslepo skrz akci vázanou na jeden kit).
                         return {
                             "status": OUTCOME_UNCHANGED,
-                            "old_value": old_desc,
-                            "new_value": old_desc,
+                            "old_value": old_desc + legacy_global_note,
+                            "new_value": old_desc + legacy_global_note,
                             "audit": None,
                         }
                     await CooldownRepository().delete(
                         session,
                         player_id=player.id,
                         cooldown_type=COOLDOWN_WAITLIST,
+                        kit_id=kit.id,
                     )
                     return await _commit(
                         {
+                            "kit": kit_key,
                             "old_value": old_desc,
-                            "new_value": "waitlist: žádný",
+                            "new_value": f"waitlist {kit_key}: žádný",
                         }
                     )
                 expires = datetime.fromtimestamp((now + queue_cooldown_ms) / 1000, tz=timezone.utc)
@@ -901,13 +919,18 @@ async def _apply_player_edit_db(
                     session,
                     player_id=player.id,
                     cooldown_type=COOLDOWN_WAITLIST,
+                    kit_id=kit.id,
                     expires_at=expires,
                     source="edituser",
                 )
                 return await _commit(
                     {
-                        "old_value": old_desc,
-                        "new_value": (f"waitlist: {format_duration(queue_cooldown_ms)} (od teď)"),
+                        "kit": kit_key,
+                        "old_value": old_desc + legacy_global_note,
+                        "new_value": (
+                            f"waitlist {kit_key}: "
+                            f"{format_duration(queue_cooldown_ms)} (od teď)"
+                        ),
                     }
                 )
 

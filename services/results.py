@@ -633,6 +633,7 @@ async def _db_record_result(
 
     async with db_transaction(session_factory) as session:
         results = ResultRepository()
+        kit_row = await _db_resolve_kit(session, kit)
 
         # --- Idempotence / ochrana před duplicitami ---
         if ticket_id is not None:
@@ -661,12 +662,11 @@ async def _db_record_result(
             player = await PlayerRepository().get_by_discord_id(
                 session, int(player_id)
             )
-            if player is not None and queue_cooldown_ms > 0:
-                active = await CooldownRepository().is_active(
+            if player is not None and queue_cooldown_ms > 0 and kit_row is not None:
+                active = await CooldownRepository().get_active_waitlist(
                     session,
                     player_id=player.id,
-                    cooldown_type=COOLDOWN_WAITLIST,
-                    kit_id=None,
+                    kit_id=kit_row.id,
                     now=_ms_to_dt(now),
                 )
                 if active:
@@ -686,7 +686,6 @@ async def _db_record_result(
             ticket_key = f"result:{result_id}"
 
         # --- Validace ---
-        kit_row = await _db_resolve_kit(session, kit)
         if ticket_id is not None:
             tid = str(ticket_id)
             ticket = await TicketRepository().get_by_channel(session, int(tid))
@@ -787,13 +786,14 @@ async def _db_record_result(
             promotion_status=PROMOTION_DISCORD_PENDING,
         )
 
-        # --- Cooldown hráče (queue, 4 dny; i ticket výsledek ho prodlužuje) ---
+        # --- Cooldown hráče (queue, 4 dny per kit; i ticket výsledek ho
+        #     prodlužuje – ale jen pro TENTO kit, ne ostatní) ---
         if queue_cooldown_ms > 0:
             await CooldownRepository().upsert(
                 session,
                 player_id=player.id,
                 cooldown_type=COOLDOWN_WAITLIST,
-                kit_id=None,
+                kit_id=kit_row.id,
                 expires_at=_ms_to_dt(now + int(queue_cooldown_ms)),
                 source="result",
             )

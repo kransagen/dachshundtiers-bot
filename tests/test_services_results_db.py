@@ -150,10 +150,10 @@ async def test_record_result_ticket_created_closes_and_cooldowns(
             session,
             player_id=player.id,
             cooldown_type=COOLDOWN_WAITLIST,
-            kit_id=None,
             now=_dt(NOW_MS),
         )
         assert len(wait) == 1
+        assert wait[0].kit_id == kit.id, "waitlist cooldown must be scoped to this kit"
         updates = (await session.execute(
             select(AuditLog).where(AuditLog.entity_type == "ticket")
         )).scalars().all()
@@ -264,6 +264,47 @@ async def test_record_result_queue_created_and_duplicate_via_cooldown(
         new_tier="HT3",
     )
     assert r4["result"] == "invalid_tier"
+
+
+async def test_queue_cooldown_on_one_kit_never_blocks_another_kit(
+    session_factory, clean_db
+):
+    """Business rule: cooldowns are per player+kit+type. A queue cooldown
+    set by testing HT3 must never block the same player from testing a
+    different kit (Tournament)."""
+    await _seed(session_factory)
+    ht3 = await _record(session_factory, ticket_id=None, kit="HT3")
+    assert ht3["result"] == "created"
+
+    # Same player, same kit again — blocked (real per-kit cooldown).
+    ht3_again = await _record(session_factory, ticket_id=None, kit="HT3")
+    assert ht3_again["result"] == "duplicate"
+
+    # Same player, a DIFFERENT kit — must NOT be blocked by HT3's cooldown.
+    tourney = await _record(
+        session_factory,
+        ticket_id=None,
+        kit="Tournament",
+        new_tier="LT4",
+        now=NOW_MS + 1,
+    )
+    assert tourney["result"] == "created"
+
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 100)
+        ht3_kit = await KitRepository().get_by_key(session, "ht3")
+        tourney_kit = await KitRepository().get_by_key(session, "tourney")
+        ht3_cd = await CooldownRepository().get_active(
+            session, player_id=player.id, cooldown_type=COOLDOWN_WAITLIST,
+            kit_id=ht3_kit.id, now=_dt(NOW_MS),
+        )
+        tourney_cd = await CooldownRepository().get_active(
+            session, player_id=player.id, cooldown_type=COOLDOWN_WAITLIST,
+            kit_id=tourney_kit.id, now=_dt(NOW_MS),
+        )
+    assert len(ht3_cd) == 1
+    assert len(tourney_cd) == 1
+    assert ht3_cd[0].id != tourney_cd[0].id
 
 
 async def test_record_result_eval(session_factory, clean_db):

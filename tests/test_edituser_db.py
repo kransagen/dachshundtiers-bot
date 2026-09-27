@@ -233,7 +233,7 @@ async def test_db_cooldown_set_queue_applies_and_audits(session_factory, clean_d
     await _seed_player(session_factory)
     result = await edituser.apply_player_edit(
         player_id=str(111111111111111111),
-        edit={"field": "cooldown", "action": "set_queue"},
+        edit={"field": "cooldown", "action": "set_queue", "kit": "molepvp"},
         actor_id=ACTOR_ID,
         actor_name=ACTOR_NAME,
         now=NOW,
@@ -242,18 +242,33 @@ async def test_db_cooldown_set_queue_applies_and_audits(session_factory, clean_d
         session_factory=session_factory,
     )
     assert result["status"] == "changed"
-    assert result["new_value"].startswith("waitlist:")
+    assert result["new_value"].startswith("waitlist molepvp:")
     assert "od teď" in result["new_value"]
     entries = await _audit_entries(session_factory)
     assert len(entries) == 1
     assert entries[0].details["field"] == "cooldown"
 
 
+async def test_db_cooldown_set_queue_requires_kit(session_factory, clean_db):
+    await _seed_player(session_factory)
+    result = await edituser.apply_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "cooldown", "action": "set_queue"},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+    )
+    assert result["status"] == "error"
+
+
 async def test_db_cooldown_clear_queue_unchanged_when_empty(session_factory, clean_db):
     await _seed_player(session_factory)
     result = await edituser.apply_player_edit(
         player_id=str(111111111111111111),
-        edit={"field": "cooldown", "action": "clear_queue"},
+        edit={"field": "cooldown", "action": "clear_queue", "kit": "molepvp"},
         actor_id=ACTOR_ID,
         actor_name=ACTOR_NAME,
         now=NOW,

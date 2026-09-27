@@ -137,6 +137,73 @@ async def test_cooldown_kit_upsert_and_waitlist_coexist(session_factory, clean_d
     assert expired is False
 
 
+async def test_cooldown_waitlist_is_per_kit_not_global(session_factory, clean_db):
+    """Business rule: cooldowns are per player+kit+type. A waitlist cooldown
+    on one kit must never block a different kit."""
+    now = datetime.now(timezone.utc)
+    async with transaction(session_factory) as session:
+        player = await _seed_player(session, _player_repo(), 12, "Cool3")
+        await ensure_dimensions(
+            session,
+            (("boxing", "Boxing"), ("bedwars", "Bedwars")),
+            (("t1", "ladder", "Tier 1", 1),),
+        )
+        boxing = (
+            await session.execute(select(Kit).where(Kit.key == "boxing"))
+        ).scalar_one()
+        bedwars = (
+            await session.execute(select(Kit).where(Kit.key == "bedwars"))
+        ).scalar_one()
+        repo = CooldownRepository()
+        await repo.upsert(
+            session, player_id=player.id, cooldown_type="waitlist",
+            kit_id=boxing.id, expires_at=now + timedelta(hours=1),
+        )
+        boxing_active = await repo.get_active_waitlist(
+            session, player_id=player.id, kit_id=boxing.id, now=now
+        )
+        bedwars_active = await repo.get_active_waitlist(
+            session, player_id=player.id, kit_id=bedwars.id, now=now
+        )
+    assert len(boxing_active) == 1
+    assert bedwars_active == []
+
+
+async def test_cooldown_waitlist_legacy_global_still_blocks_every_kit(
+    session_factory, clean_db
+):
+    """A pre-migration global row (kit_id IS NULL) can't be retroactively
+    attributed to one kit, so it must keep blocking every kit until it
+    naturally expires — never silently dropped, never merged into one kit."""
+    now = datetime.now(timezone.utc)
+    async with transaction(session_factory) as session:
+        player = await _seed_player(session, _player_repo(), 13, "Cool4")
+        await ensure_dimensions(
+            session,
+            (("boxing", "Boxing"), ("bedwars", "Bedwars")),
+            (("t1", "ladder", "Tier 1", 1),),
+        )
+        boxing = (
+            await session.execute(select(Kit).where(Kit.key == "boxing"))
+        ).scalar_one()
+        bedwars = (
+            await session.execute(select(Kit).where(Kit.key == "bedwars"))
+        ).scalar_one()
+        repo = CooldownRepository()
+        await repo.upsert(
+            session, player_id=player.id, cooldown_type="waitlist",
+            kit_id=None, expires_at=now + timedelta(hours=1),
+        )
+        boxing_active = await repo.get_active_waitlist(
+            session, player_id=player.id, kit_id=boxing.id, now=now
+        )
+        bedwars_active = await repo.get_active_waitlist(
+            session, player_id=player.id, kit_id=bedwars.id, now=now
+        )
+    assert len(boxing_active) == 1
+    assert len(bedwars_active) == 1
+
+
 async def test_ticket_open_unique_and_close(session_factory, clean_db):
     async with transaction(session_factory) as session:
         kit = await _seed_dimensions(session)

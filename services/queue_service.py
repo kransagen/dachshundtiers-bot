@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 from db.models import Kit, Player, Queue, QueueEntry
-from db.repositories.cooldowns import COOLDOWN_WAITLIST, CooldownRepository
+from db.repositories.cooldowns import CooldownRepository
 from db.repositories.kits import KitRepository
 from db.repositories.players import PlayerIdentityError, PlayerRepository
 from db.repositories.queues import (
@@ -146,11 +146,10 @@ async def _db_join_queue_once(
         except PlayerIdentityError:
             return {"result": "identity_conflict"}
 
-        active = await CooldownRepository().get_active(
+        active = await CooldownRepository().get_active_waitlist(
             session,
             player_id=player.id,
-            cooldown_type=COOLDOWN_WAITLIST,
-            kit_id=None,
+            kit_id=kit_row.id,
             now=_db_dt(now),
         )
         if active:

@@ -1,11 +1,8 @@
-"""DB (PostgreSQL) i JSON režim services/config_store.py — Phase F (todo #5).
+"""services/config_store.py — PostgreSQL only.
 
-Ověřuje dual-mode kontrakt nad ``bot_config`` (key→JSONB): queue channel
-přepis (runtime > env/defaulty) a HT3+ panel roundtrip; JSON režim
-(session_factory=None) píše do původních souborů.
+Ověřuje kontrakt nad ``bot_config`` (key→JSONB): queue channel přepis
+(runtime > env/defaulty) a HT3+ panel roundtrip.
 """
-
-from pathlib import Path
 
 from db.repositories.sync_audit import BotConfigRepository
 from db.services.session import transaction
@@ -80,41 +77,4 @@ async def test_ht3_panel_replace(session_factory, clean_db):
     assert await cfg.get_ht3_panel(session_factory=session_factory) == {
         "message_id": "3",
         "channel_id": "4",
-    }
-
-
-# ---------------------------------------------------------------------------
-# JSON režim (session_factory=None) — parity s legacy soubory
-# ---------------------------------------------------------------------------
-
-
-async def test_json_queue_channel_roundtrip(tmp_path: Path, monkeypatch):
-    import json
-
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert await cfg.get_queue_channel_id("molepvp") is None
-    await cfg.set_queue_channel_id("MolePvP", 111)
-    assert await cfg.get_queue_channel_id("molepvp") == 111
-    assert json.loads((tmp_path / "queue_channels.json").read_text()) == {
-        "molepvp": 111
-    }
-
-
-async def test_json_ht3_panel_roundtrip(tmp_path: Path, monkeypatch):
-    import json
-
-    import storage as storage_mod
-
-    monkeypatch.setattr(storage_mod, "DATA_DIR", tmp_path)
-    assert await cfg.get_ht3_panel() == {}
-    await cfg.set_ht3_panel(987, 654)
-    assert await cfg.get_ht3_panel() == {
-        "message_id": "987",
-        "channel_id": "654",
-    }
-    assert json.loads((tmp_path / "ht3_panel_message.json").read_text()) == {
-        "message_id": "987",
-        "channel_id": "654",
     }

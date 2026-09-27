@@ -126,6 +126,33 @@ async def test_join_after_cooldown_passes(session_factory, clean_db):
     assert result["result"] == "joined"
 
 
+async def test_join_cooldown_on_one_kit_never_blocks_another_kit(
+    session_factory, clean_db
+):
+    """Business rule: cooldowns are per player+kit+type. A per-kit waitlist
+    cooldown on AnchorPvP must not block the same player joining MolePVP."""
+    await _seed(session_factory, open_kits=("anchorpvp", "molepvp"))
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 1)
+        if player is None:
+            _outcome, player = await PlayerRepository().claim_discord_id(
+                session, discord_id=1, ign="AliceMC"
+            )
+        anchorpvp = await KitRepository().get_by_key(session, "anchorpvp")
+        await CooldownRepository().upsert(
+            session,
+            player_id=player.id,
+            cooldown_type=COOLDOWN_WAITLIST,
+            kit_id=anchorpvp.id,
+            expires_at=_dt(NOW_MS + 60_000),
+        )
+    blocked = await _join(session_factory, "1", kit="AnchorPvP", at=NOW_MS + 1_000)
+    assert blocked["result"] == "cooldown"
+
+    allowed = await _join(session_factory, "1", kit="MolePVP", at=NOW_MS + 1_000)
+    assert allowed["result"] == "joined"
+
+
 async def test_join_duplicate_blocked(session_factory, clean_db):
     await _seed(session_factory)
     assert (await _join(session_factory, "1"))["result"] == "joined"

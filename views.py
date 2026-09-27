@@ -15,7 +15,7 @@ from db.repositories.kits import KitRepository
 from db.repositories.tournaments import TournamentRepository
 from db.services.session import transaction
 from panel import update_panel
-from services.cooldowns import get_cooldowns
+from services.cooldowns import get_cooldowns, get_waitlist_cooldown_ms
 from services.evals import has_eval
 from services.permissions import get_tester_roles
 from services.queue_service import (

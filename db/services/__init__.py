@@ -33,8 +33,10 @@ from db.services.promotion import (
     PromotionCommitService,
     PromotionWedgeOutcome,
     WEDGE_EVENT_TYPE,
+    commit_confirmed_promotion,
     commit_promotion_with_wedge,
     enqueue_promotion_wedge,
+    grant_confirmation,
 )
 from db.services.session import transaction
 from db.services.tier_mirror import (
@@ -73,9 +75,11 @@ __all__ = [
     "WEDGE_EVENT_TYPE",
     "build_commit_kwargs",
     "classify_member_roles",
+    "commit_confirmed_promotion",
     "commit_promotion_with_wedge",
     "default_stale_cutoff",
     "enqueue_promotion_wedge",
+    "grant_confirmation",
     "transaction",
     "validate_kit_role_configuration",
 ]

@@ -44,6 +44,13 @@ log = logging.getLogger("dachshundtiers")
 class TierRoleGrant:
     """Výsledek atomického udělení tier role (single ``member.edit``).
 
+    ``ok=True`` znamená jen „role nebyla odmítnuta". Aby se ale mohla
+    zapsat do PostgreSQL jako POTVRZENÝ stav, musí být ``verified=True``:
+    G0 cutover (invariant 6) vyžaduje mezi mutací Discordu a commitem do DB
+    **ověřit skutečný finální stav rolí**. ``verified`` je defaultně
+    ``False``, takže každý nový návratový bod, který zapomene stav
+    potvrdit, selže bezpečně (nic se necommitne) místo tichého předpokladu.
+
     ``ambiguous`` (H6 audit fix): ``True`` znamená, že se ``ok=False``
     vrátilo NE proto, že mutace jistě selhala (Forbidden, chybějící
     mapování/role/člen), ale protože klientský request selhal (timeout /
@@ -58,6 +65,46 @@ class TierRoleGrant:
     note: str = ""
     tier_role_id: Optional[int] = None
     ambiguous: bool = False
+    verified: bool = False
+
+
+def _role_ids(member) -> Optional[set[int]]:
+    """Sada ID rolí člena, nebo ``None``, pokud objekt role nepopisuje.
+
+    ``None`` znamená „stav se nedá z tohoto objektu přečíst" — nikdy „stav je
+    prázdný". Rozlišení je zásadní: ``None`` nesmí být zaměněno za shodu se
+    zamýšlenou množinou rolí.
+    """
+    roles = getattr(member, "roles", None)
+    if not isinstance(roles, (list, tuple, set, frozenset)):
+        return None
+    ids: set[int] = set()
+    for role in roles:
+        role_id = getattr(role, "id", None)
+        if not isinstance(role_id, int):
+            return None
+        ids.add(role_id)
+    return ids
+
+
+async def _read_current_role_ids(guild, member_id: str) -> Optional[set[int]]:
+    """Živý dotaz na aktuální role člena — autoritativní čtení z Discordu.
+
+    ``None`` = stav se nepodařilo přečíst (NotFound / Forbidden / HTTP /
+    timeout / connection error). Volající to MUSÍ chápat jako „neznámé",
+    nikdy jako „nezměněné" ani jako „potvrzené".
+    """
+    try:
+        fresh = await guild.fetch_member(int(member_id))
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException,
+        asyncio.TimeoutError,
+        OSError,
+    ):
+        return None
+    return _role_ids(fresh)
 
 
 async def auto_grant_kit_role(
@@ -74,6 +121,11 @@ async def auto_grant_kit_role(
     API voláním (žádné add_roles + remove_roles zvlášť, žádný mezistav).
     Vrací :class:`TierRoleGrant` – ``ok=False`` znamená, že se role
     NEzměnila (volající pak nesmí zapisovat DB mirror jako potvrzený).
+
+    G0 cutover: ``ok=True`` je doplněno o ``verified=True`` **jen když byl
+    skutečný finální stav rolí potvrzen** (z odpovědi PATCHu, jinak živým
+    dotazem). Bez potvrzení vrátí ``ok=True, verified=False`` / ambiguous,
+    takže PostgreSQL nikdy nedostane stav, který Discord nepotvrdil.
     """
     kit_key = (kit_key or "").strip().lower()
     kit_map = await get_kit_role_map(kit_key, session_factory=session_factory)
@@ -121,16 +173,34 @@ async def auto_grant_kit_role(
     target = [r for r in member.roles if r.id not in kit_other_tier_ids]
     if role_obj not in target:
         target.append(role_obj)
-    if {r.id for r in member.roles} == {r.id for r in target}:
-        return TierRoleGrant(ok=True, note="", tier_role_id=int(role_id))
+    target_ids = {r.id for r in target}
+    role_mention = role_obj.mention
+
+    if _role_ids(member) == target_ids:
+        # Cached state already matches — nothing to mutate. But the cache can
+        # be stale and Discord is the authority, so confirm against a live
+        # read before reporting a CONFIRMED state the PG mirror may store.
+        confirmed = await _read_current_role_ids(guild, member_id)
+        if confirmed == target_ids:
+            return TierRoleGrant(
+                ok=True, note="", tier_role_id=int(role_id), verified=True
+            )
+        if confirmed is None:
+            return TierRoleGrant(
+                ok=False,
+                ambiguous=True,
+                tier_role_id=int(role_id),
+                note=(
+                    f"\n⚠️ Roli <@&{role_id}> už hráč má, ale aktuální stav rolí se "
+                    "nepodařilo z Discordu načíst – stav je NEJISTÝ, do PostgreSQL "
+                    "se proto nic nezapsalo. Zkontroluj ručně nebo spusť "
+                    "`/sync discord` (Discord zůstává jediným zdrojem pravdy)."
+                ),
+            )
+        # Cache was stale (live read disagrees) — fall through and mutate.
 
     try:
-        await member.edit(roles=target)
-        return TierRoleGrant(
-            ok=True,
-            note=f"\n🎖️ Hráči byla dána role **{role_obj.mention}**.",
-            tier_role_id=int(role_id),
-        )
+        updated = await member.edit(roles=target)
     except discord.Forbidden as err:
         # Definitive: the bot lacks permission — the mutation certainly did
         # not happen, no ambiguity, never worth re-verifying.
@@ -155,27 +225,16 @@ async def auto_grant_kit_role(
             member_id,
             err,
         )
-        try:
-            verified = await guild.fetch_member(int(member_id))
-        except (
-            discord.NotFound,
-            discord.Forbidden,
-            discord.HTTPException,
-            asyncio.TimeoutError,
-            OSError,
-        ):
-            verified = None
-        if verified is not None:
-            held_after = {r.id for r in verified.roles}
-            target_ids = {r.id for r in target}
-            if held_after == target_ids:
-                # Discord DID apply it — never treat a confirmed change as
-                # a failure just because the original response was lost.
-                return TierRoleGrant(
-                    ok=True,
-                    note=f"\n🎖️ Hráči byla dána role **{role_obj.mention}**.",
-                    tier_role_id=int(role_id),
-                )
+        confirmed = await _read_current_role_ids(guild, member_id)
+        if confirmed == target_ids:
+            # Discord DID apply it — never treat a confirmed change as
+            # a failure just because the original response was lost.
+            return TierRoleGrant(
+                ok=True,
+                note=f"\n🎖️ Hráči byla dána role **{role_mention}**.",
+                tier_role_id=int(role_id),
+                verified=True,
+            )
         # Neither the original call nor re-verification could confirm the
         # outcome — report this as genuinely UNKNOWN, not as a plain
         # failure: the caller must never write a false PG mirror state and
@@ -189,6 +248,55 @@ async def auto_grant_kit_role(
                 "`/sync discord` (Discord zůstává jediným zdrojem pravdy)."
             ),
         )
+
+    # ── Success path (G0, invariant 6) ──────────────────────────────────
+    # "member.edit did not raise" is NOT a confirmation. The PATCH response
+    # body already describes the member as Discord now sees it; when it is not
+    # usable, fall back to a live re-read. Only a role-id set equal to the
+    # intended one is ever reported as a confirmed state.
+    observed = _role_ids(updated)
+    if observed is None:
+        observed = await _read_current_role_ids(guild, member_id)
+
+    if observed == target_ids:
+        return TierRoleGrant(
+            ok=True,
+            note=f"\n🎖️ Hráči byla dána role **{role_mention}**.",
+            tier_role_id=int(role_id),
+            verified=True,
+        )
+    if observed is None:
+        # Mutation "succeeded" but the final state could not be read at all.
+        return TierRoleGrant(
+            ok=False,
+            ambiguous=True,
+            tier_role_id=int(role_id),
+            note=(
+                f"\n⚠️ Roli <@&{role_id}> se nepovedlo potvrdit a stav rolí se "
+                "nepodařilo přečíst – stav je NEJISTÝ, do PostgreSQL se proto "
+                "nic nezapsalo. Zkontroluj ručně nebo spusť `/sync discord` "
+                "(Discord zůstává jediným zdrojem pravdy)."
+            ),
+        )
+    # Discord answered with a DIFFERENT role set than requested — a confirmed
+    # non-application (e.g. a concurrent edit won the race). Never report this
+    # as success; PostgreSQL must not mirror a state Discord never confirmed.
+    log.warning(
+        "Udělení role %s pro %s: Discord vrátil jinou množinu rolí (%s != %s)",
+        role_id,
+        member_id,
+        sorted(observed),
+        sorted(target_ids),
+    )
+    return TierRoleGrant(
+        ok=False,
+        tier_role_id=int(role_id),
+        note=(
+            f"\n⚠️ Discord potvrdil jiný stav rolí, než bylo požadováno – "
+            f"role <@&{role_id}> se v záznamu nepovažuje za potvrzenou. Zkontroluj "
+            "roli ručně nebo spusť `/sync discord`."
+        ),
+    )
 
 
 class Roles(commands.Cog):

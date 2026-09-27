@@ -497,48 +497,46 @@ class Results(commands.Cog):
         except Exception:  # noqa: BLE001
             log.exception("Chyba při automatickém udělování role pro %s", target_id)
 
-        # 5d) PostgreSQL mirror (Discord-first) – volá se jen PO úspěšné
-        #     Discord mutaci (invariant 6). Selže-li DB transakce, událost
-        #     jde do outboxu (promotion_commit, discord_role_confirmed=True)
-        #     a mirror se doplní podle Discordu – nikdy naopak.
+        # 5d) PostgreSQL mirror (Discord-first) – JEDINÝ kanonický zápis
+        #     povýšení (``db.services.commit_confirmed_promotion``). Tenhle
+        #     gate neopakuje: nepotvrzený/nejistý Discord grant se v něm
+        #     odmítne sám a NIC se do DB nezapíše (invariant 6). Selže-li
+        #     transakce, událost jde do outboxu (promotion_commit,
+        #     discord_role_confirmed=True) a mirror se doplní podle Discordu
+        #     – nikdy naopak.
         db_note = ""
         try:
-            from db.services import commit_promotion_with_wedge
+            from db.services import commit_confirmed_promotion
 
-            if (
-                isinstance(grant, TierRoleGrant)
-                and grant.ok
-                and grant.tier_role_id is not None
-            ):
-                wedge = await commit_promotion_with_wedge(
-                    session_factory=getattr(self.bot, "db_session_factory", None),
-                    result_key=f"result:{record['record'].get('id')}",
-                    kind="ticket" if ticket is not None else "queue",
-                    discord_id=int(target_id),
-                    ign=ign_clean,
-                    kit_key=kit_key,
-                    new_tier_code=stored_tier,
-                    discord_role_id=int(grant.tier_role_id),
-                    previous_tier_code=(
-                        previous_tier if previous_tier not in ("N/A", "") else None
-                    ),
-                    score=score,
-                    outcome=outcome,
-                    evaluator_discord_id=interaction.user.id,
-                    ticket_channel_id=(
-                        int(ticket["id"]) if ticket is not None else None
-                    ),
-                    notes=notes_clean or None,
-                    eval_flag=is_eval,
-                    date=current_date,
-                    close_ticket_channel_id=(
-                        int(ticket["id"]) if ticket is not None else None
-                    ),
-                    audit_actor_id=interaction.user.id,
-                    audit_actor_name=str(interaction.user),
-                )
-                if wedge.message:
-                    db_note = f"\n{wedge.message}"
+            wedge = await commit_confirmed_promotion(
+                getattr(self.bot, "db_session_factory", None),
+                grant=grant,
+                result_key=f"result:{record['record'].get('id')}",
+                kind="ticket" if ticket is not None else "queue",
+                discord_id=int(target_id),
+                ign=ign_clean,
+                kit_key=kit_key,
+                new_tier_code=stored_tier,
+                previous_tier_code=(
+                    previous_tier if previous_tier not in ("N/A", "") else None
+                ),
+                score=score,
+                outcome=outcome,
+                evaluator_discord_id=interaction.user.id,
+                ticket_channel_id=(
+                    int(ticket["id"]) if ticket is not None else None
+                ),
+                notes=notes_clean or None,
+                eval_flag=is_eval,
+                date=current_date,
+                close_ticket_channel_id=(
+                    int(ticket["id"]) if ticket is not None else None
+                ),
+                audit_actor_id=interaction.user.id,
+                audit_actor_name=str(interaction.user),
+            )
+            if wedge.message:
+                db_note = f"\n{wedge.message}"
         except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /result
             log.exception("PostgreSQL mirror pro %s selhal", target_id)
 

@@ -404,44 +404,41 @@ class TopResult(commands.Cog):
                 log.exception("Nelze udělit tier roli po HT Fightu (%s)", kit_clean)
                 grant_note = "⚠️ Tier roli se nepodařilo udělit – oprav ji manuálně."
 
-        # 1a2) PostgreSQL mirror (Discord-first, invariant 6): jen když se role
-        #      opravdu změnila (grant.ok) – selže-li DB, událost do outboxu.
+        # 1a2) PostgreSQL mirror (Discord-first, invariant 6): JEDINÝ kanonický
+        #      zápis povýšení (``db.services.commit_confirmed_promotion``) –
+        #      nepotvrzený/nejistý Discord grant se odmítne v něm, nic se
+        #      nezapíše; selže-li transakce, událost jde do outboxu.
         db_note = ""
         if promoted:
             try:
-                from db.services import commit_promotion_with_wedge
+                from db.services import commit_confirmed_promotion
 
-                if (
-                    isinstance(grant, TierRoleGrant)
-                    and grant.ok
-                    and grant.tier_role_id is not None
-                ):
-                    wedge = await commit_promotion_with_wedge(
-                        session_factory=sf,
-                        result_key=f"ht_fight:{rec.get('id')}",
-                        kind="ht_fight",
-                        discord_id=int(player_id),
-                        ign=ign_clean,
-                        kit_key=kit_clean,
-                        new_tier_code=new_tier,
-                        discord_role_id=int(grant.tier_role_id),
-                        previous_tier_code=(
-                            previous_tier if previous_tier not in ("N/A", "") else None
-                        ),
-                        bridge_tier_code=(rec.get("bridgeTier") or None),
-                        tier_status=tier_status.strip() or None,
-                        score=score.strip(),
-                        outcome=outcome,
-                        opponent_id=(
-                            int(rec["opponentId"]) if rec.get("opponentId") else None
-                        ),
-                        opponent_name=(rec.get("opponentName") or None),
-                        date=(rec.get("date") or None),
-                        audit_actor_id=interaction.user.id,
-                        audit_actor_name=str(interaction.user),
-                    )
-                    if wedge.message:
-                        db_note = f"\n{wedge.message}"
+                wedge = await commit_confirmed_promotion(
+                    sf,
+                    grant=grant,
+                    result_key=f"ht_fight:{rec.get('id')}",
+                    kind="ht_fight",
+                    discord_id=int(player_id),
+                    ign=ign_clean,
+                    kit_key=kit_clean,
+                    new_tier_code=new_tier,
+                    previous_tier_code=(
+                        previous_tier if previous_tier not in ("N/A", "") else None
+                    ),
+                    bridge_tier_code=(rec.get("bridgeTier") or None),
+                    tier_status=tier_status.strip() or None,
+                    score=score.strip(),
+                    outcome=outcome,
+                    opponent_id=(
+                        int(rec["opponentId"]) if rec.get("opponentId") else None
+                    ),
+                    opponent_name=(rec.get("opponentName") or None),
+                    date=(rec.get("date") or None),
+                    audit_actor_id=interaction.user.id,
+                    audit_actor_name=str(interaction.user),
+                )
+                if wedge.message:
+                    db_note = f"\n{wedge.message}"
             except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /topresult
                 log.exception("PostgreSQL mirror pro HT Fight %s selhal", kit_clean)
 

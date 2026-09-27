@@ -728,3 +728,99 @@ async def commit_promotion_with_wedge(
             ),
         )
     return PromotionWedgeOutcome(committed=True, wedged=False, message="")
+
+
+# ---------------------------------------------------------------------------
+# CANONICAL PRODUCTION ENTRY POINT (Phase G0 cutover)
+# ---------------------------------------------------------------------------
+
+
+def grant_confirmation(grant) -> tuple[bool, Optional[int], bool]:
+    """Normalise a Discord role-mutation result into
+    ``(confirmed, role_id, ambiguous)``.
+
+    ``grant`` is duck-typed on purpose: ``cogs.roles.TierRoleGrant`` lives in
+    the Discord layer and must NOT be imported here (``db/`` stays free of any
+    Discord dependency). Every attribute is read defensively, so a caller that
+    passes ``None``, a wrong object, or a hand-rolled object can never satisfy
+    the confirmation requirement.
+
+    A grant is CONFIRMED only when all three hold:
+
+    * ``ok``        – the mutation was not rejected,
+    * ``verified``  – the ACTUAL final Discord role set was read back and
+                      matched the intended one (G0/invariant 6); ``ok`` alone
+                      only means "the HTTP call did not raise",
+    * ``tier_role_id`` is set – there is a concrete role to mirror.
+    """
+    confirmed = (
+        bool(getattr(grant, "ok", False))
+        and bool(getattr(grant, "verified", False))
+        and getattr(grant, "tier_role_id", None) is not None
+    )
+    role_id = getattr(grant, "tier_role_id", None)
+    ambiguous = bool(getattr(grant, "ambiguous", False))
+    return confirmed, role_id, ambiguous
+
+
+async def commit_confirmed_promotion(
+    session_factory: Optional[async_sessionmaker[AsyncSession]],
+    *,
+    grant,
+    **commit_kwargs,
+) -> PromotionWedgeOutcome:
+    """The ONE production entry point that persists a promotion.
+
+    Contract (this is the architectural enforcement point, not a convenience
+    wrapper — a caller cannot bypass it and still reach the DB):
+
+    1. ``grant`` MUST be a Discord-confirmed role mutation. Anything that is
+       not confirmed (rejected, ambiguous, unverified, ``None``, or a wrong
+       object) is REFUSED: nothing is written to ``player_current_tiers``,
+       ``tier_history`` or ``results``, and a loud operator-facing message is
+       returned. That covers failure-matrix cases 1, 2 and 6.
+    2. With a confirmed grant, resolve identity/kit/tier and commit result +
+       mirror + history + audit in ONE transaction, wedging durably if that
+       transaction fails (cases 3, 4, 7).
+    3. Without a ``session_factory`` nothing is written and nothing is
+       wedged (the legacy no-PostgreSQL deployment, where the Discord role
+       stays the only authority and ``/sync discord`` is the repair path).
+
+    This function holds no Discord handle and imports no JSON store, so the
+    forbidden directions ``PostgreSQL -> Discord`` and
+    ``players.json -> current tier`` are structurally impossible here.
+    """
+    confirmed, role_id, ambiguous = grant_confirmation(grant)
+
+    if not confirmed:
+        if ambiguous:
+            reason = (
+                "stav rolí v Discordu se nepodařilo potvrdit – je NEJISTÝ, "
+                "takže se do PostgreSQL nic nezapsalo (žádný vrat Discordu, "
+                "žádný falešný mirror)"
+            )
+        else:
+            reason = (
+                "role se v Discordu nepotvrdily jako změněné – do PostgreSQL "
+                "se proto nezapsal žádný tier"
+            )
+        log.warning(
+            "Promotion %s z refused (confirmed=%s, ambiguous=%s, role_id=%s): %s",
+            commit_kwargs.get("result_key"),
+            confirmed,
+            ambiguous,
+            role_id,
+            reason,
+        )
+        return PromotionWedgeOutcome(
+            committed=False,
+            wedged=False,
+            message=(
+                f"⚠️ {reason}. Zkontroluj stav rolí ručně nebo spusť "
+                "`/sync discord` (Discord zůstává jediným zdrojem pravdy)."
+            ),
+        )
+
+    if commit_kwargs.get("discord_role_id") is None:
+        commit_kwargs["discord_role_id"] = int(role_id)
+    return await commit_promotion_with_wedge(session_factory, **commit_kwargs)

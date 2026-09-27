@@ -55,13 +55,16 @@ def _iter_py_files(root: Path) -> list[Path]:
     )
 
 
-def _module_of(path: Path) -> str:
-    parts = path.parts
-    try:
-        idx = parts.index("dachshundtiers-bot")
-        parts = parts[idx + 1 :]
-    except ValueError:
-        parts = tuple(p for p in parts if p not in ("", ".", ".."))
+def _module_of(path: Path, root: Path) -> str:
+    """Dotted module path of ``path`` relative to the repo ``root``.
+
+    Must NOT search for a literal repo-folder-name string in the absolute
+    path — GitHub Actions checks out to ``.../work/<repo>/<repo>/...``, so a
+    name-based search finds the wrong (outer) occurrence and silently
+    mis-attributes every module, breaking the authorized-mutation-site
+    allowlist match on CI while passing locally.
+    """
+    parts = path.relative_to(root).parts
     dotted = ".".join(parts)
     return dotted.rsplit(".py", 1)[0]
 
@@ -113,7 +116,7 @@ def scan_patterns(root: Path, patterns: tuple[str, ...]) -> list[dict]:
         except OSError:
             continue
         lines = text_content.splitlines()
-        module = _module_of(path)
+        module = _module_of(path, root)
         try:
             tree = ast.parse(text_content, filename=str(path))
         except SyntaxError:

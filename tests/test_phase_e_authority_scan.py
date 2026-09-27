@@ -34,8 +34,9 @@ def test_mutation_surface_survives_unrelated_line_number_drift(tmp_path):
     the enclosing function's qualname, not the line number."""
     import shutil
 
-    # _module_of() derives the dotted module path by locating a
-    # "dachshundtiers-bot" path segment, so the copy must keep that name.
+    # _module_of() derives the dotted module path relative to the root
+    # passed to scan_patterns() below, so the copy's folder name doesn't
+    # matter — only that `workdir` itself is passed as that root.
     workdir = tmp_path / "dachshundtiers-bot"
     shutil.copytree(
         REPO,

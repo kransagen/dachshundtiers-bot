@@ -335,11 +335,16 @@ class ResultDbOutageTests(unittest.TestCase):
 mock.patch.object(
                  cm, "auto_grant_kit_role",
                  new=mock.AsyncMock(return_value=TierRoleGrant(
-                     ok=True, tier_role_id=202, note="grant ok"
+                     ok=True, verified=True, tier_role_id=202, note="grant ok"
                  )),
              ), \
              mock.patch(
-                 "db.services.commit_promotion_with_wedge",
+                 # patch na PRIMITIVU uvnitř db.services.promotion, ne na
+                 # atributu balíčku `db.services`: kanonická služba
+                 # `commit_confirmed_promotion` ji volá jako module-global, tak
+                 # tímhle testem opravdu prochází celý řetězec
+                 # cog -> grant_confirmation -> commit_promotion_with_wedge.
+                 "db.services.promotion.commit_promotion_with_wedge",
                  new=mock.AsyncMock(return_value=PromotionWedgeOutcome(
                      committed=False, wedged=True, message=wedge_message
                  )),
@@ -439,11 +444,16 @@ class TopResultDbOutageTests(unittest.TestCase):
         ), mock.patch.object(
             cm, "auto_grant_kit_role",
             new=mock.AsyncMock(
-                return_value=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+                return_value=TierRoleGrant(
+                    ok=True, verified=True, tier_role_id=202, note="ok"
+                )
             ),
         ), mock.patch.object(cm, "get_ticket", new=mock.AsyncMock(return_value=None)), \
            mock.patch(
-               "db.services.commit_promotion_with_wedge",
+               # viz poznámka u `ResultDbOutageTests._call` – patch na primitivu
+               # v `db.services.promotion`, aby šel skutečný kanonický řetězec
+               # cog -> grant_confirmation -> commit_promotion_with_wedge.
+               "db.services.promotion.commit_promotion_with_wedge",
                new=mock.AsyncMock(return_value=PromotionWedgeOutcome(
                    committed=False, wedged=True,
                    message=(

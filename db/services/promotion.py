@@ -745,21 +745,25 @@ def grant_confirmation(grant) -> tuple[bool, Optional[int], bool]:
     passes ``None``, a wrong object, or a hand-rolled object can never satisfy
     the confirmation requirement.
 
-    A grant is CONFIRMED only when all three hold:
+    A grant is CONFIRMED only when ALL of the following hold:
 
     * ``ok``        – the mutation was not rejected,
     * ``verified``  – the ACTUAL final Discord role set was read back and
                       matched the intended one (G0/invariant 6); ``ok`` alone
                       only means "the HTTP call did not raise",
+    * ``ambiguous`` is falsy – an ambiguous result means the Discord outcome is
+                      UNKNOWN, so it can never be treated as a state Discord
+                      confirmed, whatever the other flags claim,
     * ``tier_role_id`` is set – there is a concrete role to mirror.
     """
+    role_id = getattr(grant, "tier_role_id", None)
+    ambiguous = bool(getattr(grant, "ambiguous", False))
     confirmed = (
         bool(getattr(grant, "ok", False))
         and bool(getattr(grant, "verified", False))
-        and getattr(grant, "tier_role_id", None) is not None
+        and not ambiguous
+        and role_id is not None
     )
-    role_id = getattr(grant, "tier_role_id", None)
-    ambiguous = bool(getattr(grant, "ambiguous", False))
     return confirmed, role_id, ambiguous
 
 

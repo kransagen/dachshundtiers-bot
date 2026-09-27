@@ -35,6 +35,7 @@ ALL_TABLES = (
     "cooldowns",
     "queues",
     "queue_entries",
+    "queue_testers",
     "evaluations",
     "testers",
     "outbox_events",
@@ -124,6 +125,35 @@ def session_factory(db_engine):
 
 @pytest.fixture
 async def clean_db(db_engine):
+    """Reset every table before a test that needs an empty database.
+
+    ``TRUNCATE ... CASCADE`` needs an AccessExclusiveLock on every table at
+    once, so a single connection left behind by an earlier test (an
+    unclosed ``AsyncSession``, or a task that outlived its test) parks this
+    statement: such a backend is ``idle in transaction``, still holds an
+    AccessShareLock, and the truncate waits indefinitely. When two such
+    sessions overlap, PostgreSQL reports ``deadlock detected`` instead and
+    kills the TRUNCATE. Both symptoms surface as scattered, order-dependent
+    failures in tests that have nothing to do with the leaking one
+    (IntegrityError on a unique index the truncate never got to clear, empty
+    result sets, ...).
+
+    Nothing outside this fixture may legitimately hold a connection: the
+    engine is function-scoped with ``NullPool`` and is disposed on teardown,
+    and pytest runs tests sequentially on this dedicated embedded server. So
+    any OTHER backend on this database is a leak - terminate it first, then
+    truncate. That makes per-test isolation deterministic instead of
+    depending on GC timing.
+    """
+    async with db_engine.begin() as conn:
+        await conn.execute(
+            text(
+                "SELECT pg_terminate_backend(pid) "
+                "FROM pg_stat_activity "
+                "WHERE datname = current_database() "
+                "AND pid <> pg_backend_pid()"
+            )
+        )
     async with db_engine.begin() as conn:
         await conn.execute(
             text("TRUNCATE " + ", ".join(ALL_TABLES) + " RESTART IDENTITY CASCADE")

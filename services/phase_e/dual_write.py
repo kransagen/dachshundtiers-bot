@@ -1,6 +1,27 @@
 """Phase E, E1 — dual-write stabilization helpers.
 
-JSON+PG dual-write is time-boxed (design §15.7). This module provides:
+.. warning::
+
+   **NOT WIRED TO ANY PRODUCTION PATH (deferred, design §15.7).** As of the
+   G0 promotion-cutover audit this module has ZERO production callers — only
+   ``tests/test_phase_e_dual_write.py``. Nothing in ``cogs/``, ``services/``
+   or ``db/`` imports it. It is kept (not deleted) because it is an inert,
+   documented design deliverable: both functions are pure, they touch no
+   Discord and no database, and they cannot influence a promotion.
+
+   Two things must stay true, and are enforced by
+   ``tests/test_phase_e_dual_write.py::test_dual_write_module_has_no_production_callers``:
+
+   * ``json_export_enabled()`` stays uncalled. The confirmed state is written
+     to PostgreSQL by ``db.services.commit_confirmed_promotion``; it is NOT
+     exported to ``players.json`` (that file is legacy/export only since G0).
+     ``config.PHASE_E_JSON_EXPORT_ENABLED`` therefore only documents the
+     intent of the stabilization window, it gates nothing today.
+   * ``watchdog_divergence()`` stays observe-only and uncalled. If it is ever
+     wired into ``/sync check`` it must keep reporting only — it must never
+     become a second place that decides a current tier.
+
+   This module provides:
 
 1. ``json_export_enabled`` — feature flag gate for the JSON export side of
    confirmed state; when False, no confirmed outcome is exported to

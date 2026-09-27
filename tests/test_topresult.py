@@ -1109,8 +1109,10 @@ class TopResultCogBridgeTests(unittest.TestCase):
 
 
 class TopResultDbMirrorTests(unittest.TestCase):
-    """item 13: 1a2 – cog volá commit_promotion_with_wedge s EXAKTNÍM payloadem
-    jen když grant prošel (chytilo by chybu z rodiny int('LT2'))."""
+    """item 13: 1a2 – cog předá celý grant kanonické službě
+    ``commit_confirmed_promotion`` s EXAKTNÍM payloadem (chytilo by chybu
+    z rodiny int('LT2')). POZOR: gate už NENÍ v cogu – rozhodnutí „zapsat
+    do PG nebo ne" (včetně požadavku na `verified`) má jedině služba."""
 
     CHANNEL_ID = 5555
     ROLE_ID = 6666
@@ -1145,7 +1147,7 @@ class TopResultDbMirrorTests(unittest.TestCase):
         ) as grant_mock, mock.patch.object(
             cm, "get_ticket", new=mock.AsyncMock(return_value=None)
         ), mock.patch(
-            "db.services.commit_promotion_with_wedge",
+            "db.services.commit_confirmed_promotion",
             new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
         ) as commit_mock:
             channel = mock.MagicMock()
@@ -1175,7 +1177,7 @@ class TopResultDbMirrorTests(unittest.TestCase):
                 kit="MolePVP",
                 bridge="LT2",
             ))
-            return inter, rec_mock, grant_mock, commit_mock
+            return inter, rec_mock, grant_mock, commit_mock, grant_result
 
     @staticmethod
     def _record():
@@ -1193,20 +1195,23 @@ class TopResultDbMirrorTests(unittest.TestCase):
         }
 
     def test_win_promotion_commits_exact_db_kwargs(self):
-        inter, rec_mock, grant_mock, commit_mock = self._call(
-            self._record(), grant_result=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+        inter, rec_mock, grant_mock, commit_mock, grant = self._call(
+            self._record(),
+            grant_result=TierRoleGrant(ok=True, verified=True, tier_role_id=202, note="ok"),
         )
         commit_mock.assert_awaited_once()
         kw = commit_mock.await_args.kwargs
-        # bezprostřední spojení: role id, které vrátil grant, jde do DB
+        # bezprostřední spojení: celý grant jde do kanonické služby
         self.assertEqual(grant_mock.await_args.kwargs["tier_up"], "LT2")
+        self.assertIs(kw["grant"], grant)
         self.assertEqual(kw["result_key"], "ht_fight:x")
         self.assertEqual(kw["kind"], "ht_fight")
         self.assertEqual(kw["discord_id"], 1)
         self.assertEqual(kw["ign"], "mendu__")
         self.assertEqual(kw["kit_key"], "MolePVP")
         self.assertEqual(kw["new_tier_code"], "LT2")
-        self.assertEqual(kw["discord_role_id"], 202)
+        # `discord_role_id` už neurčuje cog – vybírá ho služba z grantu
+        self.assertNotIn("discord_role_id", kw)
         self.assertEqual(kw["previous_tier_code"], "LT3")
         self.assertEqual(kw["bridge_tier_code"], "LT2")
         self.assertEqual(kw["tier_status"], "Povýšen na LT2")
@@ -1217,28 +1222,33 @@ class TopResultDbMirrorTests(unittest.TestCase):
         self.assertEqual(kw["date"], "25.09.2026")
         self.assertEqual(kw["audit_actor_id"], inter.user.id)
 
-    def test_grant_failed_skips_db_mirror(self):
-        _, _, _, commit_mock = self._call(
-            self._record(), grant_result=TierRoleGrant(ok=False, note="nelze", tier_role_id=None)
-        )
-        commit_mock.assert_not_awaited()
+    def test_grant_failed_is_handed_to_the_canonical_service(self):
+        """Cog už NEMÁ vlastní gate – nepotvrzený grant se předá službě, která
+        ho odmítne (viz test_grant_failed_never_writes_to_postgres v G0 testech)."""
+        failed = TierRoleGrant(ok=False, note="nelze", tier_role_id=None)
+        _, _, _, commit_mock, _ = self._call(self._record(), grant_result=failed)
+        commit_mock.assert_awaited_once()
+        self.assertIs(commit_mock.await_args.kwargs["grant"], failed)
 
-    def test_legacy_empty_grant_skips_db_mirror(self):
-        _, _, _, commit_mock = self._call(self._record(), grant_result="")
-        commit_mock.assert_not_awaited()
+    def test_legacy_empty_grant_is_handed_to_the_canonical_service(self):
+        _, _, _, commit_mock, _ = self._call(self._record(), grant_result="")
+        commit_mock.assert_awaited_once()
+        self.assertEqual(commit_mock.await_args.kwargs["grant"], "")
 
     def test_unknown_bridge_code_still_commits_as_code(self):
         rec = self._record()
         rec["record"]["bridgeTier"] = "WR9"
-        _, _, _, commit_mock = self._call(
-            rec, grant_result=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+        _, _, _, commit_mock, _ = self._call(
+            rec,
+            grant_result=TierRoleGrant(ok=True, verified=True, tier_role_id=202, note="ok"),
         )
         commit_mock.assert_awaited_once()
         self.assertEqual(commit_mock.await_args.kwargs["bridge_tier_code"], "WR9")
 
-    def test_discord_grant_raises_no_commit_no_guess(self):
+    def test_discord_grant_raises_hands_unconfirmed_grant_to_service(self):
         """Failure matrix 1/4: Discord nedostupný (grant RAISES) → žádný
-        tier commit, žádný dohad, hlasitá zpráva, oznámení pokračuje."""
+        potvrzený grant, žádný dohad, hlasitá zpráva, oznámení pokračuje.
+        Cog už gate nemá: předá službě `grant=None`, která to odmítne."""
         cm = self.cog_module
         with mock.patch.object(
             cm,
@@ -1256,8 +1266,8 @@ class TopResultDbMirrorTests(unittest.TestCase):
         ) as grant_mock, mock.patch.object(
             cm, "get_ticket", new=mock.AsyncMock(return_value=None)
         ), mock.patch(
-            "db.services.commit_promotion_with_wedge",
-            new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
+            "db.services.commit_confirmed_promotion",
+            new=mock.AsyncMock(return_value=SimpleNamespace(message="")),
         ) as commit_mock:
             channel = mock.MagicMock()
             channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
@@ -1287,7 +1297,9 @@ class TopResultDbMirrorTests(unittest.TestCase):
                 bridge="LT2",
             ))
         grant_mock.assert_awaited_once()
-        commit_mock.assert_not_awaited()
+        # žádný dohad: služba dostane grant=None (ne ok/verified za hráče)
+        commit_mock.assert_awaited_once()
+        self.assertIsNone(commit_mock.await_args.kwargs["grant"])
         channel.send.assert_awaited_once()
         reply = inter.followup.send.await_args.args[0]
         self.assertIn("Tier roli se nepodařilo udělit", reply)
@@ -1304,7 +1316,9 @@ class TopResultDbMirrorTests(unittest.TestCase):
         ), mock.patch.object(
             cm, "auto_grant_kit_role",
             new=mock.AsyncMock(
-                return_value=TierRoleGrant(ok=True, tier_role_id=202, note="ok")
+                return_value=TierRoleGrant(
+                    ok=True, verified=True, tier_role_id=202, note="ok"
+                )
             ),
         ) as grant_mock, mock.patch.object(
             cm, "get_ticket", new=mock.AsyncMock(return_value=None)

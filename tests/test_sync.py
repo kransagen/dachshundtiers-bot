@@ -39,6 +39,7 @@ from unittest import mock
 import discord
 import github_sync
 import storage
+import cogs.sync as sync_mod
 from services import permissions
 from services.checkweb import CHECKWEB_LOG_FILE
 from services.datacheck import DATACHECK_LOG_FILE
@@ -606,6 +607,34 @@ class SyncWebTests(unittest.TestCase):
         self.assertIn("GITHUB_TOKEN", embed.description)
         self.assertIsNone(kwargs.get("view"))
         self.pusher.assert_not_awaited()
+
+    def test_pg_export_failure_is_labeled_as_legacy_json_fallback(self):
+        """H6: pokud je PostgreSQL nakonfigurovaný, ale export z něj selže,
+        výsledek MUSÍ jasně říct, že šlo o legacy JSON fallback – nesmí se
+        tvářit jako normální PostgreSQL export."""
+        inter = _interaction(user=_admin_member())
+        cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
+
+        async def main():
+            with (
+                mock.patch.object(
+                    sync_mod,
+                    "export_players",
+                    new=mock.AsyncMock(side_effect=RuntimeError("DB down")),
+                ),
+                mock.patch.object(
+                    github_sync,
+                    "fetch_players",
+                    new=mock.AsyncMock(return_value=(_deep(self.web), "sha", None)),
+                ),
+            ):
+                await Sync.sync_web.callback(cog, inter, "preview")
+
+        asyncio.run(main())
+        embed, _ = _sent(inter)
+        fields = " ".join(f.name + " " + str(f.value) for f in embed.fields)
+        self.assertIn("LEGACY JSON FALLBACK", fields)
 
     def test_stale_nothing_pushes(self):
         inter = _interaction(user=_admin_member())

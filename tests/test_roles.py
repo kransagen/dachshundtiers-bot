@@ -16,7 +16,7 @@ from unittest import mock
 
 import discord
 import storage
-from cogs.roles import auto_grant_kit_role
+from cogs.roles import TierRoleGrant, auto_grant_kit_role
 from services.kit_roles import KIT_ROLES_FILE
 
 
@@ -26,6 +26,24 @@ def _role(rid, name=None):
     role.mention = f"<@&{rid}>"
     role.name = name or f"Role{rid}"
     return role
+
+
+def _fresh(member):
+    """Member as a LIVE read would return it: current roles, fresh object."""
+    snapshot = mock.MagicMock()
+    snapshot.roles = list(member.roles)
+    return snapshot
+
+
+def _fresh_after(member, roles):
+    """PATCH response carrying an UNUSABLE role list, but applying the edit.
+
+    Mirrors a discord.py response object whose ``roles`` cannot be read as a
+    concrete role-id set — the code must then re-read Discord live instead of
+    trusting the body.
+    """
+    member.roles = list(roles)
+    return mock.MagicMock(roles=mock.MagicMock())
 
 
 class AutoGrantKitRoleTests(unittest.TestCase):
@@ -53,10 +71,20 @@ class AutoGrantKitRoleTests(unittest.TestCase):
         member = mock.MagicMock()
         member.add_roles = mock.AsyncMock()
         member.remove_roles = mock.AsyncMock()
-        member.edit = mock.AsyncMock()
         member.roles = member_roles or []
         guild.get_member.return_value = member
-        guild.fetch_member = mock.AsyncMock(return_value=member)
+
+        # G0: `member.edit` and `guild.fetch_member` must behave like the real
+        # discord.py — the PATCH response is the member AS DISCORD NOW SEES IT
+        # (so a mock that returns an unrelated object would be confirming
+        # nothing), and fetch_member returns a FRESH member reflecting the
+        # applied state rather than the pre-edit cache.
+        def _apply(roles):
+            member.roles = list(roles)
+            return member
+
+        member.edit = mock.AsyncMock(side_effect=_apply)
+        guild.fetch_member = mock.AsyncMock(side_effect=lambda _mid: _fresh(member))
         return guild, member
 
     def test_display_case_kit_finds_lowercase_key(self):
@@ -65,6 +93,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             guild, member = self._guild()
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
             self.assertIn("<@&111>", grant.note)
             self.assertEqual(grant.tier_role_id, 111)
             member.edit.assert_awaited_once()
@@ -79,6 +108,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             guild, member = self._guild()
             grant = await auto_grant_kit_role(guild, "1", "  MolePVP ", "HT3")
             self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
             self.assertEqual(grant.tier_role_id, 111)
             member.edit.assert_awaited_once()
             member.add_roles.assert_not_awaited()
@@ -108,6 +138,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             guild, member = self._guild(member_roles=[_role(222), _role(333)])
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
             member.edit.assert_awaited_once()
             _, kwargs = member.edit.await_args
             self.assertEqual({r.id for r in kwargs["roles"]}, {111})
@@ -119,10 +150,130 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             guild, member = self._guild(member_roles=[_role(111)])
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
             self.assertEqual(grant.tier_role_id, 111)
             member.edit.assert_not_awaited()
             member.add_roles.assert_not_awaited()
             member.remove_roles.assert_not_awaited()
+        asyncio.run(main())
+
+    # ------------------------------------------------------------------
+    # G0 (invariant 6): DISCORD STATE MUST BE VERIFIED before PostgreSQL
+    # may mirror it. `ok` alone only means "the HTTP call did not raise" —
+    # `verified` is the flag the canonical commit service actually requires,
+    # and it defaults to False so a forgotten return site fails closed.
+    # ------------------------------------------------------------------
+
+    def test_default_verified_is_false(self):
+        """Fail-closed by default: a hand-built grant that forgot to verify
+        can never be mistaken for a confirmed Discord state."""
+        self.assertFalse(TierRoleGrant(ok=True, tier_role_id=111).verified)
+
+    def test_no_op_path_is_confirmed_by_live_read(self):
+        """Role already matches the cache, but Discord is the authority —
+        the cached match alone must NOT be reported as confirmed; the live
+        re-read decides."""
+        async def main():
+            guild, member = self._guild(member_roles=[_role(111)])
+            member.edit = mock.AsyncMock()
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
+            self.assertEqual(grant.tier_role_id, 111)
+            member.edit.assert_not_awaited()
+            guild.fetch_member.assert_awaited()
+        asyncio.run(main())
+
+    def test_no_op_path_unreadable_state_is_ambiguous_not_ok(self):
+        """Cached roles match, but the LIVE state cannot be read at all.
+        That is UNKNOWN, not 'unchanged' and not 'confirmed'."""
+        async def main():
+            guild, member = self._guild(member_roles=[_role(111)])
+            guild.fetch_member = mock.AsyncMock(
+                side_effect=discord.HTTPException(mock.Mock(status=503), "down")
+            )
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertFalse(grant.ok)
+            self.assertTrue(grant.ambiguous)
+            self.assertFalse(grant.verified)
+            self.assertIn("NEJISTÝ", grant.note)
+        asyncio.run(main())
+
+    def test_no_op_path_stale_cache_falls_through_to_mutation(self):
+        """Cache says 'already HT3' but Discord says otherwise — the cache is
+        stale, so the intended role set MUST be applied, not reported as a
+        confirmed no-op."""
+        async def main():
+            guild, member = self._guild(member_roles=[_role(111)])
+            stale = mock.MagicMock()
+            stale.roles = []  # Discord disagrees with the cache
+            guild.fetch_member = mock.AsyncMock(return_value=stale)
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
+            member.edit.assert_awaited_once()
+            _, kwargs = member.edit.await_args
+            self.assertEqual({r.id for r in kwargs["roles"]}, {111})
+        asyncio.run(main())
+
+    def test_success_path_uses_patch_response_as_confirmation(self):
+        """A successful PATCH whose response body already shows the intended
+        roles IS the confirmation — no extra API call needed."""
+        async def main():
+            guild, member = self._guild()
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
+            guild.fetch_member.assert_not_awaited()
+        asyncio.run(main())
+
+    def test_success_path_falls_back_to_live_read_when_body_unusable(self):
+        """PATCH succeeded but its body does not describe roles → fall back
+        to a live read, and only a matching read counts as confirmed."""
+        async def main():
+            guild, member = self._guild()
+            member.edit = mock.AsyncMock(
+                side_effect=lambda roles: _fresh_after(member, roles)
+            )
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
+            guild.fetch_member.assert_awaited()
+        asyncio.run(main())
+
+    def test_success_path_unreadable_body_and_failing_read_is_ambiguous(self):
+        """Edit did not raise, yet NOBODY can read the final state. The
+        outcome is unknown — never a confirmed success (that would let PG
+        mirror a state Discord never reported)."""
+        async def main():
+            guild, member = self._guild()
+            member.edit = mock.AsyncMock(
+                return_value=mock.MagicMock(roles=mock.MagicMock())
+            )
+            guild.fetch_member = mock.AsyncMock(
+                side_effect=discord.HTTPException(mock.Mock(status=503), "down")
+            )
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertFalse(grant.ok)
+            self.assertTrue(grant.ambiguous)
+            self.assertFalse(grant.verified)
+            self.assertIn("NEJISTÝ", grant.note)
+        asyncio.run(main())
+
+    def test_success_path_confirmed_mismatch_is_not_ok(self):
+        """Discord answered with a DIFFERENT role set than requested (e.g. a
+        concurrent edit won the race). A confirmed non-application must be
+        reported as failure, never as success — PG may not mirror it."""
+        async def main():
+            guild, member = self._guild()
+            member.edit = mock.AsyncMock(
+                side_effect=lambda roles: mock.MagicMock(roles=[_role(999)])
+            )
+            grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
+            self.assertFalse(grant.ok)
+            self.assertFalse(grant.verified)
+            self.assertFalse(grant.ambiguous)
+            self.assertIn("jiný stav rolí", grant.note)
         asyncio.run(main())
 
     def test_forbidden_edit_reports_not_ok(self):
@@ -134,6 +285,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertFalse(grant.ok)
             self.assertFalse(grant.ambiguous)
+            self.assertFalse(grant.verified)
             self.assertIn("nepovedlo udělit", grant.note)
         asyncio.run(main())
 
@@ -156,6 +308,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             guild.fetch_member = mock.AsyncMock(return_value=verified)
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
             self.assertFalse(grant.ambiguous)
             self.assertEqual(grant.tier_role_id, 111)
         asyncio.run(main())
@@ -173,6 +326,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertFalse(grant.ok)
             self.assertTrue(grant.ambiguous)
+            self.assertFalse(grant.verified)
         asyncio.run(main())
 
     def test_timeout_then_verification_unavailable_is_ambiguous(self):
@@ -189,6 +343,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertFalse(grant.ok)
             self.assertTrue(grant.ambiguous)
+            self.assertFalse(grant.verified)
             self.assertIn("NEJISTÝ", grant.note)
         asyncio.run(main())
 
@@ -205,6 +360,7 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             guild.fetch_member = mock.AsyncMock(return_value=verified)
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertTrue(grant.ok)
+            self.assertTrue(grant.verified)
             self.assertFalse(grant.ambiguous)
         asyncio.run(main())
 

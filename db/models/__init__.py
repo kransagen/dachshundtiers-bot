@@ -1,6 +1,12 @@
+from db.models.identity import (
+    MinecraftAccount,
+    PlayerLinkToken,
+    normalize_uuid,
+)
 from db.models.ops import (
     Cooldown,
     Evaluation,
+    KitTesterRoom,
     Queue,
     QueueEntry,
     QueueTester,
@@ -34,10 +40,13 @@ __all__ = [
     "Evaluation",
     "Kit",
     "KitRole",
+    "KitTesterRoom",
+    "MinecraftAccount",
     "MigrationImportIssue",
     "OutboxEvent",
     "Player",
     "PlayerCurrentTier",
+    "PlayerLinkToken",
     "Queue",
     "QueueEntry",
     "QueueTester",
@@ -52,4 +61,5 @@ __all__ = [
     "TierHistory",
     "Tournament",
     "TournamentEntry",
+    "normalize_uuid",
 ]

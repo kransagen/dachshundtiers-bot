@@ -8,8 +8,10 @@ Odstraňuje duplicitu napříč cogy:
   kit_roles.json / modes (dříve 3×),
 - ``apply_role_actions`` – aplikace plánu rolí (add/remove) s per-akce
   vyhodnocením – sdíleno /sync discord a /edituser,
-- ``admin_gate_error`` – guild + admin kontrola pro příkazy i view tlačítka,
-- ``save_players`` – atomický zápis ``players.json`` (per-záznamová rozhodnutí).
+- ``admin_gate_error`` – guild + admin kontrola pro příkazy i view tlačítka.
+  (Bývalý ``save_players`` – atomický zápis ``players.json`` – je pryč:
+  jediný zapisovač players.json je ``services.player_export``, a to jen
+  jako export z PostgreSQL.)
 
 Business logika zůstává ve službách (services/role_sync, services/store, ...);
 tohle je jen sdílený „Discord glue“.
@@ -22,8 +24,6 @@ import discord
 from services.kit_catalog import get_kits
 from services.permissions import has_admin_role
 from services.role_sync import make_member
-from services.store import transaction
-from storage import using_postgres
 
 log = logging.getLogger("dachshundtiers")
 
@@ -253,23 +253,3 @@ def admin_gate_error(interaction) -> str | None:
     if not has_admin_role(interaction.user):
         return "❌ Pouze pro administrátory."
     return None
-
-
-async def save_players(players: list) -> None:
-    """DEPRECATED (F4/F-FIX): players.json je export-only a už nemá koho.
-
-    F-FIX odstranil poslední produkční čtenáře/zapisovatele JSON-first cest
-    (/sync importdiscord, /checkweb apply, /sync data tier normalizace).
-    Zbývající JSON režim (bez PostgreSQL) je jediné, co tady smí zapisovat.
-    """
-    if using_postgres():
-        raise RuntimeError(
-            "F-FIX: players.json se v PostgreSQL režimu nepíše. Jediný "
-            "zapisovač je services.player_export.write_players_export "
-            "(canonical export z PostgreSQL)."
-        )
-
-    async def _run(tx):
-        tx.set("players.json", players)
-
-    await transaction(("players.json",), _run)

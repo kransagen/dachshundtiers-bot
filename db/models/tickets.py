@@ -92,4 +92,17 @@ class TicketMember(Base):
 
     __table_args__ = (
         UniqueConstraint("ticket_id", "player_id", "added_at", name="uq_ticket_member"),
+        # H10 audit fix: at most ONE active membership per (ticket, player).
+        # ``added_at`` differs between re-adds, so the time-based unique above
+        # cannot stop two concurrent /add operations from inserting two ACTIVE
+        # rows — this partial unique index rejects the loser at the DB level,
+        # while historical re-adds after removal (removed_at IS NOT NULL) stay
+        # untouched.
+        Index(
+            "uq_ticket_members_active",
+            "ticket_id",
+            "player_id",
+            unique=True,
+            postgresql_where=text("removed_at IS NULL"),
+        ),
     )

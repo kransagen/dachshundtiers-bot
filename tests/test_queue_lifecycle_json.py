@@ -1,164 +1,57 @@
-"""JSON režim (session_factory=None) nových front-životního-cyklu služeb — Phase F.
+"""Životní cyklus front (open/close, testeri, /skip, panel) – výhradně PostgreSQL.
 
-Ověřuje, že zadní cesta zachovává původní JSON kontrakt (active_queues.json,
-queue.json, pulled_players.json, testers.json, queue_messages.json) pro
-open/close fronty, joinasqueue/leaveq a /skip. DB režim (parita) je pokryt
-test_services_queue_lifecycle_db.py.
+Tyhle testy dřív pokrývaly JSON režim (session_factory=None) fronty
+(active_queues.json / queue.json / queue_messages.json / testers.json /
+pulled_players.json přes ``services.store``). JSON režim je zcela odebraný;
+produkční chování nad PostgreSQL je pokryté
+``tests/test_services_queue_lifecycle_db.py``.
+
+Tenhle soubor teď hlídá jenom, že se JSON fallback nevrátil: lifecycle služby
+vyžadují ``session_factory`` a nikdy nesahají do JSON souborů.
 """
 
-import asyncio
-import tempfile
-import unittest
-from unittest import mock
+import inspect
+from pathlib import Path
 
-import storage
+import pytest
+
 from services import queue_service as qsvc
 
 COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
 
 
-class QueueLifecycleJsonTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-
-        storage.save_data("active_queues.json", {})
-        storage.save_data("queue.json", [])
-        storage.save_data("queue_messages.json", {})
-        storage.save_data("testers.json", [])
-        storage.save_data("cooldowns.json", {})
-        storage.save_data("pulled_players.json", {})
-
-    def test_open_queue_json(self):
-        asyncio.run(self._open_ok())
-
-    async def _open_ok(self):
-        status, qdata = await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-        self.assertEqual(status, "ok")
-        self.assertEqual(qdata["name"], "AnchorPvP")
-        self.assertEqual(qdata["opener"], "111")
-        self.assertEqual(qdata["testers"], ["111"])
-        self.assertIsInstance(qdata["time"], int)
-
-        status, _ = await qsvc.open_queue("anchorpvp", "AnchorPvP", "222", "Second")
-        self.assertEqual(status, "exists")
-
-        active = storage.load_data("active_queues.json", {})
-        self.assertIn("anchorpvp", active)
-
-    def test_close_queue_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            await qsvc.join_queue(
-                "1", "alice", "AliceMC", "AnchorPvP",
-                joined_at_ms=1_700_000_000_000, cooldown_ms=COOLDOWN_MS,
-            )
-            old = await qsvc.close_queue("anchorpvp")
-            self.assertIsNone(old)
-            state = await qsvc.queue_state("anchorpvp")
-            self.assertIsNone(state)
-            entries = await qsvc.list_queue_entries("anchorpvp")
-            self.assertEqual(entries, [])
-        asyncio.run(run())
-
-    def test_join_and_leave_tester_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            status, qdata = await qsvc.join_queue_tester("anchorpvp", "222")
-            self.assertEqual(status, "ok")
-            self.assertEqual(qdata["testers"], ["111", "222"])
-
-            status, _ = await qsvc.join_queue_tester("anchorpvp", "222")
-            self.assertEqual(status, "duplicate")
-
-            status, qdata = await qsvc.leave_queue_tester("anchorpvp", "111")
-            self.assertEqual(status, "ok")
-            self.assertEqual(qdata["opener"], "222")
-
-            status, _ = await qsvc.leave_queue_tester("anchorpvp", "111")
-            self.assertEqual(status, "not_listed")
-
-            status, _ = await qsvc.join_queue_tester("molepvp", "333")
-            self.assertEqual(status, "closed")
-        asyncio.run(run())
-
-    def test_skip_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            await qsvc.join_queue(
-                "1", "alice", "AliceMC", "AnchorPvP",
-                joined_at_ms=1_700_000_000_000, cooldown_ms=COOLDOWN_MS,
-            )
-            await qsvc.join_queue(
-                "2", "bob", "BobMC", "AnchorPvP",
-                joined_at_ms=1_700_000_000_100, cooldown_ms=COOLDOWN_MS,
-            )
-            first = await qsvc.peek_first_player()
-            self.assertEqual(first["id"], "1")
-            result = await qsvc.skip_player("1")
-            self.assertFalse(result["was_pulled"])
-            self.assertFalse(result["requeued"])
-            self.assertTrue(result["moved"])
-            self.assertEqual(result["next"]["id"], "2")
-            entries = await qsvc.list_queue_entries("anchorpvp")
-            self.assertEqual([e["id"] for e in entries], ["1", "2"])
-        asyncio.run(run())
-
-    def test_skip_pulled_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            player = qsvc.make_entry("1", "alice", "AliceMC", "AnchorPvP", 1_700_000_000_000)
-            await qsvc.save_pulled_player(player, 555)
-            result = await qsvc.skip_player("1")
-            self.assertTrue(result["was_pulled"])
-            self.assertEqual(result["channel_id"], 555)
-            self.assertEqual(result["kit_key"], "anchorpvp")
-        asyncio.run(run())
-
-    def test_removeq_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            await qsvc.join_queue(
-                "1", "alice", "AliceMC", "AnchorPvP",
-                joined_at_ms=1_700_000_000_000, cooldown_ms=COOLDOWN_MS,
-            )
-            entry = await qsvc.removeq("1")
-            self.assertEqual(entry["id"], "1")
-            self.assertIsNone(await qsvc.removeq("1"))
-        asyncio.run(run())
-
-    def test_register_global_tester_json(self):
-        async def run():
-            self.assertTrue(await qsvc.register_global_tester("777", "Seven"))
-            self.assertTrue(await qsvc.register_global_tester("777", "Seven"))
-            testers = storage.load_data("testers.json", [])
-            self.assertEqual(testers, ["777"])
-        asyncio.run(run())
-
-    def test_panel_message_id_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            await qsvc.set_queue_panel("anchorpvp", 555, 999)
-            mid = await qsvc.panel_message_id("anchorpvp")
-            self.assertEqual(mid, "999")
-        asyncio.run(run())
-
-    def test_snapshot_json(self):
-        async def run():
-            await qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener")
-            await qsvc.join_queue(
-                "1", "alice", "AliceMC", "AnchorPvP",
-                joined_at_ms=1_700_000_000_000, cooldown_ms=COOLDOWN_MS,
-            )
-            entries, active = await qsvc.queue_snapshot()
-            self.assertEqual([e["id"] for e in entries], ["1"])
-            self.assertIn("anchorpvp", active)
-        asyncio.run(run())
+@pytest.mark.asyncio
+async def test_lifecycle_requires_session_factory(tmp_path, monkeypatch):
+    monkeypatch.setattr("storage.DATA_DIR", str(tmp_path))
+    cases = (
+        lambda: qsvc.open_queue("anchorpvp", "AnchorPvP", "111", "Opener"),
+        lambda: qsvc.close_queue("anchorpvp"),
+        lambda: qsvc.queue_state("anchorpvp"),
+        lambda: qsvc.active_queues(),
+        lambda: qsvc.list_queue_entries("anchorpvp"),
+        lambda: qsvc.queue_snapshot(),
+        lambda: qsvc.peek_first_player(),
+        lambda: qsvc.join_queue_tester("anchorpvp", "222"),
+        lambda: qsvc.leave_queue_tester("anchorpvp", "222"),
+        lambda: qsvc.register_global_tester("777", "Seven"),
+        lambda: qsvc.removeq("1"),
+        lambda: qsvc.skip_player("1"),
+        lambda: qsvc.set_queue_panel("anchorpvp", 555, 999),
+        lambda: qsvc.panel_message_id("anchorpvp"),
+    )
+    for call in cases:
+        with pytest.raises(TypeError):
+            await call()
+    assert list(Path(tmp_path).iterdir()) == []
 
 
-def asyncio_run(coro):
-    import asyncio
-
-    return asyncio.run(coro)
+def test_no_json_fallback_sources():
+    """Zdrojový regresní test pro lifecycle funkce queue_service."""
+    src = inspect.getsource(qsvc)
+    assert "if session_factory is not None:" not in src
+    assert "def _json_active_queues" not in src
+    # Žádný JSON I/O: module docstring o JSONu mluví jen v minulém čase,
+    # ale produkční kód nesmí na soubor SAHAT.
+    assert "load_data(" not in src
+    assert "save_data(" not in src
+    assert "from services.store import transaction" not in src

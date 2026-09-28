@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from db.models import QueueEntry
+from db.models import Player, QueueEntry
 from db.repositories.cooldowns import COOLDOWN_WAITLIST, CooldownRepository
 from db.repositories.kits import KitRepository, ensure_dimensions
 from db.repositories.players import PlayerRepository
@@ -177,7 +177,52 @@ async def test_concurrent_joins_two_users_both_land(session_factory, clean_db):
         _join(session_factory, "2", name="b", ign="B"),
     )
     assert sorted([r1["result"], r2["result"]]) == ["joined", "joined"]
-    assert len(await _entries(session_factory)) == 2
+    entries = await _entries(session_factory)
+    assert len(entries) == 2
+    # E4: concurrent joins must never share a position (FIFO order).
+    assert sorted(e.position for e in entries) == [1, 2]
+
+
+async def test_concurrent_joins_many_users_distinct_positions(session_factory, clean_db):
+    """E4 regression: N concurrent joins in the same queue get positions
+    {1..N} — a plain MAX(position)+1 read would let two transactions observe
+    the same MAX and insert the same position, silently corrupting FIFO
+    order. Serialization on the queue row must hold regardless of how many
+    joins overlap."""
+    await _seed(session_factory)
+    outcomes = await asyncio.gather(
+        *[
+            _join(session_factory, str(uid), name=f"u{uid}", ign=f"IGN{uid}")
+            for uid in range(1, 7)
+        ]
+    )
+    assert [o["result"] for o in outcomes] == ["joined"] * 6
+    entries = await _entries(session_factory)
+    assert sorted(e.position for e in entries) == list(range(1, 7))
+    assert len({e.position for e in entries if e.status == QUEUE_ENTRY_WAITING}) == 6
+
+    # FIFO pull order follows ascending positions (assignment of WHICH join
+    # gets WHICH position is arbitrary under concurrency — only the ORDER
+    # must be the position order).
+    entries = await _entries(session_factory)
+    async with transaction(session_factory) as session:
+        players = await session.execute(
+            select(Player).where(Player.id.in_([e.player_id for e in entries]))
+        )
+        discord_by_player = {
+            p.id: p.discord_id for p in players.scalars()
+        }
+    position_by_discord = {
+        discord_by_player[e.player_id]: e.position for e in entries
+    }
+    pulled_ids = []
+    while True:
+        player = await qsvc.pop_for_kit("anchorpvp", session_factory=session_factory)
+        if player is None:
+            break
+        pulled_ids.append(player["id"])
+    pulled_positions = [position_by_discord[int(uid)] for uid in pulled_ids]
+    assert pulled_positions == sorted(position_by_discord.values())
 
 
 async def test_leave_queue(session_factory, clean_db):

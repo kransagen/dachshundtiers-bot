@@ -1,9 +1,12 @@
 """Identita hráče – Discord ID je PRIMÁRNÍ identita (bez discord.py).
 
-Kanonická databáze hráčů (data/players.json) je seznam záznamů:
-``username`` = aktuální IGN, ``discordId`` = Discord ID hráče (stabilní),
-``modes`` = tiery per kit, ``history`` = historie tierů. Tento modul je
-jediné místo, kde se identita hráče řeší:
+PŮVODNĚ to byl jediný zdroj pravdy pro ``data/players.json``. Dnes je tato
+tabulka NEŽIVÁ: produkční stav hráčů je v PostgreSQL a pravidla identity,
+která tady kdysi žila, zrcadlí ``db/repositories/players.py`` (must not
+diverge — viz tam). Tenhle modul přežil jen jako čisté (čistě funkční) API
+pro PŘEVIEW: ``services/edituser.change_player_*`` a ``cogs/edituser`` na
+projekcích (dict-like záznamech hráče) počítají, co by se změnilo, NEŽ se
+cokoli zapíše do PostgreSQL. Plní role:
 
   - ``discordId`` je stabilní primární klíč – IGN se může měnit,
   - ``username`` (IGN) je zobrazované jméno – změna IGN přejmenuje záznam,
@@ -13,7 +16,7 @@ jediné místo, kde se identita hráče řeší:
     operace se odmítá – nikdy se nehádá a nikdy neslučuje automaticky.
 
 Stav se nikdy nemutuje na místě – funkce pracují s kopiemi (čisté funkce,
-stejný styl jako apply_result_to_players v services/results.py).
+stejný styl jako dřívější JSON aplikace výsledků v services/results.py).
 """
 
 # Výsledek claim_ign.

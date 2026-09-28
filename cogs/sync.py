@@ -221,51 +221,40 @@ async def _fetch_website():
     return players, "GitHub", []
 
 
-# _canonical_for_export source labels (H6: fallback must be loud, never
-# presented as a normal PostgreSQL export).
-EXPORT_SOURCE_POSTGRES = "postgres"
-EXPORT_SOURCE_JSON_ONLY_MODE = "json_only_mode"
-EXPORT_SOURCE_JSON_FALLBACK = "json_fallback_after_pg_failure"
+# Web/GitHub export má JEDINÝ zdroj: PostgreSQL. ``data/players.json`` už
+# není zdroj pravdy, a proto se nikdy nepoužije jako „náhrada", když export
+# z DB selže. Selhání exportu je selhání exportu – operátor to musí vidět,
+# jinak by na webu visel tichý rozestup, o kterém nikdo neví.
+async def _canonical_for_export(session_factory) -> list[dict]:
+    """Kanonická data hráčů pro web/GitHub export – výhradně z PostgreSQL.
 
-
-async def _canonical_for_export(session_factory) -> tuple[list, str]:
-    """Canonical players pro web/GitHub export: PostgreSQL → players.json fallback.
-
-    Export je export-only kanál: při výpadku DB nesmí selhat, ale fallback je
-    hlasitý (log.exception + druhá návratová hodnota) a nikdy se nepropírá do
-    autoritativních cest. Vrací ``(players, source)`` – ``source`` rozlišuje
-    tři případy a volající MUSÍ jej zobrazit operátorovi:
-
-    * ``EXPORT_SOURCE_POSTGRES`` – normální kanonický export z PostgreSQL.
-    * ``EXPORT_SOURCE_JSON_ONLY_MODE`` – bot běží v legacy JSON-only režimu
-      (``session_factory`` není nakonfigurovaný); to NENÍ selhání/fallback,
-      je to explicitně zvolený deployment mode.
-    * ``EXPORT_SOURCE_JSON_FALLBACK`` – PostgreSQL JE nakonfigurovaný, ale
-      export z něj selhal, takže se použil legacy players.json. Tohle je
-      jediný případ, který se nesmí tvářit jako normální export.
+    Dřív tady byl třetí zdroj pravdy: když export z DB selhal (nebo nebyla
+    DB vůbec nakonfigurovaná), načetl se ``data/players.json`` a výsledek
+    se prezentoval jako „synced", jen s oranžovou poznámkou. To je přesně
+    situace, kdy se dvě pravdy tiš rozejdou a nikdo nepozná, která odpověď
+    je správná. Teď výjimka propadne – volající ji musí ohlásit a export
+    se vůbec neprovede.
     """
-    if session_factory is not None:
-        try:
-            return await export_players(session_factory), EXPORT_SOURCE_POSTGRES
-        except Exception:  # noqa: BLE001 – výpadek DB nesmí zablokovat export
-            log.exception(
-                "Canonical export z PostgreSQL selhal – pokračuji z data/players.json"
-            )
-            return load_data("players.json", []) or [], EXPORT_SOURCE_JSON_FALLBACK
-    return load_data("players.json", []) or [], EXPORT_SOURCE_JSON_ONLY_MODE
+    if session_factory is None:
+        raise RuntimeError(
+            "export hráčů potřebuje PostgreSQL; players.json se už jako zdroj "
+            "pravdy nepoužívá"
+        )
+    return await export_players(session_factory)
 
 
 async def _canonical_players(session_factory) -> list:
-    """'DB' strana checkweb analýzy = canonical data z PostgreSQL (F-FIX).
+    """Canonical data pro checkweb analýzu – výhradně z PostgreSQL.
 
-    V DB režimu je ``players.json`` export-only a nesmí být čten jako zdroj
-    current tieru, takže výpadek DB vyvolá výjimku — žádný tichý fallback.
-    Bez ``session_factory`` běží legacy JSON režim, kde je ``players.json``
-    jediný dostupný store.
+    Výpadek DB vyvolá výjimku (analýza bez dat je bezcenná a klamavá), žádný
+    tichý fallback na ``players.json``.
     """
-    if session_factory is not None:
-        return await export_players(session_factory)
-    return load_data("players.json", []) or []
+    if session_factory is None:
+        raise RuntimeError(
+            "checkweb analýza potřebuje PostgreSQL; players.json se už "
+            "nepoužívá jako zdroj current tieru"
+        )
+    return await export_players(session_factory)
 
 
 async def _kit_role_maps_or_empty(session_factory) -> dict:
@@ -558,27 +547,7 @@ def _rollback_embed(
     return [embed]
 
 
-def _mark_json_fallback(embeds: list, export_source: str | None) -> list:
-    """H6: pokud export běžel z legacy players.json po selhání PostgreSQL,
-    zobrazí to hlasitě jako první pole prvního embedu – export se NIKDY
-    nesmí tvářit jako normální PostgreSQL export."""
-    if export_source == EXPORT_SOURCE_JSON_FALLBACK and embeds:
-        embeds[0].insert_field_at(
-            0,
-            name="⚠️ LEGACY JSON FALLBACK",
-            value=(
-                "Export z PostgreSQL selhal – tento náhled/výsledek je "
-                "spočítaný z legacy **data/players.json**, ne z aktuální "
-                "kanonické DB."
-            ),
-            inline=False,
-        )
-    return embeds
-
-
-def _websync_embed(
-    result: dict, *, mode: str, note: str = "", export_source: str | None = None
-) -> list:
+def _websync_embed(result: dict, *, mode: str, note: str = "") -> list:
     """Embed pack s přehledem rozdílů / výsledkem (preview / apply)."""
     if not result["ok"]:
         embed = discord.Embed(
@@ -589,7 +558,7 @@ def _websync_embed(
         if mode == "apply":
             embed.set_footer(text="Nic se na web neposílalo.")
         _append_note(embed, note)
-        return _mark_json_fallback([embed], export_source)
+        return [embed]
 
     analysis = result["analysis"] or {}
     if analysis.get("has_issues"):
@@ -635,7 +604,7 @@ def _websync_embed(
             sections=sections,
         )
         _append_note(embeds[0], note)
-        return _mark_json_fallback(embeds, export_source)
+        return embeds
 
     embed = discord.Embed(
         title="✅ /sync web – web je v synchronizaci",
@@ -646,7 +615,7 @@ def _websync_embed(
         color=0x10B981,
     )
     _append_note(embed, note)
-    return _mark_json_fallback([embed], export_source)
+    return [embed]
 
 
 def _datacheck_embed(report: dict, *, note: str = "") -> list:
@@ -1177,7 +1146,23 @@ class SyncWebConfirmView(SafeView):
         # Ověření, že se kanonická DB od náhledu nezměnila – nahrajeme PŘESNĚ
         # to, co admin potvrdil (nikdy nic automaticky navíc).
         session_factory = getattr(interaction.client, "db_session_factory", None)
-        canonical, export_source = await _canonical_for_export(session_factory)
+        try:
+            canonical = await _canonical_for_export(session_factory)
+        except Exception:  # noqa: BLE001 – žádný fallback na players.json
+            log.exception("Export z PostgreSQL selhal – nic se neposílá")
+            self.finished = True
+            await self._finish(
+                interaction,
+                result={
+                    "ok": False,
+                    "message": (
+                        "PostgreSQL nedostupný – **nic jsem na web neposlal**. "
+                        "Nahrát se nesmí nic jiného než data z DB; zkontroluj "
+                        "spojení a spusť **/sync web mode:apply** znovu."
+                    ),
+                },
+            )
+            return
         if not canonical or fingerprint_canonical(canonical) != self.fingerprint:
             self.finished = True
             await self._finish(interaction, result=None, stale=True)
@@ -1190,18 +1175,14 @@ class SyncWebConfirmView(SafeView):
             actor_name=str(interaction.user),
         )
         self.finished = True
-        await self._finish(
-            interaction, result=result, stale=False, export_source=export_source
-        )
+        await self._finish(interaction, result=result, stale=False)
 
-    async def _finish(
-        self, interaction, *, result=None, stale=False, export_source=None
-    ) -> None:
+    async def _finish(self, interaction, *, result=None, stale=False) -> None:
         if stale:
             embed = discord.Embed(
                 title="🔄 /sync web – stav se změnil",
                 description=(
-                    "Kanonická players.json se mezitím změnila – **nic jsem "
+                    "Kanonická DB se mezitím změnila – **nic jsem "
                     "na web neposlal**. Spusť **/sync web mode:apply** znovu."
                 ),
                 color=0xEF4444,
@@ -1222,17 +1203,6 @@ class SyncWebConfirmView(SafeView):
                     name="Záznamy na webu",
                     value=f"**{result['records']}** hráčů · "
                     f"{len(result['errors'])} chyb · {result['attempts']} pokusů",
-                    inline=False,
-                )
-            if export_source == EXPORT_SOURCE_JSON_FALLBACK:
-                embed.add_field(
-                    name="⚠️ LEGACY JSON FALLBACK",
-                    value=(
-                        "Export z PostgreSQL selhal – nahráno bylo **legacy "
-                        "data/players.json**, ne aktuální kanonická DB. "
-                        "Zkontroluj DB spojení a spusť **/sync web** znovu, "
-                        "jakmile bude PostgreSQL dostupné."
-                    ),
                     inline=False,
                 )
             embed.set_footer(text="Zapsáno do data/websync_log.json (audit).")
@@ -2220,13 +2190,23 @@ class Sync(commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         session_factory = getattr(getattr(self, "bot", None), "db_session_factory", None)
-        canonical, export_source = await _canonical_for_export(session_factory)
+        try:
+            canonical = await _canonical_for_export(session_factory)
+        except Exception:  # noqa: BLE001 – žádný fallback na players.json
+            log.exception("Export z PostgreSQL selhal – /sync web neproběhne")
+            return await interaction.followup.send(
+                "❌ **PostgreSQL nedostupný – export neproběhl.**\n"
+                "Na web se nesmí nahrát nic jiného než data z DB (dřív se sem "
+                "tichy dostal legacy `data/players.json` a vznikl rozestup, "
+                "který nikdo neviděl). Zkontroluj spojení a opakuj.",
+                ephemeral=True,
+            )
         result = await preview_website(
             canonical=canonical,
             actor_id=interaction.user.id,
             actor_name=str(interaction.user),
         )
-        embeds = _websync_embed(result, mode=mode, note=note, export_source=export_source)
+        embeds = _websync_embed(result, mode=mode, note=note)
 
         if not result["ok"]:
             await _send_embed_pack(interaction.followup, embeds)

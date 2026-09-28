@@ -1,13 +1,19 @@
-"""Tester statistics — JSON file or derived from PostgreSQL.
+"""Tester statistics, derived from PostgreSQL.
 
-Phase F (#4): ``testers_stats.json`` aggregation moves to runtime derivation
-from ``results`` (per-tester totals for kits/tiers/months/hours). ``/addtest``
-manual credits land in the ``tester_credits`` ledger and merge into the same
-projection, so the admin backfill feature survives without a JSON source.
+Phase F (#4): statistiky se počítají za běhu z ``results`` (per-tester totals
+pro kity/tiery/měsíce/hodiny). ``/addtest`` ruční kredity jdou do ledgeru
+``tester_credits`` a slučují se do téhož projekce, takže admin backfill funguje
+bez JSON zdroje.
 
-JSON režim: čte/zapisuje ``testers_stats.json`` přesně jako původní cog kód.
-DB režim: statistiky se dopočítávají z ``Result`` (jen ``kind`` ticket/queue —
-ht_fight se v JSONu nikdy nepočítal) + ``TesterCredit`` pro total/monthly.
+DRUHÝ REŽIM TU UŽ NENÍ. ``testers_stats.json`` se už nečte ani nezapisuje a
+každá funkce vyžaduje ``session_factory``. Bez DB statistiky nejsou – nejde
+vrátit „nějaký odhad ze souboru", protože by to byl druhý zdroj pravdy, který
+by se tiš rozcházel s výsledky. Klíče v návratových dictech (``total``,
+``lastTested``, ``kits``, ``tiers``, ``monthly``, ``hourlyLogs``) zůstávají,
+protože je čtou cogy.
+
+``kind`` se počítá jen ticket/queue – ``ht_fight`` se nikdy nepočítal ani v
+JSONu, a to je záměrné, ne opomenutí.
 """
 
 from __future__ import annotations
@@ -17,16 +23,13 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db.models import Kit, Player, Result, TesterCredit, TierDefinition
 from db.repositories.players import PlayerRepository
 from db.repositories.tester_credits import TesterCreditRepository
 from db.services.session import transaction as db_transaction
-from services.store import transaction
-from storage import load_data
-from utils import month_key
 
 PRAGUE = ZoneInfo("Europe/Prague")
 RESULT_STAT_KINDS = ("ticket", "queue")
@@ -41,16 +44,13 @@ def _tier_display(tier_name: Optional[str], eval_flag: bool) -> Optional[str]:
 async def tester_stats(
     player_id: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> Optional[dict]:
-    """Statistiky jednoho testera (JSON-parity klíče) nebo ``None`` bez dat."""
-    if session_factory is not None:
-        return await _db_tester_stats(session_factory, player_id)
-    stats_db = load_data("testers_stats.json", {})
-    return stats_db.get(str(player_id))
-
-
-async def _db_tester_stats(session_factory, player_id: str) -> Optional[dict]:
+    """Statistiky jednoho testera, nebo ``None`` když nemá žádné testy."""
+    if session_factory is None:
+        raise RuntimeError(
+            "tester_stats potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
+        )
     async with db_transaction(session_factory) as session:
         uid = int(player_id)
         player = await PlayerRepository().get_by_discord_id(session, uid)
@@ -113,27 +113,13 @@ async def _db_tester_stats(session_factory, player_id: str) -> Optional[dict]:
 async def tester_leaderboard(
     period: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> list:
     """[(tester_key, score)] sestupně, jen score > 0; period all|current."""
-    if session_factory is not None:
-        return await _db_tester_leaderboard(session_factory, period)
-
-    stats_db = load_data("testers_stats.json", {})
-    current_month = datetime.now().strftime("%m.%Y")
-    entries: list = []
-    for tester_id, data in stats_db.items():
-        if period == "all":
-            score = data.get("total", 0)
-        else:
-            score = data.get("monthly", {}).get(current_month, 0)
-        if score > 0:
-            entries.append((str(tester_id), score))
-    entries.sort(key=lambda item: item[1], reverse=True)
-    return entries
-
-
-async def _db_tester_leaderboard(session_factory, period: str) -> list:
+    if session_factory is None:
+        raise RuntimeError(
+            "tester_leaderboard potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
+        )
     async with db_transaction(session_factory) as session:
         current_month = datetime.now().strftime("%m.%Y")
         scores: dict[int, int] = {}
@@ -174,66 +160,45 @@ async def credit_tester(
     amount: int,
     month: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Ruční připsání historických testů (/addtest) — JSON i DB režim."""
-    if session_factory is not None:
-        return await _db_credit_tester(session_factory, tester_id, amount, month)
-
-    async def _run(tx):
-        stats_db = tx.get("testers_stats.json", {})
-        stat = stats_db.setdefault(
-            tester_id,
-            {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
+    """Ruční připsání historických testů (/addtest) do ledgeru tester_credits."""
+    if session_factory is None:
+        raise RuntimeError(
+            "credit_tester potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
         )
-        stat["total"] = stat.get("total", 0) + amount
-        stat["monthly"][month] = stat["monthly"].get(month, 0) + amount
-        tx.set("testers_stats.json", stats_db)
+    async def _once(session):
+        player = await PlayerRepository().get_or_create_by_discord_id(
+            session, discord_id=int(tester_id), ign=""
+        )
+        await TesterCreditRepository().credit(
+            session, tester_id=player.id, month=month, amount=amount
+        )
 
-    return await transaction(("testers_stats.json",), _run)
+    try:
+        async with db_transaction(session_factory) as session:
+            await _once(session)
+    except IntegrityError:
+        # Racing /addtest for the same (tester, month): the unique index rejected
+        # the loser, so re-read and credit on top of the winner's row.
+        async with db_transaction(session_factory) as session:
+            await _once(session)
 
 
 async def remove_tester_credit(
     tester_id: str,
     amount: int,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> int:
     """Odečte ``amount`` z aktuálního měsíce i celkového součtu (/removetest).
 
     Vrací nový celkový počet testů testera (pro hlášku bota).
     """
-    if session_factory is not None:
-        return await _db_remove_tester_credit(session_factory, tester_id, amount)
-
-    updated_total = 0
-
-    async def _run(tx):
-        nonlocal updated_total
-        stats_db = tx.get("testers_stats.json", {})
-        stat = stats_db.get(tester_id)
-        if not stat:
-            stat = {
-                "total": 0,
-                "lastTested": "",
-                "kits": {},
-                "tiers": {},
-                "monthly": {},
-                "hourlyLogs": [],
-            }
-            stats_db[tester_id] = stat
-        stat["total"] = max(0, stat.get("total", 0) - amount)
-        stat["monthly"][month_key()] = max(
-            0, stat["monthly"].get(month_key(), 0) - amount
+    if session_factory is None:
+        raise RuntimeError(
+            "remove_tester_credit potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
         )
-        updated_total = stat["total"]
-        tx.set("testers_stats.json", stats_db)
-
-    await transaction(("testers_stats.json",), _run)
-    return updated_total
-
-
-async def _db_remove_tester_credit(session_factory, tester_id: str, amount: int) -> int:
     async with db_transaction(session_factory) as session:
         player = await PlayerRepository().get_by_discord_id(session, int(tester_id))
         if player is None:
@@ -269,20 +234,3 @@ async def _count_stat_results(session, player_id: int) -> int:
         )
     )
     return int(result.scalar_one())
-
-
-async def _db_credit_tester(session_factory, tester_id: str, amount: int, month: str) -> None:
-    async def _once(session):
-        player = await PlayerRepository().get_or_create_by_discord_id(
-            session, discord_id=int(tester_id), ign=""
-        )
-        await TesterCreditRepository().credit(
-            session, tester_id=player.id, month=month, amount=amount
-        )
-
-    try:
-        async with db_transaction(session_factory) as session:
-            await _once(session)
-    except IntegrityError:
-        async with db_transaction(session_factory) as session:
-            await _once(session)

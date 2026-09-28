@@ -15,9 +15,9 @@ from sqlalchemy import (
     BigInteger,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     Text,
-    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -39,7 +39,13 @@ class TesterCredit(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "tester_id", "month", name="uq_tester_credit_month"
-        ),
+        # Declared as a unique *Index*, not a UniqueConstraint, because that is
+        # what migration c4d5e6f7a8b9 actually created. Declaring a
+        # UniqueConstraint here made every Alembic autogenerate run emit a
+        # phantom `remove_index` + `add_constraint` pair for a table that had
+        # not changed. The database is the correct side here: a unique index
+        # enforces the same thing, and the deployed schema already has it, so
+        # the model is what needed fixing (mirroring the same reasoning as
+        # `db/models/ops.py:Cooldown`).
+        Index("uq_tester_credit_month", "tester_id", "month", unique=True),
     )

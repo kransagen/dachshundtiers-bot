@@ -1,10 +1,13 @@
 """Dual-mode testy views.py (Phase F #10c).
 
 Ověřují, že interaktivní komponenty (JoinModal, QueueView, HT3PanelView,
-HT3Modal, PullChannelSelectView) předávají ``session_factory`` do služeb
-a že JSON pre-checky (closed fronta / cooldown / duplicita) běží přes
-duální služby (queue_state / get_cooldowns / list_queue_entries) místo
-přímého čtení JSON souborů.
+HT3Modal) předávají ``session_factory`` do služeb a že JSON pre-checky
+(closed fronta / cooldown / duplicita) běží přes duální služby
+(queue_state / get_cooldowns / list_queue_entries) místo přímého čtení JSON
+souborů.
+
+Pull už tester roomku nevolí — patří kitu (`kit_tester_rooms`), takže
+``QueueView.on_pull`` jde přes ``pull_for_kit`` stejně jako ``/queue pull``.
 
 Diskutovaný MagicMock trap: u ``mock.MagicMock()`` interakce je
 ``interaction.client`` auto-MagicMock (truthy) => ``_session_factory`` by
@@ -17,7 +20,6 @@ import unittest
 from unittest import mock
 
 from views import (
-    HT3Modal,
     HT3PanelView,
     JoinModal,
     QueueView,
@@ -162,13 +164,40 @@ class QueueViewTests(unittest.TestCase):
 
     def test_pull_empty_queue(self):
         import asyncio
+        from services.queue_service import PULL_EMPTY, PullResult
+
         inter = _interaction()
         inter.user = mock.MagicMock()
         with mock.patch("views.has_tester_role", return_value=True), \
-             mock.patch("views.list_queue_entries", new=mock.AsyncMock(return_value=[])):
+             mock.patch(
+                 "views.pull_for_kit",
+                 new=mock.AsyncMock(return_value=PullResult(status=PULL_EMPTY)),
+             ):
             asyncio.run(self.view.on_pull(inter))
         inter.response.send_message.assert_called_once()
         self.assertIn("prázdná", inter.response.send_message.call_args.args[0])
+
+    def test_pull_without_tester_room_keeps_player_in_queue(self):
+        """No tester room -> tell the tester; never silently drop the player.
+
+        The pull and the room lookup are one transaction, so a missing
+        mapping means the queue entry is still ``waiting``.
+        """
+        import asyncio
+        from services.queue_service import PULL_NO_ROOM, PullResult
+
+        inter = _interaction()
+        inter.user = mock.MagicMock()
+        grant = mock.AsyncMock()
+        with mock.patch("views.has_tester_role", return_value=True), \
+             mock.patch(
+                 "views.pull_for_kit",
+                 new=mock.AsyncMock(return_value=PullResult(status=PULL_NO_ROOM)),
+             ), \
+             mock.patch("views.grant_pull_access", new=grant):
+            asyncio.run(self.view.on_pull(inter))
+        grant.assert_not_awaited()
+        self.assertIn("mktesterroom", inter.response.send_message.call_args.args[0])
 
 
 class HT3PanelViewTests(unittest.TestCase):
@@ -194,41 +223,130 @@ class HT3PanelViewTests(unittest.TestCase):
         inter.response.send_message.assert_called_once()
         self.assertIn("cooldown", inter.response.send_message.call_args.args[0])
 
-    def test_on_select_no_cooldown_opens_modal(self):
+    def test_on_select_opens_ticket_without_modal(self):
+        """Panel vybere jen kit a rovnou založí ticket – žádný modál, žádné psaní IGN/tieru."""
         import asyncio
+        from services.ht3_tickets import HT3Context
+
         inter = _interaction()
+        inter.guild = mock.MagicMock()
+        inter.followup.send = mock.AsyncMock()
         inter.data = {"values": ["AnchorPvP"]}
         view = HT3PanelView(kits=["AnchorPvP"])
+        opened = mock.AsyncMock(
+            return_value=mock.MagicMock(status="opened", channel_id=5555, message=None)
+        )
+        context = HT3Context(
+            ok=True,
+            discord_id=99,
+            ign="AliceMC",
+            kit="AnchorPvP",
+            current_tier="LT3",
+            target_tier="HT3",
+            eval_ok=True,
+        )
         with mock.patch("views.get_cooldowns", new=mock.AsyncMock(
             return_value={"waitlist_ms": None, "ht3": {}}
-        )), mock.patch("views.HT3Modal") as modal:
+        )), mock.patch(
+            "views.resolve_ht3_context", new=mock.AsyncMock(return_value=context)
+        ) as rhc, mock.patch("views._open_ht3_ticket", new=opened):
             asyncio.run(view.on_select(inter))
-        modal.assert_called_once_with("AnchorPvP")
-        inter.response.send_modal.assert_called_once()
+
+        inter.response.send_modal.assert_not_called()
+        rhc.assert_awaited_once()
+        self.assertEqual(rhc.await_args.args[1], "AnchorPvP")
+        opened.assert_awaited_once()
+        self.assertEqual(opened.await_args.kwargs["ign"], "AliceMC")
+        self.assertEqual(opened.await_args.kwargs["target_tier"], "HT3")
+        inter.followup.send.assert_awaited_once()
+        self.assertIn("5555", inter.followup.send.await_args.args[0])
+
+    def test_on_select_refuses_without_minecraft_link(self):
+        import asyncio
+        from services.ht3_tickets import HT3Context
+
+        inter = _interaction()
+        inter.guild = mock.MagicMock()
+        inter.followup.send = mock.AsyncMock()
+        inter.data = {"values": ["AnchorPvP"]}
+        view = HT3PanelView(kits=["AnchorPvP"])
+        opened = mock.AsyncMock()
+        with mock.patch("views.get_cooldowns", new=mock.AsyncMock(
+            return_value={"waitlist_ms": None, "ht3": {}}
+        )), mock.patch("views.resolve_ht3_context", new=mock.AsyncMock(
+            return_value=HT3Context(ok=False, reason="no_minecraft_account")
+        )), mock.patch("views._open_ht3_ticket", new=opened):
+            asyncio.run(view.on_select(inter))
+
+        opened.assert_not_awaited()
+        self.assertIn("/link", inter.followup.send.await_args.args[0])
+
+    def test_on_select_refuses_without_tier(self):
+        import asyncio
+        from services.ht3_tickets import HT3Context
+
+        inter = _interaction()
+        inter.guild = mock.MagicMock()
+        inter.followup.send = mock.AsyncMock()
+        inter.data = {"values": ["AnchorPvP"]}
+        view = HT3PanelView(kits=["AnchorPvP"])
+        opened = mock.AsyncMock()
+        with mock.patch("views.get_cooldowns", new=mock.AsyncMock(
+            return_value={"waitlist_ms": None, "ht3": {}}
+        )), mock.patch("views.resolve_ht3_context", new=mock.AsyncMock(
+            return_value=HT3Context(ok=False, reason="no_current_tier")
+        )), mock.patch("views._open_ht3_ticket", new=opened):
+            asyncio.run(view.on_select(inter))
+
+        opened.assert_not_awaited()
+        self.assertIn("/result", inter.followup.send.await_args.args[0])
+
+    def test_session_factory_propagated_to_context(self):
+        import asyncio
+        from services.ht3_tickets import HT3Context
+
+        factory = object()
+        inter = _interaction(db_factory=factory)
+        inter.guild = mock.MagicMock()
+        inter.followup.send = mock.AsyncMock()
+        inter.data = {"values": ["AnchorPvP"]}
+        view = HT3PanelView(kits=["AnchorPvP"])
+        rhc = mock.AsyncMock(
+            return_value=HT3Context(ok=False, reason="no_current_tier")
+        )
+        with mock.patch("views.get_cooldowns", new=mock.AsyncMock(
+            return_value={"waitlist_ms": None, "ht3": {}}
+        )), mock.patch("views.resolve_ht3_context", new=rhc):
+            asyncio.run(view.on_select(inter))
+
+        self.assertIs(rhc.await_args.kwargs["session_factory"], factory)
 
 
-class HT3ModalTests(unittest.TestCase):
-    """HT3Modal.on_submit – SF propagace do služeb (player_tier, has_eval,
-    find_open_ticket, create_ticket, set_panel_message, log_ticket_event)."""
+class OpenHT3TicketTests(unittest.TestCase):
+    """``_open_ht3_ticket`` – jediné místo, kde se HT3 ticket opravdu založí.
+
+    Pokrytá je i nešťastná větev: když ``create_ticket`` řekne „duplicate",
+    právě vytvořený kanál se smaže, aby nezůstal sirotský pokoj bez ticketu.
+    """
 
     def setUp(self):
-        self.modal = HT3Modal("AnchorPvP")
-        self.modal.ign_input = mock.MagicMock(value="AliceMC")
-        self.modal.tier_input = mock.MagicMock(value="HT3")
+        from views import _open_ht3_ticket
 
-    def _channel(self):
+        self._open = _open_ht3_ticket
+
+    def _interaction(self, db_factory=None):
+        inter = _interaction(db_factory=db_factory)
         channel = mock.MagicMock()
         channel.id = 2001
         channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=3001))
         channel.delete = mock.AsyncMock()
-        return channel
-
-    def _guild(self):
         guild = mock.MagicMock()
         guild.get_member.return_value = mock.MagicMock()
         guild.get_channel.return_value = mock.MagicMock(id=4001)
-        guild.create_text_channel = mock.AsyncMock(return_value=self._channel())
-        return guild
+        guild.create_text_channel = mock.AsyncMock(return_value=channel)
+        inter.guild = guild
+        inter.followup.send = mock.AsyncMock()
+        return inter, channel
 
     def _ticket(self):
         return {
@@ -237,20 +355,24 @@ class HT3ModalTests(unittest.TestCase):
             "currentTier": "LT3", "eval": True, "claimerId": None, "members": [],
         }
 
-    def test_sf_propagated_to_all_services(self):
+    def _call(self, inter, **overrides):
         import asyncio
-        factory = object()
-        inter = _interaction(db_factory=factory)
-        inter.guild = self._guild()
-        inter.followup.send = mock.AsyncMock()
 
-        with mock.patch("views.player_tier", new=mock.AsyncMock(return_value="LT3")) as pt, \
-             mock.patch("views.has_eval", new=mock.AsyncMock(return_value=True)) as he, \
-             mock.patch("views.tier_allows_tickets", return_value=True), \
-             mock.patch("views.effective_ticket_tier", return_value="LT3E"), \
-             mock.patch("views.next_ticket_tier", return_value="HT3"), \
-             mock.patch("views.find_open_ticket", new=mock.AsyncMock(return_value=None)) as fot, \
-             mock.patch("views.get_ht3_ticket_category", return_value=4001), \
+        kwargs = dict(
+            ign="AliceMC",
+            kit="AnchorPvP",
+            target_tier="HT3",
+            current_tier="LT3",
+            eval_ok=True,
+            owner_id="99",
+            session_factory=overrides.pop("session_factory", None),
+        )
+        kwargs.update(overrides)
+        return asyncio.run(self._open(inter, **kwargs))
+
+    def test_creates_channel_and_persists_ticket(self):
+        inter, channel = self._interaction()
+        with mock.patch("views.get_ht3_ticket_category", return_value=4001), \
              mock.patch("views._apply_ticket_overwrites", return_value={}), \
              mock.patch("views.create_ticket", new=mock.AsyncMock(
                  return_value={"result": "created", "ticket": self._ticket()}
@@ -259,36 +381,83 @@ class HT3ModalTests(unittest.TestCase):
              mock.patch("views.HTTicketView"), \
              mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm, \
              mock.patch("views.log_ticket_event", new=mock.AsyncMock()) as lte:
-            asyncio.run(self.modal.on_submit(inter))
+            result = self._call(inter)
 
-        for svc in (pt, he, fot, ct, spm, lte):
-            self.assertEqual(svc.call_args.kwargs["session_factory"], factory,
-                             f"{svc._mock_name} nedostal session_factory")
+        self.assertEqual(result.status, "opened")
+        self.assertEqual(result.channel_id, 2001)
+        channel.delete.assert_not_awaited()
+        self.assertEqual(ct.await_args.kwargs["channel_id"], 2001)
+        self.assertEqual(ct.await_args.kwargs["target_tier"], "HT3")
+        spm.assert_awaited_once()
+        lte.assert_awaited_once()
 
-    def test_json_mode_sf_is_none(self):
-        import asyncio
-        inter = _interaction()
-        inter.guild = self._guild()
-        inter.followup.send = mock.AsyncMock()
-
-        with mock.patch("views.player_tier", new=mock.AsyncMock(return_value="LT3")) as pt, \
-             mock.patch("views.has_eval", new=mock.AsyncMock(return_value=True)), \
-             mock.patch("views.tier_allows_tickets", return_value=True), \
-             mock.patch("views.effective_ticket_tier", return_value="LT3E"), \
-             mock.patch("views.next_ticket_tier", return_value="HT3"), \
-             mock.patch("views.find_open_ticket", new=mock.AsyncMock(return_value=None)), \
-             mock.patch("views.get_ht3_ticket_category", return_value=4001), \
+    def test_session_factory_propagated_to_services(self):
+        factory = object()
+        inter, _ = self._interaction(db_factory=factory)
+        with mock.patch("views.get_ht3_ticket_category", return_value=4001), \
              mock.patch("views._apply_ticket_overwrites", return_value={}), \
              mock.patch("views.create_ticket", new=mock.AsyncMock(
                  return_value={"result": "created", "ticket": self._ticket()}
+             )) as ct, \
+             mock.patch("views.ticket_embed", return_value=mock.MagicMock()), \
+             mock.patch("views.HTTicketView"), \
+             mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm, \
+             mock.patch("views.log_ticket_event", new=mock.AsyncMock()) as lte:
+            self._call(inter, session_factory=factory)
+
+        for svc in (ct, spm, lte):
+            self.assertIs(
+                svc.await_args.kwargs["session_factory"], factory,
+                f"{svc._mock_name} nedostal session_factory",
+            )
+
+    def test_duplicate_deletes_the_orphan_channel(self):
+        inter, channel = self._interaction()
+        existing = dict(self._ticket(), id="9999")
+        with mock.patch("views.get_ht3_ticket_category", return_value=4001), \
+             mock.patch("views._apply_ticket_overwrites", return_value={}), \
+             mock.patch("views.create_ticket", new=mock.AsyncMock(
+                 return_value={"result": "duplicate", "ticket": existing}
              )), \
              mock.patch("views.ticket_embed", return_value=mock.MagicMock()), \
              mock.patch("views.HTTicketView"), \
-             mock.patch("views.set_panel_message", new=mock.AsyncMock()), \
-             mock.patch("views.log_ticket_event", new=mock.AsyncMock()):
-            asyncio.run(self.modal.on_submit(inter))
+             mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm:
+            result = self._call(inter)
 
-        self.assertEqual(pt.call_args.kwargs["session_factory"], None)
+        self.assertEqual(result.status, "duplicate")
+        self.assertIsNone(result.channel_id)
+        channel.delete.assert_awaited_once()
+        spm.assert_not_awaited()
+        self.assertIn("9999", result.message)
+
+    def test_missing_category_creates_nothing(self):
+        inter, _ = self._interaction()
+        inter.guild.get_channel.return_value = None
+        inter.guild.fetch_channel = mock.AsyncMock(return_value=None)
+        created = mock.AsyncMock()
+        with mock.patch("views.get_ht3_ticket_category", return_value=4001), \
+             mock.patch("views.create_ticket", new=created):
+            result = self._call(inter)
+
+        self.assertEqual(result.status, "no_category")
+        inter.guild.create_text_channel.assert_not_awaited()
+        created.assert_not_awaited()
+
+    def test_identity_conflict_is_reported(self):
+        inter, channel = self._interaction()
+        with mock.patch("views.get_ht3_ticket_category", return_value=4001), \
+             mock.patch("views._apply_ticket_overwrites", return_value={}), \
+             mock.patch("views.create_ticket", new=mock.AsyncMock(
+                 return_value={
+                     "result": "identity_conflict",
+                     "message": "IGN patří jinému hráči",
+                 }
+             )):
+            result = self._call(inter)
+
+        self.assertEqual(result.status, "failed")
+        channel.delete.assert_awaited_once()
+        self.assertIn("jinému hráči", result.message)
 
 
 if __name__ == "__main__":

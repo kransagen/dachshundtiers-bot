@@ -634,6 +634,119 @@ async def test_db_execute_unchanged_skips_roles_and_web(session_factory, clean_d
     assert applied == []
 
 
+async def test_db_execute_web_failure_is_partial_and_db_safe(session_factory, clean_db):
+    """Best effort webu: selhání push → PARTIAL, kanonická DB změna zůstává."""
+    await _seed_player(session_factory)
+    pushed = {}
+
+    async def push_web(canonical):
+        pushed["canonical"] = canonical
+        return {"ok": False, "message": "GitHub 500"}
+
+    report = await edituser.execute_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "ign", "new_value": "MenduTwo"},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+        push_web=push_web,
+    )
+    assert report["status"] == edituser.STATUS_PARTIAL
+    assert report["web"]["ok"] is False
+    assert "GitHub 500" in report["web"]["errors"]
+    assert pushed["canonical"], "web dostal canonical z export_players"
+    # kanonická změna se nikdy neztratí kvůli webu
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 111111111111111111)
+        assert player.ign == "MenduTwo"
+    assert len(await _audit_entries(session_factory)) == 1
+
+
+async def test_db_execute_web_exception_is_partial(session_factory, clean_db):
+    """Vyhozená výjimka z push_web → PARTIAL, DB změna zůstává."""
+    await _seed_player(session_factory)
+
+    async def push_web(_canonical):
+        raise RuntimeError("network down")
+
+    report = await edituser.execute_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "ign", "new_value": "MenduTwo"},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+        push_web=push_web,
+    )
+    assert report["status"] == edituser.STATUS_PARTIAL
+    assert any("network down" in e for e in report["web"]["errors"])
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 111111111111111111)
+        assert player.ign == "MenduTwo"
+
+
+async def test_db_execute_discord_api_failure_is_partial_but_db_changed(session_factory, clean_db):
+    """Selhání Discord rolí NIKDY nevrací DB změnu – tomu je jen PARTIAL."""
+    await _seed_player(session_factory)
+
+    async def apply_roles(_actions):
+        return [{"op": "add", "roleId": "101", "ok": False, "error": "Forbidden"}]
+
+    report = await edituser.execute_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "tier", "kit": "molepvp", "tier": "HT3"},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+        role_context={
+            "member": {"id": 111111111111111111, "roles": []},
+            "roles_map": {"molepvp": {"HT3": 777001}},
+            "kit_display": {"molepvp": "MolePVP"},
+        },
+        apply_roles=apply_roles,
+    )
+    assert report["status"] == edituser.STATUS_PARTIAL
+    assert "Forbidden" in report["roles"]["errors"]
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 111111111111111111)
+        shape = await player_export.build_player_shape(session, player)
+    assert shape["modes"].get("MolePVP") == "HT3"
+
+
+async def test_db_execute_role_exception_is_partial(session_factory, clean_db):
+    await _seed_player(session_factory)
+
+    async def apply_roles(_actions):
+        raise RuntimeError("Discord API down")
+
+    report = await edituser.execute_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "tier", "kit": "molepvp", "tier": "HT3"},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+        role_context={
+            "member": {"id": 111111111111111111, "roles": []},
+            "roles_map": {"molepvp": {"HT3": 777001}},
+            "kit_display": {"molepvp": "MolePVP"},
+        },
+        apply_roles=apply_roles,
+    )
+    assert report["status"] == edituser.STATUS_PARTIAL
+    assert any("Discord API down" in e for e in report["roles"]["errors"])
+
+
 # ---------------------------------------------------------------------------
 # player_export – canonical shapes (Krok B)
 # ---------------------------------------------------------------------------

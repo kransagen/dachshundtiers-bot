@@ -1,263 +1,113 @@
-"""Testy servisní logiky front services/queue_service.py (bez discord.py).
+"""services/queue_service.py už NEMÁ JSON režim – výhradně PostgreSQL.
 
-Na rozdíl od produkce běží testy v izolovaném ``data`` adresáři (tempdir),
-ať nesahají na reálná data bota.
+Bývalé JSON testy (active_queues.json / queue.json / pulled_players.json /
+cooldowns.json přes ``services.store`` a tempdir ``storage.DATA_DIR``) jsou
+pryč společně s JSON větvemi. Produkční chování nad PostgreSQL je pokryté:
+
+  - ``tests/test_services_queue_db.py``               – join/leave/pop/remove,
+    cooldown, duplicita, pulled roundtrip, preset roomky,
+  - ``tests/test_services_queue_lifecycle_db.py``     – open/close, testeri,
+    removeq, /skip, panel.
+
+Tenhle soubor teď hlídá jen to, že se JSON režim nevrátil: žádný fallback na
+soubor, ``session_factory`` je povinný a čisté JSON helpery
+(``cooldown_remaining`` / ``already_in_queue`` / ``make_entry`` /
+``move_to_queue_end``) neexistují.
 """
 
-import asyncio
-import tempfile
-import time
-import unittest
-from unittest import mock
+import inspect
+from pathlib import Path
 
-import storage
+import pytest
+
 from services import queue_service
 
 COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000  # 4 dny, stejně jako v config
 
 
-def _ms():
-    return time.time() * 1000
+def _ms() -> int:
+    import time
+
+    return int(time.time() * 1000)
 
 
-class QueueServiceTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
+@pytest.mark.asyncio
+async def test_session_factory_is_required(tmp_path, monkeypatch):
+    """Všechny veřejné operace vyžadují ``session_factory`` (žádný default)."""
+    monkeypatch.setattr("storage.DATA_DIR", str(tmp_path))
+    cases = (
+        lambda: queue_service.join_queue(
+            "1", "alice", "AliceMC", "AnchorPvP",
+            joined_at_ms=_ms(), cooldown_ms=COOLDOWN_MS,
+        ),
+        lambda: queue_service.leave_queue("1", "AnchorPvP"),
+        lambda: queue_service.pop_for_kit("anchorpvp"),
+        lambda: queue_service.remove_by_player_id("1"),
+        lambda: queue_service.preset_player_room({"id": "1"}, 123),
+        lambda: queue_service.save_pulled_player({"id": "1"}, 123),
+        lambda: queue_service.remove_pulled_player("1"),
+        lambda: queue_service.open_queue("anchorpvp", "AnchorPvP", "1", "A"),
+        lambda: queue_service.set_queue_panel("anchorpvp", 1, 2),
+        lambda: queue_service.close_queue("anchorpvp"),
+        lambda: queue_service.queue_state("anchorpvp"),
+        lambda: queue_service.active_queues(),
+        lambda: queue_service.list_queue_entries("anchorpvp"),
+        lambda: queue_service.queue_snapshot(),
+        lambda: queue_service.peek_first_player(),
+        lambda: queue_service.join_queue_tester("anchorpvp", "1"),
+        lambda: queue_service.leave_queue_tester("anchorpvp", "1"),
+        lambda: queue_service.register_global_tester("1", "A"),
+        lambda: queue_service.removeq("1"),
+        lambda: queue_service.skip_player("1"),
+        lambda: queue_service.panel_message_id("anchorpvp"),
+        lambda: queue_service.set_tester_room("anchorpvp", 123),
+        lambda: queue_service.resolve_tester_room("anchorpvp"),
+        lambda: queue_service.clear_tester_room("anchorpvp"),
+        lambda: queue_service.resolve_kit("anchorpvp"),
+        lambda: queue_service.pull_for_kit("anchorpvp"),
+    )
+    for call in cases:
+        with pytest.raises(TypeError):
+            await call()
 
-        storage.save_data(
-            "active_queues.json",
-            {"anchorpvp": {"name": "AnchorPvP", "opener": "99", "testers": ["99"]}},
-        )
-        storage.save_data("queue.json", [])
-        storage.save_data("cooldowns.json", {})
-
-    async def _join(self, uid, name="alice", ign="AliceMC", kit="AnchorPvP", at=None):
-        return await queue_service.join_queue(
-            uid,
-            name,
-            ign,
-            kit,
-            joined_at_ms=at if at is not None else _ms(),
-            cooldown_ms=COOLDOWN_MS,
-        )
-
-    def test_join_success(self):
-        async def main():
-            result = await self._join("1")
-            self.assertEqual(result["result"], "joined")
-
-            queue = storage.load_data("queue.json")
-            self.assertEqual(len(queue), 1)
-            entry = queue[0]
-            self.assertEqual(entry["id"], "1")
-            self.assertEqual(entry["kit"], "AnchorPvP")
-            self.assertEqual(entry["username"], "alice")
-
-        asyncio.run(main())
-
-    def test_join_closed_queue(self):
-        async def main():
-            storage.save_data("active_queues.json", {})
-            result = await self._join("1")
-            self.assertEqual(result["result"], "closed")
-            self.assertEqual(storage.load_data("queue.json"), [])
-
-        asyncio.run(main())
-
-    def test_join_cooldown_blocks(self):
-        async def main():
-            now = _ms()
-            storage.save_data("cooldowns.json", {"1": now})
-            result = await self._join("1", at=now + 1000)
-            self.assertEqual(result["result"], "cooldown")
-            self.assertGreater(result["remaining"], 0)
-            self.assertEqual(storage.load_data("queue.json"), [])
-
-        asyncio.run(main())
-
-    def test_join_after_cooldown_passes(self):
-        async def main():
-            now = _ms()
-            storage.save_data("cooldowns.json", {"1": now})
-            result = await self._join("1", at=now + COOLDOWN_MS + 1)
-            self.assertEqual(result["result"], "joined")
-
-        asyncio.run(main())
-
-    def test_join_duplicate_blocked(self):
-        async def main():
-            storage.save_data(
-                "queue.json",
-                [queue_service.make_entry("1", "alice", "AliceMC", "AnchorPvP", _ms())],
-            )
-            result = await self._join("1")
-            self.assertEqual(result["result"], "duplicate")
-            self.assertEqual(len(storage.load_data("queue.json")), 1)
-
-        asyncio.run(main())
-
-    def test_concurrent_joins_same_user_no_duplicate(self):
-        """Dvě souběžné interakce stejného hráče → jen jeden záznam."""
-
-        async def main():
-            results = await asyncio.gather(self._join("1"), self._join("1"))
-            statuses = sorted(r["result"] for r in results)
-            self.assertEqual(statuses, ["duplicate", "joined"])
-            self.assertEqual(len(storage.load_data("queue.json")), 1)
-
-        asyncio.run(main())
-
-    def test_concurrent_joins_two_users_both_land(self):
-        """Dvě souběžné interakce dvou hráčů → žádný ztracený zápis."""
-
-        async def main():
-            async def join(uid, name, ign):
-                return await queue_service.join_queue(
-                    uid, name, ign, "AnchorPvP",
-                    joined_at_ms=_ms(), cooldown_ms=COOLDOWN_MS,
-                )
-
-            results = await asyncio.gather(join("1", "a", "A"), join("2", "b", "B"))
-            self.assertEqual(sorted(r["result"] for r in results), ["joined", "joined"])
-            self.assertEqual(len(storage.load_data("queue.json")), 2)
-
-        asyncio.run(main())
-
-    def test_leave_queue(self):
-        async def main():
-            storage.save_data(
-                "queue.json",
-                [
-                    queue_service.make_entry("1", "a", "A", "AnchorPvP", _ms()),
-                    queue_service.make_entry("2", "b", "B", "MolePVP", _ms()),
-                ],
-            )
-            self.assertTrue(await queue_service.leave_queue("1", "AnchorPvP"))
-            queue = storage.load_data("queue.json")
-            self.assertEqual(len(queue), 1)
-            self.assertEqual(queue[0]["id"], "2")
-
-            # podruhé už není – a cizí kit se nesahá
-            self.assertFalse(await queue_service.leave_queue("1", "AnchorPvP"))
-            self.assertEqual(len(storage.load_data("queue.json")), 1)
-
-        asyncio.run(main())
-
-    def test_pop_for_kit_pops_first_of_kit(self):
-        async def main():
-            storage.save_data(
-                "queue.json",
-                [
-                    queue_service.make_entry("1", "a", "A", "MolePVP", _ms()),
-                    queue_service.make_entry("2", "b", "B", "AnchorPvP", _ms()),
-                    queue_service.make_entry("3", "c", "C", "AnchorPvP", _ms()),
-                ],
-            )
-            first = await queue_service.pop_for_kit("anchorpvp")
-            self.assertEqual(first["id"], "2")
-            self.assertEqual(
-                [p["id"] for p in storage.load_data("queue.json")], ["1", "3"]
-            )
-
-            second = await queue_service.pop_for_kit("anchorpvp")
-            self.assertEqual(second["id"], "3")
-            self.assertEqual(
-                [p["id"] for p in storage.load_data("queue.json")], ["1"]
-            )
-
-            none = await queue_service.pop_for_kit("anchorpvp")
-            self.assertIsNone(none)
-
-        asyncio.run(main())
-
-    def test_remove_by_player_id(self):
-        async def main():
-            storage.save_data(
-                "queue.json",
-                [queue_service.make_entry("1", "a", "A", "AnchorPvP", _ms())],
-            )
-            self.assertTrue(await queue_service.remove_by_player_id("1"))
-            self.assertFalse(await queue_service.remove_by_player_id("1"))
-            self.assertEqual(storage.load_data("queue.json"), [])
-
-        asyncio.run(main())
-
-    def test_pulled_player_roundtrip(self):
-        async def main():
-            player = queue_service.make_entry("7", "g", "Guy", "AnchorPvP", _ms())
-            await queue_service.save_pulled_player(player, 123456)
-            pulled = storage.load_data("pulled_players.json", {})
-            self.assertIn("7", pulled)
-            self.assertEqual(pulled["7"]["channel"], "123456")
-            self.assertEqual(pulled["7"]["player"]["ign"], "Guy")
-
-            self.assertTrue(await queue_service.remove_pulled_player("7"))
-            self.assertEqual(storage.load_data("pulled_players.json", {}), {})
-
-        asyncio.run(main())
-
-    def test_preset_player_room(self):
-        async def main():
-            await queue_service.preset_player_room(
-                {
-                    "id": "8",
-                    "username": "h",
-                    "ign": "Hank",
-                    "kit": "",
-                    "joinedAt": 0,
-                },
-                999,
-            )
-            pulled = storage.load_data("pulled_players.json", {})
-            self.assertEqual(pulled["8"]["channel"], "999")
-            self.assertEqual(pulled["8"]["player"]["username"], "h")
-
-        asyncio.run(main())
+    # V tempdir nevznikla žádná JSON data (fronta se nikam file-uvn nepsala).
+    assert list(Path(tmp_path).iterdir()) == []
 
 
-class CooldownRemainingTests(unittest.TestCase):
-    """cooldowns.json ukládá čas POSLEDNÍHO testu (ne expiry).
+@pytest.mark.asyncio
+async def test_no_json_mode_anymore(tmp_path, monkeypatch):
+    """Žádné JSON soubory front se nečtou ani nepíšou – ani po primingu."""
+    import storage
 
-    Semantika je sdílená join flow (/queue) i /cooldown zobrazením –
-    „kolik zbývá" = last_test + cooldown_ms - now, ne last_test - now.
-    """
+    monkeypatch.setattr(storage, "DATA_DIR", str(tmp_path))
+    for name in ("active_queues.json", "queue.json", "cooldowns.json",
+                 "pulled_players.json", "queue_messages.json", "testers.json"):
+        (tmp_path / name).write_text("{}" if name.endswith(".json") else "[]")
 
-    COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
-
-    def test_remaining_inside_window(self):
-        now = 1_000_000
-        remaining = queue_service.cooldown_remaining(
-            {"1": now - 60_000}, "1", now, self.COOLDOWN_MS
-        )
-        self.assertEqual(remaining, self.COOLDOWN_MS - 60_000)
-
-    def test_expired_returns_none(self):
-        now = 1_000_000
-        remaining = queue_service.cooldown_remaining(
-            # „starý" timestamp – test proběhl dávno, cooldown vypršel
-            {"1": now - self.COOLDOWN_MS - 1},
-            "1",
-            now,
-            self.COOLDOWN_MS,
-        )
-        self.assertIsNone(remaining)
-
-    def test_no_record_returns_none(self):
-        now = 1_000_000
-        self.assertIsNone(
-            queue_service.cooldown_remaining({}, "1", now, self.COOLDOWN_MS)
+    with pytest.raises(TypeError):
+        await queue_service.join_queue(
+            "1", "alice", "AliceMC", "AnchorPvP",
+            joined_at_ms=_ms(), cooldown_ms=COOLDOWN_MS,
         )
 
-    def test_other_player_unaffected(self):
-        now = 1_000_000
-        remaining = queue_service.cooldown_remaining(
-            {"2": now - 60_000}, "1", now, self.COOLDOWN_MS
-        )
-        self.assertIsNone(remaining)
+    # Soubory se ani nepohnuly.
+    assert (tmp_path / "active_queues.json").read_text() == "{}"
+    assert (tmp_path / "queue.json").read_text() == "{}"
+    assert (tmp_path / "cooldowns.json").read_text() == "{}"
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_legacy_json_helpers_and_branches_removed():
+    """Zdrojový regresní test: JSON cesta z queue_service.py je pryč."""
+    src = inspect.getsource(queue_service)
+    assert "if session_factory is not None:" not in src
+    assert "cooldown_remaining" not in src
+    assert "already_in_queue" not in src
+    assert "make_entry" not in src
+    assert "move_to_queue_end" not in src
+    assert "from services.store import transaction" not in src
+    # Žádné čtení/zápis json souborů front v produkčním kódu (docstring se
+    # o nich zmiňuje jen v minulém čase).
+    assert "load_data(" not in src
+    assert "save_data(" not in src
+    assert "tx.get(" not in src
+    assert "tx.set(" not in src

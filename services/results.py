@@ -1,4 +1,4 @@
-"""HT výsledky – čistá logika + transakční stav (bez discord.py).
+"""HT výsledky – čistá logika + PostgreSQL (bez discord.py).
 
 „Unified HT result system": výsledek evaluace (z /result) se zapisuje SEM –
 ať jde o HT3+ ticket, nebo klasický queue výsledek. Tady je jediný zdroj
@@ -10,7 +10,8 @@ Výsledek je propojený s:
   - evaluátorem (evaluatorId / evaluatorName),
   - ticketem (ticketId = ID kanálu HT ticketu; None pro queue výsledky),
   - časem (timestamp + date),
-  - předchozím tierem (previousTier – hodnota z players.json v čase zápisu),
+  - předchozím tierem (previousTier – hodnota z `player_current_tiers`, tj.
+    zrcadla potvrzeného Discordu, v okamžiku zápisu),
   - novým tierem (newTier),
   - poznámkami (notes).
 
@@ -20,12 +21,23 @@ Vlastnosti:
   - idempotence: jeden HT ticket = maximálně jeden výsledek. Opakované
     odeslání nic nepřepíše a vrátí stejný uložený záznam,
   - ochrana před duplicitami: queue výsledek se nezapíše, dokud má hráč
-    aktivní cooldown (4 dny),
-  - historie se nikdy nemaže – data/ht_results.json je append-only
-    (klíč = ticketId / synthetic queue-id, hodnoty jsou neměnné záznamy),
-  - potvrzení výsledku atomicky aktualizuje kanonickou databázi hráčů
-    (data/players.json) a zavírá HT ticket včetně HT3+ cooldownu
-    (HT3_COOLDOWN_MS) a zápisu do logu ticketu.
+    aktivní cooldown (4 dny) PRO DANÝ KIT,
+  - historie se nikdy nemaže – tabulka `results` je append-only (jedna větev
+    na ticket / queue / ht_fight),
+  - potvrzení výsledku atomicky založí řádek do `results`, nastaví waitlist
+    cooldown a uzavře HT ticket včetně HT3+ cooldownu a zápisu do logu
+    ticketu – v jedné transakci.
+
+DRUHÝ REŽIM TU UŽ NENÍ. ``players.json`` / ``ht_results.json`` /
+``cooldowns.json`` se nečtou ani nezapisují; každá funkce vyžaduje
+``session_factory`` a bez něj odmítne. Dvojí zdroj pravdy by se tiš
+rozcházel – například „duplicitní" queue výsledek by se v jednom režimu našel
+a ve druhém ne, takže tester by dostal jinou hlášku podle toho, zda bot
+viděl databázi.
+
+Návratové dicty mají historicky JSON-ish tvar (``playerId``, ``newTier`` …),
+protože je čtou cogy a view modaly. Je to jen projekce z DB řádku
+(``_db_result_to_dict``), ne formát, v jakém je data uložená.
 
 Žádná závislost na discord.py ani github_sync → snadné testy.
 """
@@ -33,6 +45,7 @@ Vlastnosti:
 import logging
 import time
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db.models import Result
@@ -40,6 +53,7 @@ from db.repositories.cooldowns import COOLDOWN_HT3, COOLDOWN_WAITLIST, CooldownR
 from db.repositories.kits import KitRepository, TierDefinitionRepository
 from db.repositories.players import PlayerIdentityError, PlayerRepository
 from db.repositories.results import (
+    ANNOUNCEMENT_PENDING,
     PROMOTION_COMMITTED,
     PROMOTION_DISCORD_PENDING,
     ResultRepository,
@@ -48,22 +62,14 @@ from db.repositories.sync_audit import AuditRepository
 from db.repositories.tickets import TICKET_OPEN, TicketRepository
 from db.repositories.tiers import MirrorRepository
 from db.services.session import transaction as db_transaction
-from services.player_identity import PlayerIdentityConflict, claim_ign
-from services.store import read as store_read, transaction
 from services.tickets import (
-    HT3_COOLDOWNS_FILE,
     HT3_TIER_LADDER,
-    HT_TICKETS_FILE,
-    HT_TICKET_LOGS_FILE,
-    STATUS_CLOSED,
-    STATUS_OPEN,
     _db_resolve_kit,
     _db_resolve_tier,
     _db_ticket_to_dict,
     _dt_to_ms,
     _ms_to_dt,
 )
-from utils import migrate_mode_keys
 
 log = logging.getLogger("dachshundtiers")
 
@@ -71,28 +77,12 @@ log = logging.getLogger("dachshundtiers")
 # HT3 a výš se řeší výhradně přes HT3+ tickety.
 RESULT_TIERS = {"LT5", "HT5", "LT4", "HT4", "LT3", "LT3E"}
 # Volba „LT3 + eval" (v kódu LT3E): hráč dostane tier LT3 (stejná role)
-# do players.json a navíc status evalu (data/evals.json) – viz set_eval.
+# a navíc eval flag – viz set_eval.
 EVAL_TIER = "LT3E"
 
-# Typ výsledku v kanonické historii (data/ht_results.json):
-#   normal   – klasický /result (queue nebo HT3+ eval ticket),
-#   ht_fight – HT Fight výsledek (/topresult) – zapisuje se do STEJNÉ historie;
-#              výhra povyšuje hráče na další tier (players.json),
-#              prohra tier nemění.
-RESULT_TYPES = ("normal", "ht_fight")
-
-# Stav odeslání oznámení výsledku do kanálu (/topresult announcement):
-#   pending – záznam vznikl, oznámení se ještě neodeslalo,
-#   sent    – zpráva je v kanálu (messageId),
-#   failed  – odeslání selhalo (retry tlačítkem v UI).
-ANNOUNCEMENT_PENDING = "pending"
-ANNOUNCEMENT_SENT = "sent"
-ANNOUNCEMENT_FAILED = "failed"
-ANNOUNCEMENT_STATUSES = frozenset(
-    {ANNOUNCEMENT_PENDING, ANNOUNCEMENT_SENT, ANNOUNCEMENT_FAILED}
-)
-
-HT_RESULTS_FILE = "ht_results.json"
+# Typ výsledku v kanonické historii (tabulka `results`) je ``normal``
+# (klasický /result) nebo ``ht_fight`` (HT Fight výsledek, /topresult) –
+# rozlišuje se podle sloupce ``kind``, viz ``_db_result_to_dict``.
 QUEUE_RESULT_PREFIX = "queue-"
 
 _QUEUE_TIERS_MESSAGE = (
@@ -163,217 +153,8 @@ def validate_result_tier(
 
 
 # ---------------------------------------------------------------------------
-# Kanonická databáze hráčů (players.json)
-# ---------------------------------------------------------------------------
-def apply_result_to_players(
-    players: list,
-    ign: str,
-    kit: str,
-    new_tier: str,
-    current_date: str,
-    *,
-    player_id: str | None = None,
-) -> tuple[list, str]:
-    """Aplikuje výsledek na seznam hráčů (kanonická players.json).
-
-    Vrací ``(players, previous_tier)`` – previous_tier je hodnota z players.json
-    PŘED zápisem („N/A", když hráč záznam nemá). Čistá funkce: vstupní seznam
-    se nikdy nemutuje (kopie), idempotentní aplikace – stejná volání na
-    stejném stavu dávají stejný výsledek.
-
-    ``player_id`` (Discord ID) = primární identita (services/player_identity):
-    hráč se najde podle Discord ID, IGN se případně přejmenuje / adopuje
-    historický záznam bez Discord ID. IGN patřící JINÉMU Discord ID zvedá
-    ``PlayerIdentityConflict`` (operaci odmítnout, nikdy neslučovat).
-    Bez ``player_id`` = legacy chování (čistá case-insensitive shoda IGN).
-    """
-    players = _copy_players_from(players)
-    ign_clean = (ign or "").strip()
-    if player_id:
-        players, player, _outcome = claim_ign(
-            players, discord_id=player_id, ign=ign_clean
-        )
-    else:
-        player = next(
-            (
-                p
-                for p in players
-                if str(p.get("username", "")).strip().lower() == ign_clean.lower()
-            ),
-            None,
-        )
-        if player is None:
-            player = {"username": ign_clean, "modes": {}, "history": {}}
-            players.append(player)
-    previous = "N/A"
-    player.setdefault("modes", {})
-    player.setdefault("history", {})
-    # Sjednocení názvů kitů: klíče modes/history jdou POUZE pod kanonickým
-    # (display-case) názvem kitu z kits.json. Existující klíč s jiným case se
-    # migruje bezeztrátově – nikdy nevzniknou dva klíče jednoho kitu
-    # („MolePVP" i „molepvp").
-    kit_key = migrate_mode_keys(player["modes"], kit)
-    migrate_mode_keys(player["history"], kit)
-    if player["modes"].get(kit_key):
-        previous = str(player["modes"][kit_key]).upper()
-    player["history"].setdefault(kit_key, [])
-    player["modes"][kit_key] = new_tier
-    player["history"][kit_key].append({"date": current_date, "tier": new_tier})
-    return players, previous
-
-
-def _copy_players_from(players) -> list:
-    """Hluboká kopie hráčských záznamů (modes/history) – nemutuje vstup."""
-    return [
-        {
-            **p,
-            "modes": dict(p.get("modes") or {}),
-            "history": {k: list(v) for k, v in (p.get("history") or {}).items()},
-        }
-        for p in (players or [])
-    ]
-
-
-# ---------------------------------------------------------------------------
 # Záznam výsledku
 # ---------------------------------------------------------------------------
-def make_result(
-    *,
-    result_id: str,
-    kind: str,
-    ticket_id: str | None,
-    player_id: str,
-    player_name: str,
-    ign: str,
-    evaluator_id: str,
-    evaluator_name: str,
-    kit: str,
-    previous_tier: str,
-    new_tier: str,
-    display_tier: str,
-    score: str,
-    outcome: str,
-    notes: str | None,
-    eval_flag: bool,
-    now: int,
-    date: str,
-    result_type: str = "normal",
-    fight_tier: str = None,
-    tier_status: str = None,
-    opponent_id: str = None,
-    opponent_name: str = "",
-) -> dict:
-    """Sestaví neměnný záznam výsledku (bez zápisu).
-
-    ``result_type`` (``normal`` | ``ht_fight``) rozlišuje klasický /result od
-    HT Fight výsledku (/topresult). HT Fight záznam navíc nese ``fightTier``,
-    ``tierStatus``, ``opponentId``/``opponentName`` a stav oznámení
-    ``announcement`` – povýšení hráče řeší services/topresult.py.
-    """
-    record = {
-        "id": result_id,
-        "kind": kind,
-        "ticketId": str(ticket_id) if ticket_id else None,
-        "playerId": str(player_id),
-        "playerName": player_name or "",
-        "ign": (ign or "").strip(),
-        "evaluatorId": str(evaluator_id),
-        "evaluatorName": evaluator_name or "",
-        "kit": (kit or "").strip(),
-        "previousTier": previous_tier,
-        "newTier": normalize_tier(new_tier),
-        "displayTier": display_tier,
-        "score": score or "",
-        "outcome": outcome or "",
-        "notes": (notes or "").strip() or None,
-        "eval": bool(eval_flag),
-        "resultType": result_type,
-        "timestamp": now,
-        "date": date,
-    }
-    if result_type == "ht_fight":
-        record["fightTier"] = normalize_tier(fight_tier)
-        record["tierStatus"] = (tier_status or "").strip()
-        record["opponentId"] = str(opponent_id) if opponent_id else None
-        record["opponentName"] = opponent_name or ""
-        record["announcement"] = ANNOUNCEMENT_PENDING
-    return record
-
-
-def get_result_type(record: dict) -> str:
-    """Typ výsledku; staré záznamy bez pole = ``normal``."""
-    if not isinstance(record, dict):
-        return "normal"
-    rt = record.get("resultType")
-    return rt if rt in RESULT_TYPES else "normal"
-
-
-def get_result_announcement(record: dict) -> str:
-    """Stav oznámení výsledku; staré záznamy bez pole = ``pending``."""
-    if not isinstance(record, dict):
-        return ANNOUNCEMENT_PENDING
-    status = record.get("announcement")
-    return status if status in ANNOUNCEMENT_STATUSES else ANNOUNCEMENT_PENDING
-
-
-def close_ticket_in_tx(
-    tx,
-    tickets: dict,
-    ticket: dict,
-    ticket_id,
-    *,
-    now: int,
-    actor_id: str,
-    actor_name: str = "",
-    ht3_cooldown_ms: int = 0,
-    log_action: str = "result",
-    log_details: str | None = None,
-) -> None:
-    """Uzavře HT ticket uvnitř otevřené transakce (sdílené /result a /topresult).
-
-    Zavře ticket (status + closedAt), nastaví HT3+ cooldown vlastníkovi na
-    klíč kitu a připíše událost do logu ticketu. Předpokládá, že transaction
-    má v ``files`` HT_TICKETS_FILE, HT3_COOLDOWNS_FILE a HT_TICKET_LOGS_FILE.
-    """
-    ticket["status"] = STATUS_CLOSED
-    ticket["closedAt"] = now
-    tx.set(HT_TICKETS_FILE, tickets)
-
-    if ht3_cooldown_ms > 0:
-        owner_id = str(ticket.get("ownerId", ""))
-        if owner_id:
-            ht3_cd = tx.get(HT3_COOLDOWNS_FILE, {})
-            ht3_cd.setdefault(owner_id, {})[str(ticket.get("kit", ""))] = (
-                now + ht3_cooldown_ms
-            )
-            tx.set(HT3_COOLDOWNS_FILE, ht3_cd)
-
-    logs = tx.get(HT_TICKET_LOGS_FILE, {})
-    logs.setdefault(str(ticket_id), []).append(
-        {
-            "ts": now,
-            "action": log_action,
-            "actorId": str(actor_id),
-            "actorName": actor_name or "",
-            "details": log_details,
-        }
-    )
-    tx.set(HT_TICKET_LOGS_FILE, logs)
-
-
-def _latest_player_result(results: dict, player_id: str) -> dict | None:
-    """Nejnovější záznam hráče v historii (podle timestamp)."""
-    best = None
-    for r in results.values():
-        if not isinstance(r, dict):
-            continue
-        if str(r.get("playerId", "")) != str(player_id):
-            continue
-        if best is None or r.get("timestamp", 0) > best.get("timestamp", 0):
-            best = r
-    return best
-
-
 async def record_result(
     *,
     ticket_id=None,
@@ -393,7 +174,7 @@ async def record_result(
     date: str = "",
     queue_cooldown_ms: int = 0,
     ht3_cooldown_ms: int = 0,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zapíše výsledek evaluace atomicky (validace + idempotence + zápis).
 
@@ -408,9 +189,11 @@ async def record_result(
     - dokud má hráč aktivní cooldown (``queue_cooldown_ms``), je odeslání
       považované za duplicitu a nepřepíše se.
 
-    ``session_factory`` (async_sessionmaker) → zápis do PostgreSQL (result se
-    vloží se stavem ``discord_pending``; Discord-first potvrzení dotáhne
-    ``commit_promotion_with_wedge`` se stejným ``result_key``).
+    ``session_factory`` (async_sessionmaker) je povinný: zápis jde do
+    PostgreSQL a result se vloží se stavem ``discord_pending``; Discord-first
+    potvrzení dotáhne ``commit_promotion_with_wedge`` se stejným
+    ``result_key``. Bez factory funkce odmítne (RuntimeError) – už žádný
+    fallback na ``players.json`` / ``ht_results.json`` neexistuje.
 
     Vrací:
       - ``{"result": "created", "record": {...}, "previous_tier": ...}``
@@ -420,188 +203,66 @@ async def record_result(
       - ``{"result": "invalid_tier", "message"}``
       - ``{"result": "identity_conflict", "message"}`` (IGN patří jinému Diskordu)
     """
-    if session_factory is not None:
-        return await _db_record_result(
-            session_factory,
-            ticket_id=ticket_id,
-            player_id=player_id,
-            player_name=player_name,
-            ign=ign,
-            evaluator_id=evaluator_id,
-            evaluator_name=evaluator_name,
-            kit=kit,
-            new_tier=new_tier,
-            display_tier=display_tier,
-            score=score,
-            outcome=outcome,
-            notes=notes,
-            eval_flag=eval_flag,
-            now=now,
-            date=date,
-            queue_cooldown_ms=queue_cooldown_ms,
-            ht3_cooldown_ms=ht3_cooldown_ms,
-        )
-    if now is None:
-        now = _now_ms()
-    player_id = str(player_id)
-    evaluator_id = str(evaluator_id)
-    stored_tier = "LT3" if eval_flag else normalize_tier(new_tier)
-
-    files = ["players.json", "cooldowns.json", HT_RESULTS_FILE]
-    if ticket_id is not None:
-        files += [HT_TICKETS_FILE, HT3_COOLDOWNS_FILE, HT_TICKET_LOGS_FILE]
-
-    async def _run(tx):
-        results = tx.get(HT_RESULTS_FILE, {})
-
-        # --- Idempotence / ochrana před duplicitami ---
-        if ticket_id is not None:
-            tid = str(ticket_id)
-            existing = results.get(tid)
-            if existing is not None:
-                return {"result": "duplicate", "existing": existing}
-        else:
-            cooldowns = tx.get("cooldowns.json", {})
-            last = cooldowns.get(player_id)
-            if last and queue_cooldown_ms > 0 and now - int(last) < queue_cooldown_ms:
-                return {
-                    "result": "duplicate",
-                    "existing": _latest_player_result(results, player_id),
-                }
-
-        # --- Validace ---
-        if ticket_id is not None:
-            tid = str(ticket_id)
-            tickets = tx.get(HT_TICKETS_FILE, {})
-            ticket = tickets.get(tid)
-            if ticket is None:
-                return {"result": "not_found"}
-            if ticket.get("status") != STATUS_OPEN:
-                return {"result": "ticket_closed", "ticket": ticket}
-            if str(ticket.get("ownerId", "")) != player_id:
-                return {"result": "wrong_player", "ticket": ticket}
-            if str(ticket.get("kit", "")).strip().lower() != str(kit).strip().lower():
-                return {"result": "wrong_kit", "ticket": ticket}
-            ok_validate, msg_validate = validate_result_tier(
-                new_tier,
-                target_tier=ticket.get("targetTier"),
-                current_tier=ticket.get("currentTier"),
-            )
-            if not ok_validate:
-                return {"result": "invalid_tier", "message": msg_validate}
-            result_id = tid
-            kind = "ticket"
-        else:
-            ok_validate, msg_validate = validate_result_tier(new_tier)
-            if not ok_validate:
-                return {"result": "invalid_tier", "message": msg_validate}
-            result_id = f"{QUEUE_RESULT_PREFIX}{player_id}-{now}"
-            kind = "queue"
-
-        # --- Kanonická databáze hráčů (players.json) ---
-        players = tx.get("players.json", [])
-        try:
-            players, previous = apply_result_to_players(
-                players, ign, kit, stored_tier, date, player_id=player_id
-            )
-        except PlayerIdentityConflict as exc:
-            return {"result": "identity_conflict", "message": str(exc)}
-        tx.set("players.json", players)
-
-        # --- Historie výsledků (append-only, nikdy se nemaže) ---
-        result = make_result(
-            result_id=result_id,
-            kind=kind,
-            ticket_id=ticket_id,
-            player_id=player_id,
-            player_name=player_name,
-            ign=ign,
-            evaluator_id=evaluator_id,
-            evaluator_name=evaluator_name,
-            kit=kit,
-            previous_tier=previous,
-            new_tier=new_tier,
-            display_tier=display_tier,
-            score=score,
-            outcome=outcome,
-            notes=notes,
-            eval_flag=eval_flag,
-            now=now,
-            date=date,
-        )
-        results[result_id] = result
-        tx.set(HT_RESULTS_FILE, results)
-
-        # --- Cooldown hráče (queue, 4 dny) ---
-        cooldowns = tx.get("cooldowns.json", {})
-        cooldowns[player_id] = now
-        tx.set("cooldowns.json", cooldowns)
-
-        # --- Ticket: zavření + HT3+ cooldown + event log (atomicky) ---
-        if ticket_id is not None:
-            close_ticket_in_tx(
-                tx,
-                tickets,
-                ticket,
-                tid,
-                now=now,
-                actor_id=evaluator_id,
-                actor_name=evaluator_name,
-                ht3_cooldown_ms=ht3_cooldown_ms,
-                log_action="result",
-                log_details=f"{previous} → {normalize_tier(new_tier)}",
-            )
-
-        return {
-            "result": "created",
-            "record": result,
-            "previous_tier": previous,
-        }
-
-    return await transaction(tuple(files), _run)
+    return await _db_record_result(
+        session_factory,
+        ticket_id=ticket_id,
+        player_id=player_id,
+        player_name=player_name,
+        ign=ign,
+        evaluator_id=evaluator_id,
+        evaluator_name=evaluator_name,
+        kit=kit,
+        new_tier=new_tier,
+        display_tier=display_tier,
+        score=score,
+        outcome=outcome,
+        notes=notes,
+        eval_flag=eval_flag,
+        now=now,
+        date=date,
+        queue_cooldown_ms=queue_cooldown_ms,
+        ht3_cooldown_ms=ht3_cooldown_ms,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Čtení historie (restart-safe)
 # ---------------------------------------------------------------------------
 async def get_result_by_ticket(
-    ticket_id, session_factory: async_sessionmaker[AsyncSession] | None = None
+    ticket_id, session_factory: async_sessionmaker[AsyncSession]
 ) -> dict | None:
     """Výsledek pro daný HT ticket (podle ID kanálu), nebo None."""
-    if session_factory is not None:
-        return await _db_get_result_by_ticket(session_factory, ticket_id)
-    results = await store_read(HT_RESULTS_FILE, {})
-    return results.get(str(ticket_id))
+    if session_factory is None:
+        raise RuntimeError(
+            "get_result_by_ticket potřebuje PostgreSQL; ht_results.json se už nepoužívá"
+        )
+    return await _db_get_result_by_ticket(session_factory, ticket_id)
 
 
 async def get_results_for_player(
-    player_id, session_factory: async_sessionmaker[AsyncSession] | None = None
+    player_id, session_factory: async_sessionmaker[AsyncSession]
 ) -> list:
     """Všechny výsledky hráče v chronologickém pořadí (historie evaluací)."""
-    if session_factory is not None:
-        return await _db_get_results_for_player(session_factory, player_id)
-    results = await store_read(HT_RESULTS_FILE, {})
-    out = [
-        r
-        for r in results.values()
-        if isinstance(r, dict) and str(r.get("playerId", "")) == str(player_id)
-    ]
-    out.sort(key=lambda r: r.get("timestamp", 0))
-    return out
+    if session_factory is None:
+        raise RuntimeError(
+            "get_results_for_player potřebuje PostgreSQL; ht_results.json se už nepoužívá"
+        )
+    return await _db_get_results_for_player(session_factory, player_id)
 
 
 async def get_all_results(
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> list:
     """Všechny výsledky (historie evaluací) v pořadí zápisu."""
-    if session_factory is not None:
-        return await _db_get_all_results(session_factory)
-    results = await store_read(HT_RESULTS_FILE, {})
-    return [r for r in results.values() if isinstance(r, dict)]
+    if session_factory is None:
+        raise RuntimeError(
+            "get_all_results potřebuje PostgreSQL; ht_results.json se už nepoužívá"
+        )
+    return await _db_get_all_results(session_factory)
 
 
 # ---------------------------------------------------------------------------
-# DB mode (PostgreSQL) — result_key = f"result:{result_id}" tak, aby
+# PostgreSQL implementace — result_key = f"result:{result_id}" tak, aby
 # commit_promotion_with_wedge (cog) našel řádek po Discord mutaci.
 # ---------------------------------------------------------------------------
 async def _db_record_result(
@@ -682,6 +343,21 @@ async def _db_record_result(
                         ),
                     }
             result_id = f"{QUEUE_RESULT_PREFIX}{player_id}-{now}"
+            if kit_row is not None and queue_cooldown_ms > 0:
+                # H11 audit fix: deterministic dedup key — window = per-kit
+                # cooldown aligned to ``now``. Two concurrent submissions for
+                # the same player+kit in the same window land on the SAME
+                # result_key; the unique ``results.result_key`` constraint then
+                # rejects the loser at the DB level (handled below) instead of
+                # letting both INSERT. A later retest after the cooldown
+                # expires falls into a later window → new key → allowed.
+                # With queue_cooldown_ms == 0 there is no defined window, so
+                # the legacy time-based key is kept.
+                window_ms = int(queue_cooldown_ms)
+                window_start = (now // window_ms) * window_ms
+                result_id = (
+                    f"{QUEUE_RESULT_PREFIX}{player_id}-{kit_row.id}-{window_start}"
+                )
             kind = "queue"
             ticket_key = f"result:{result_id}"
 
@@ -766,8 +442,7 @@ async def _db_record_result(
         )
 
         # --- Historie výsledků (append-only; stav = discord_pending) ---
-        row = await results.insert(
-            session,
+        insert_kwargs = dict(
             result_key=ticket_key,
             kind=kind,
             player_id=player.id,
@@ -785,6 +460,26 @@ async def _db_record_result(
             recorded_at=_ms_to_dt(now),
             promotion_status=PROMOTION_DISCORD_PENDING,
         )
+        if ticket_id is None:
+            # H11 audit fix: souběžné queue odeslání pro stejného hráče+kit ve
+            # stejném okně sdílí deterministický result_key — unikátní
+            # ``uq_results_result_key`` pustí jen vítěze; poražený narazí na
+            # IntegrityError, které SAVEPOINT vrátí zpět (bez poškození
+            # transakce) a převede na klasické ``duplicate`` s vítězným
+            # záznamem. Dřív obě transakce vložily každá svůj řádek.
+            try:
+                async with session.begin_nested():
+                    row = await results.insert(session, **insert_kwargs)
+            except IntegrityError:
+                winner = await results.get_by_key(session, ticket_key)
+                if winner is None:
+                    raise
+                return {
+                    "result": "duplicate",
+                    "existing": await _db_result_to_dict(session, winner),
+                }
+        else:
+            row = await results.insert(session, **insert_kwargs)
 
         # --- Cooldown hráče (queue, 4 dny per kit; i ticket výsledek ho
         #     prodlužuje – ale jen pro TENTO kit, ne ostatní) ---

@@ -14,28 +14,34 @@ import time
 import discord
 from discord import app_commands
 from discord.ext import commands
+from sqlalchemy.exc import IntegrityError
 
 from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID
 from panel import create_queue_embed, update_panel
 from services.config_store import get_queue_channel_id
 from services.queue_service import (
+    PULL_EMPTY,
+    PULL_NO_KIT,
+    PULL_NO_ROOM,
     close_queue,
     join_queue,
     join_queue_tester,
     leave_queue_tester,
     list_queue_entries,
     open_queue,
-    peek_first_player,
+    pull_for_kit,
     queue_snapshot,
     queue_state,
     register_global_tester,
     removeq as removeq_service,
+    resolve_kit,
     save_pulled_player,
     set_queue_panel,
+    set_tester_room,
     skip_player as skip_queue_player,
 )
 from utils import has_tester_role, kit_autocomplete
-from views import PullChannelSelectView, QueueView, TesterRoomView
+from views import QueueView, TesterRoomView, grant_pull_access
 
 log = logging.getLogger("dachshundtiers")
 
@@ -123,7 +129,7 @@ class Queues(commands.Cog):
         view = QueueView(kit)
         message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
 
-        # Záznam panelu (queue_messages.json / DB řádek fronty)
+        # Záznam panelu (DB řádek fronty – queue_messages.json se nepoužívá)
         await set_queue_panel(kit_key, channel_id, message.id, session_factory=sf)
 
         # Zaregistrování persistentní view pro restart bota
@@ -366,8 +372,10 @@ class Queues(commands.Cog):
             "Ostatní testeři mohou pokračovat."
         )
 
-    @queue.command(name="pull", description="Automatically pull the first player")
-    async def queue_pull(self, interaction: discord.Interaction) -> None:
+    @queue.command(name="pull", description="Vytáhne prvního hráče z fronty kitu")
+    @app_commands.describe(kit="Kit, ze kterého fronty vytahovat")
+    @app_commands.autocomplete(kit=kit_autocomplete)
+    async def queue_pull(self, interaction: discord.Interaction, kit: str) -> None:
         # Stejná kontrola jako pull tlačítko na panelu (views.py) – jen role
         # Tester. Globální "joinastester" registrace není vyžadována.
         if not has_tester_role(interaction.user):
@@ -377,27 +385,34 @@ class Queues(commands.Cog):
 
         sf = getattr(self.bot, "db_session_factory", None)
 
-        player = await peek_first_player(session_factory=sf)
-        if player is None:
-            return await interaction.response.send_message("Fronta je prázdná.", ephemeral=True)
+        # Tester NEVYBÍRÁ roomku – roomka patří kitu (založí ji
+        # `/mktesterroom <kit>`) a tuhle se najde sama. Roomku i vytažení
+        # hráče řeší `pull_for_kit` v JEDNÉ transakci; když roomka chybí,
+        # hráč ve frontě zůstane a tester dostane hlášku.
+        result = await pull_for_kit(kit, session_factory=sf)
 
-        ign = player.get("ign")
-        ign_part = f" (`{ign}`)" if ign else ""
-        kit_key = str(player.get("kit", "")).lower()
-        active_q = await queue_state(kit_key, session_factory=sf)
-        kit_name = (active_q or {}).get("name") or player.get("kit", "?")
+        if result.status == PULL_NO_ROOM:
+            return await interaction.response.send_message(
+                f"❌ Kit **{kit.strip()}** nemá tester roomku. Vytvoř ji "
+                f"`/mktesterroom {kit.strip()}` – hráč ve frontě zůstal.",
+                ephemeral=True,
+            )
+        if result.status == PULL_NO_KIT:
+            return await interaction.response.send_message(
+                f"❌ Kit `{kit.strip()}` neznám.", ephemeral=True
+            )
+        if result.status == PULL_EMPTY:
+            return await interaction.response.send_message(
+                f"Fronta pro kit **{kit.strip()}** je prázdná.", ephemeral=True
+            )
 
-        # Stejný tok jako pull tlačítko na panelu: tester vybere roomku,
-        # hráč do ní dostane přístup a pošle se uvítací zpráva. Vyřazení
-        # z fronty je atomické (PullChannelSelectView.on_select).
-        view = PullChannelSelectView(player, kit_name)
-        await interaction.response.send_message(
-            content=(
-                f"⚔️ <@{player['id']}>{ign_part} je vytažen z fronty pro "
-                f"**{kit_name}**. Vyber roomku, do které ho přidat:"
-            ),
-            view=view,
-            ephemeral=True,
+        player = result.player
+        await grant_pull_access(
+            interaction,
+            player,
+            result.channel_id,
+            result.kit_name,
+            session_factory=sf,
         )
 
     # ------------------------------------------------------------------
@@ -425,18 +440,25 @@ class Queues(commands.Cog):
 
     # ------------------------------------------------------------------
     # /mktesterroom – vytvoří soukromou tester roomku (text kanál)
+    #
+    # Roomka se ZÁZNAMEM mapuje na kit (`kit_tester_rooms`), aby ji
+    # `/queue pull <kit>` našel sám. Bez tohoto mapování není kam hráče
+    # vytáhnout a pull skončí hláškou, ne tím, že by hráč zmizel z fronty.
     # ------------------------------------------------------------------
     @app_commands.command(
         name="mktesterroom",
-        description="Vytvoří soukromou tester roomku pro pullnutí hráče",
+        description="Vytvoří soukromou tester roomku pro daný kit",
     )
     @app_commands.describe(
+        kit="Kit, pro který roomka platí (z ní /queue pull čte kanál)",
         hrac="Hráč, kterému rovnou nastavit přístup (volitelné)",
         kategorie="Kategorie roomky (volitelné; default z env TESTER_ROOM_CATEGORY_ID)",
     )
+    @app_commands.autocomplete(kit=kit_autocomplete)
     async def mktesterroom(
         self,
         interaction: discord.Interaction,
+        kit: str,
         hrac: discord.Member = None,
         kategorie: discord.CategoryChannel = None,
     ) -> None:
@@ -452,6 +474,13 @@ class Queues(commands.Cog):
         guild = interaction.guild
         everyone = guild.default_role
         sf = getattr(self.bot, "db_session_factory", None)
+
+        # Kit musí existovat, jinak by vznikla roomka, kterou nikdo nenajde.
+        kit_row = await resolve_kit(kit, session_factory=sf)
+        if kit_row is None:
+            return await interaction.response.send_message(
+                f"❌ Kit `{kit.strip()}` neznám. Použij existující kit.", ephemeral=True
+            )
 
         # Kategorie: předaná parametrem, jinak z env, jinak žádná
         category = kategorie
@@ -496,7 +525,32 @@ class Queues(commands.Cog):
                 ephemeral=True,
             )
 
-        room_msg = f"🔒 Tester roomka – vytvořil <@{interaction.user.id}>"
+        # Zapíšeme mapování kit -> kanál. Je to autoritativní řádek v
+        # `kit_tester_rooms`, ze kterého `/queue pull <kit>` čte. Kdyby tenhle
+        # zápis selhal, roomka existuje, ale pull na ni neukáže – proto hlásíme
+        # to nahlas a ne předstíráme, že je vše v pořádku.
+        try:
+            await set_tester_room(
+                kit_row.key,
+                channel.id,
+                created_by=interaction.user.id,
+                session_factory=sf,
+            )
+        except IntegrityError:
+            log.exception(
+                "Kanál %s už patří jinému kitu; mapování pro %s nezapsáno.",
+                channel.id,
+                kit_row.key,
+            )
+            return await interaction.response.send_message(
+                "❌ Tato roomka už je přiřazená jinému kitu – mapování nebylo uloženo.",
+                ephemeral=True,
+            )
+
+        room_msg = (
+            f"🔒 Tester roomka pro kit **{kit_row.name}** – vytvořil "
+            f"<@{interaction.user.id}>"
+        )
         if player_named:
             room_msg += f"\n👤 Hráč s přístupem: <@{hrac.id}>"
             # Zaznamenání přednastaveného hráče – /result mu pak práva odebere,
@@ -522,10 +576,14 @@ class Queues(commands.Cog):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-        reply = f"✅ Tester roomka vytvořena: <#{channel.id}>"
+        reply = (
+            f"✅ Tester roomka pro kit **{kit_row.name}** vytvořena: "
+            f"<#{channel.id}>"
+        )
         reply += (
             f" – <@{hrac.id}> má přístup." if player_named
-            else " – přístup získá hráč po pullnutí."
+            else " – přístup získá hráč po `/queue pull "
+            f"{kit_row.key}`."
         )
         await interaction.response.send_message(reply, ephemeral=True)
 
@@ -550,8 +608,8 @@ class Queues(commands.Cog):
         player_id = str(hrac.id)
         sf = getattr(self.bot, "db_session_factory", None)
 
-        # 1) Vše transakčně (JSON / DB): odebrání záznamu (pulled_players.json
-        #    / DB queue entry) + přesun hráče na konec fronty. Odebrání práv
+        # 1) Vše transakčně v DB: odebrání záznamu (queue entry pro
+        #    pulled hráče) + přesun hráče na konec fronty. Odebrání práv
         #    z roomky proběhne níže podle vráceného channel_id.
         result = await skip_queue_player(player_id, session_factory=sf)
 

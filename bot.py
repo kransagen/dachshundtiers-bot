@@ -188,6 +188,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.topresult",
             "cogs.info",
             "cogs.edituser",
+            "cogs.link",
         ]
         for extension in extensions:
             try:

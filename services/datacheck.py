@@ -25,11 +25,16 @@ import logging
 import time
 
 from services.store import read as store_read, transaction
-from services.tickets import HT_TICKETS_FILE, HT3_TIER_LADDER, STATUS_CLOSED
+from services.tickets import HT3_TIER_LADDER, STATUS_CLOSED
 from services.playersync import is_retired_tier
 from storage import using_postgres
 
 log = logging.getLogger("dachshundtiers")
+
+# Legacy název souboru ticketů – žije POUZE tady (migrační/inspenkční tooling
+# pro data/, která už produkce nezapisuje). Produkční stav ticketů je
+# v PostgreSQL (services/tickets.py) a tenhle název se odtamtud neimportuje.
+HT_TICKETS_FILE = "ht_tickets.json"
 
 DATACHECK_LOG_FILE = "datacheck_log.json"
 
@@ -410,8 +415,9 @@ def check_duplicate_modes_keys(players: list) -> list:
     """Duplicitní klíče jednoho kitu v modes hráče („MolePVP" i „molepvp").
 
     Vzniká historicky, když psali kity různé cog A s jiným case. Report-only:
-    nové zápisy už jdou pod kanonickým názvem (services/results
-    ``apply_result_to_players``), existující data se nemění automaticky.
+    nové zápisy už jdou pod kanonickým názvem (PostgreSQL zápis přes
+    services/results.record_result + player_current_tiers mirror), existující
+    data se nemění automaticky.
     """
     out = []
     for p in (players or []):

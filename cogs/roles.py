@@ -1,12 +1,10 @@
 """Správa automatických rolí kitů a tierů po `/result`.
 
-Mapování žije v ``data/kit_roles.json`` (host-local, NIKDY necommitovat –
-obsahuje serverové ID rolí)::
+Mapování žije v PostgreSQL (``kit_roles`` – services.kit_roles; host-local
+`data/kit_roles.json` se používá jen jako startup validace serverových role
+ID, viz db.validation)::
 
-    {
-      "molepvp": {"S": "123456789012345678", "A": "123456789012345679"},
-      "uhcmace": {"S": "111111111111111111"}
-    }
+    "molepvp": {"S": "123456789012345678", "A": "123456789012345679"},
 
 Krátký slovník:
 - /setkitrole  – namapuje roli tieru pro kit,

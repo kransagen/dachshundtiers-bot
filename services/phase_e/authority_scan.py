@@ -166,6 +166,16 @@ def unique_occurrences(sites: list[dict]) -> list[dict]:
 # patterns in docstrings/help; an exact (module, qualname, pattern) outside
 # this set is a blocker.
 #
+# The set is compared for EQUALITY against what the scanner finds
+# (``tests/test_phase_e_authority_scan.py``), in both directions: a new
+# unauthorized call fails, and so does an entry whose call no longer exists.
+# That second direction matters — it means deleting an authorized mutation
+# forces a deliberate edit here, so the review record cannot silently keep
+# blessing a code path that is gone. `/result`'s hand-picked
+# ``add_role``/``remove_role`` mutations were removed for exactly that reason
+# (unauditable manual role edits); the tier-driven
+# ``auto_grant_kit_role`` path below is the one that remains authorized.
+#
 # Keyed by (module, qualified function/method name, pattern) — deliberately
 # NOT by line number (H5 audit finding: a line-number allowlist breaks on any
 # unrelated edit that shifts lines elsewhere in the file, making the suite
@@ -176,8 +186,6 @@ def unique_occurrences(sites: list[dict]) -> list[dict]:
 # human to re-approve.
 AUTHORIZED_MUTATION_SITES: set[tuple[str, str, str]] = {
     ("cogs.roles", "auto_grant_kit_role", "member.edit(roles="),
-    ("cogs.results", "Results.result", "member.add_roles("),
-    ("cogs.results", "Results.result", "member.remove_roles("),
     ("cogs._shared", "apply_role_actions", "member.add_roles("),
     ("cogs._shared", "apply_role_actions", "member.remove_roles("),
     ("cogs._shared", "apply_rollback_actions", "member.add_roles("),

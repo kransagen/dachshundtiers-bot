@@ -36,6 +36,13 @@ class Player(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     discord_id: Mapped[Optional[int]] = mapped_column(BigInteger)
     ign: Mapped[str] = mapped_column(Text, nullable=False)
+    # One-to-one with a Minecraft account (see db/models/identity.py). The
+    # UNIQUE is what makes the link one-to-one: without it two Players could
+    # point at the same UUID, and "who owns this Minecraft account" would
+    # have two answers. NULL = never linked.
+    minecraft_account_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("minecraft_accounts.id"), unique=True
+    )
     source: Mapped[str] = mapped_column(
         Text,
         nullable=False,

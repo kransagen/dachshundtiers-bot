@@ -64,6 +64,23 @@ class TicketRepository:
         )
         return result.scalar_one_or_none()
 
+    async def get_by_channel_for_update(
+        self, session: AsyncSession, channel_id: int
+    ) -> Optional[Ticket]:
+        """Načte ticket s řádkovým zámkem (``SELECT ... FOR UPDATE``).
+
+        H9 audit fix: souběžné claimy dvou testerů se serializují tady — druhý
+        ``SELECT ... FOR UPDATE`` čeká na commit/rollback prvního a v READ
+        COMMITTED pak přečte nejnovější verzi řádku (včetně cizího claimera),
+        takže už nikdy neprojde přes kontrolu ``claimer_id IS NULL``.
+        """
+        result = await session.execute(
+            select(Ticket)
+            .where(Ticket.channel_id == channel_id)
+            .with_for_update()
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_id(self, session: AsyncSession, ticket_id: int) -> Optional[Ticket]:
         return await session.get(Ticket, ticket_id)
 

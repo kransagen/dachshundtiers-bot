@@ -1,25 +1,23 @@
 """Testy „unified HT result system" – services/results.py (bez discord.py).
 
-Pokrývají Phase 3 požadavky:
-- propojení výsledku s hráčem / Discord ID / IGN / evaluátorem / ticketem /
-  časem / předchozím tierem / novým tierem / poznámkami,
-- validaci výsledků (tier vs. cíl ticketu, vlastník, kit, otevřený ticket),
-- idempotenci (HT ticket = max. 1 výsledek; opakované odeslání vrátí stejný
-  záznam a nic nepřepíše),
-- ochranu před duplicitami (queue výsledek přes aktivní cooldown hráče),
-- zachování historie (data/ht_results.json, append-only),
-- aktualizaci kanonické players.json po potvrzení,
-- zavření ticketu + HT3+ cooldown + event log při ticket výsledku,
-- souběžné zápisy (race) a restart-safe stav napříč event loopy.
+Bývalé JSON-mode testy (``ht_results.json`` / ``players.json`` přes
+``services.store``, ``apply_result_to_players`` povýšení do players.json,
+``canonical_kit_name``/``migrate_mode_keys``) jsou PRYČ spolu s JSON režimem.
+Produkční chování ``record_result`` nad PostgreSQL (queue/ticket výsledky,
+cooldown, idempotence, zavření ticketu + event log, sběh a konzistence při
+souběžných zápisech) je pokryté ``tests/test_services_results_db.py``.
+
+Tenhle soubor drží jen čistou logiku nezávislou na úložišti (validace tieru)
+a cog-plumbing testy (self-result gate, předání grantu kanonické službě
+``commit_confirmed_promotion`` s přesným payloadem) + jeden regresní test, že
+JSON fallback se do services/results.py nevrátil.
 """
 
 import asyncio
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import storage
 from cogs.results import Results
 from cogs.roles import TierRoleGrant
 from services import results, tickets
@@ -27,6 +25,10 @@ from services import results, tickets
 NOW = 1_700_000_000_000
 QUEUE_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000  # 4 dny, jako PLAYER_COOLDOWN_MS
 HT3_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000  # 7 dní, jako HT3_COOLDOWN_MS
+
+# Sentinel: existuje, ale nikdy se nevolá jako hlavní čtení (všechny
+# DB-volající cesty jsou v cog-plumbing testech zamockované).
+_FAKE_SESSION_FACTORY = object()
 
 INVALID_QUEUE_TIER_MSG = (
     "❌ Neplatný tier! V `/result` lze zadat pouze: "
@@ -98,434 +100,11 @@ class ValidateResultTierTests(unittest.TestCase):
         self.assertTrue(results.validate_result_tier("HT1", target_tier="HT1", current_tier="LT2")[0])
 
 
-class ApplyResultToPlayersTests(unittest.TestCase):
-    """Aplikace výsledku na kanonickou players.json (čistá funkce)."""
-
-    def test_new_player_created(self):
-        players, prev = results.apply_result_to_players([], "AliceMC", "AnchorPvP", "LT3", "23.09.2026")
-        self.assertEqual(prev, "N/A")
-        self.assertEqual(len(players), 1)
-        self.assertEqual(players[0]["modes"]["AnchorPvP"], "LT3")
-        self.assertEqual(players[0]["history"]["AnchorPvP"], [{"date": "23.09.2026", "tier": "LT3"}])
-
-    def test_existing_player_previous_tier_and_history(self):
-        src = [{"username": "AliceMC", "modes": {"AnchorPvP": "LT3"}, "history": {"AnchorPvP": []}}]
-        players, prev = results.apply_result_to_players(src, "AliceMC", "AnchorPvP", "HT3", "24.09.2026")
-        self.assertEqual(prev, "LT3")
-        self.assertEqual(players[0]["modes"]["AnchorPvP"], "HT3")
-        self.assertEqual(players[0]["history"]["AnchorPvP"][-1], {"date": "24.09.2026", "tier": "HT3"})
-        # čistá funkce – vstup se nemění
-        self.assertEqual(src[0]["modes"]["AnchorPvP"], "LT3")
-
-    def test_eval_stored_as_lt3(self):
-        players, _ = results.apply_result_to_players([], "alice", "AnchorPvP", "LT3", "23.09.2026")
-        self.assertEqual(players[0]["modes"]["AnchorPvP"], "LT3")
-
-
-class RecordResultQueueTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            ("players.json", []),
-            ("cooldowns.json", {}),
-            (results.HT_RESULTS_FILE, {}),
-            (tickets.HT_TICKETS_FILE, {}),
-            (tickets.HT3_COOLDOWNS_FILE, {}),
-            (tickets.HT_TICKET_LOGS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    async def _record(self, **overrides):
-        kwargs = dict(
-            player_id="1",
-            player_name="alice",
-            ign="AliceMC",
-            evaluator_id="9",
-            evaluator_name="bob",
-            kit="AnchorPvP",
-            new_tier="LT3",
-            display_tier="LT3",
-            score="5-2",
-            outcome="Won",
-            notes="Solidní hra",
-            now=NOW,
-            date="23.09.2026",
-            queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-        )
-        kwargs.update(overrides)
-        return await results.record_result(**kwargs)
-
-    def test_queue_result_connected_to_all_fields(self):
-        async def main():
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            data = rec["record"]
-            self.assertEqual(data["kind"], "queue")
-            self.assertIsNone(data["ticketId"])
-            self.assertEqual(data["playerId"], "1")  # Discord ID
-            self.assertEqual(data["playerName"], "alice")
-            self.assertEqual(data["ign"], "AliceMC")
-            self.assertEqual(data["evaluatorId"], "9")
-            self.assertEqual(data["evaluatorName"], "bob")
-            self.assertEqual(data["timestamp"], NOW)
-            self.assertEqual(data["date"], "23.09.2026")
-            self.assertEqual(data["previousTier"], "N/A")
-            self.assertEqual(data["newTier"], "LT3")
-            self.assertEqual(data["notes"], "Solidní hra")
-            self.assertEqual(data["score"], "5-2")
-            self.assertEqual(data["outcome"], "Won")
-
-            # kanonická players.json a cooldown
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["AnchorPvP"], "LT3")
-            cds = storage.load_data("cooldowns.json", {})
-            self.assertEqual(cds["1"], NOW)
-        asyncio.run(main())
-
-    def test_queue_result_previous_tier_from_canonical_db(self):
-        async def main():
-            await self._record()
-            rec = await self._record(
-                player_id="1", ign="AliceMC", new_tier="HT4", display_tier="HT4",
-                now=NOW + QUEUE_COOLDOWN_MS + 1, date="27.09.2026",
-            )
-            self.assertEqual((rec["result"], rec["record"]["previousTier"]), ("created", "LT3"))
-            self.assertEqual(rec["previous_tier"], "LT3")
-        asyncio.run(main())
-
-    def test_queue_duplicate_blocked_by_active_cooldown(self):
-        async def main():
-            first = await self._record()
-            self.assertEqual(first["result"], "created")
-            second = await self._record(
-                new_tier="HT3", display_tier="HT3", now=NOW + 1,
-            )
-            self.assertEqual(second["result"], "duplicate")
-            self.assertIsNotNone(second.get("existing"))
-            # nic se nepřepsalo – kanonická DB pořád LT3, historie 1 záznam
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["AnchorPvP"], "LT3")
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(len(hist), 1)
-        asyncio.run(main())
-
-    def test_queue_duplicate_after_cooldown_expiry_is_new_result(self):
-        async def main():
-            await self._record()
-            second = await self._record(
-                now=NOW + QUEUE_COOLDOWN_MS + 1, date="27.09.2026",
-            )
-            self.assertEqual(second["result"], "created")
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(len(hist), 2)
-        asyncio.run(main())
-
-    def test_queue_invalid_tier_writes_nothing(self):
-        async def main():
-            rec = await self._record(new_tier="HT3")
-            self.assertEqual(rec["result"], "invalid_tier")
-            self.assertEqual(rec["message"], INVALID_QUEUE_TIER_MSG)
-            self.assertEqual(storage.load_data("players.json", []), [])
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-            self.assertEqual(storage.load_data("cooldowns.json", {}), {})
-        asyncio.run(main())
-
-    def test_queue_notes_optional(self):
-        async def main():
-            rec = await self._record(notes="   ")
-            self.assertIsNone(rec["record"]["notes"])
-        asyncio.run(main())
-
-
-class RecordResultTicketTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            ("players.json", [{"username": "AliceMC", "modes": {"AnchorPvP": "LT3"}, "history": {"AnchorPvP": []}}]),
-            ("cooldowns.json", {}),
-            (results.HT_RESULTS_FILE, {}),
-            (tickets.HT_TICKETS_FILE, {"1001": _ticket()}),
-            (tickets.HT3_COOLDOWNS_FILE, {}),
-            (tickets.HT_TICKET_LOGS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    async def _record(self, **overrides):
-        kwargs = dict(
-            ticket_id=1001,
-            player_id="1",
-            player_name="alice",
-            ign="AliceMC",
-            evaluator_id="9",
-            evaluator_name="bob",
-            kit="AnchorPvP",
-            new_tier="HT3",
-            display_tier="HT3",
-            score="5-2",
-            outcome="Won",
-            notes="HT3 pass",
-            now=NOW,
-            date="23.09.2026",
-            queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-            ht3_cooldown_ms=HT3_COOLDOWN_MS,
-        )
-        kwargs.update(overrides)
-        return await results.record_result(**kwargs)
-
-    def test_ticket_result_connected_and_closes_ticket(self):
-        async def main():
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            data = rec["record"]
-            self.assertEqual(data["kind"], "ticket")
-            self.assertEqual(data["ticketId"], "1001")
-            self.assertEqual(data["playerId"], "1")
-            self.assertEqual(data["evaluatorId"], "9")
-            self.assertEqual(data["ign"], "AliceMC")
-            self.assertEqual(data["newTier"], "HT3")
-            self.assertEqual(data["previousTier"], "LT3")  # z players.json
-            self.assertEqual(data["notes"], "HT3 pass")
-
-            # kanonická players.json se posunula
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["AnchorPvP"], "HT3")
-
-            # ticket je zavřený + HT3+ cooldown + event log
-            ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["1001"]
-            self.assertEqual(ticket["status"], "closed")
-            self.assertEqual(ticket["closedAt"], NOW)
-            cds = storage.load_data(tickets.HT3_COOLDOWNS_FILE, {})
-            self.assertEqual(cds["1"]["AnchorPvP"], NOW + HT3_COOLDOWN_MS)
-            logs = storage.load_data(tickets.HT_TICKET_LOGS_FILE, {})["1001"]
-            self.assertEqual(logs[-1]["action"], "result")
-            self.assertEqual(logs[-1]["details"], "LT3 → HT3")
-            self.assertEqual(logs[-1]["actorId"], "9")
-
-            # queue cooldown hráče taky
-            self.assertEqual(storage.load_data("cooldowns.json", {})["1"], NOW)
-        asyncio.run(main())
-
-    def test_ticket_result_idempotent(self):
-        async def main():
-            first = await self._record()
-            self.assertEqual(first["result"], "created")
-            second = await self._record(now=NOW + 1000)
-            self.assertEqual(second["result"], "duplicate")
-            self.assertEqual(second["existing"]["id"], "1001")
-            # nic se neduplikuje: 1 výsledek, 1 history záznam, cooldown stejný
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(len(hist), 1)
-            players = storage.load_data("players.json", [])
-            self.assertEqual(len(players[0]["history"]["AnchorPvP"]), 1)
-            cds = storage.load_data(tickets.HT3_COOLDOWNS_FILE, {})
-            self.assertEqual(cds["1"]["AnchorPvP"], NOW + HT3_COOLDOWN_MS)
-        asyncio.run(main())
-
-    def test_ticket_result_rejects_closed_ticket(self):
-        async def main():
-            await tickets.close_ticket("1001", "9", cooldown_ms=0, now=NOW)
-            rec = await self._record()
-            self.assertEqual(rec["result"], "ticket_closed")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_ticket_result_rejects_wrong_player(self):
-        async def main():
-            rec = await self._record(player_id="2", player_name="carol")
-            self.assertEqual(rec["result"], "wrong_player")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_ticket_result_rejects_wrong_kit(self):
-        async def main():
-            rec = await self._record(kit="MolePVP")
-            self.assertEqual(rec["result"], "wrong_kit")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_ticket_result_rejects_tier_beyond_target(self):
-        async def main():
-            rec = await self._record(new_tier="LT2", display_tier="LT2")
-            self.assertEqual(rec["result"], "invalid_tier")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["AnchorPvP"], "LT3")  # beze změny
-        asyncio.run(main())
-
-    def test_ticket_result_not_found(self):
-        async def main():
-            rec = await self._record(ticket_id=9999)
-            self.assertEqual(rec["result"], "not_found")
-        asyncio.run(main())
-
-
-class ResultHistoryTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            ("players.json", []),
-            ("cooldowns.json", {}),
-            (results.HT_RESULTS_FILE, {}),
-            (tickets.HT_TICKETS_FILE, {"1001": _ticket()}),
-            (tickets.HT3_COOLDOWNS_FILE, {}),
-            (tickets.HT_TICKET_LOGS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    def test_history_per_player_chronological(self):
-        async def main():
-            await results.record_result(
-                ticket_id=1001, player_id="1", player_name="alice", ign="AliceMC",
-                evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-                new_tier="HT3", display_tier="HT3", score="5-2", outcome="Won",
-                now=NOW, date="23.09.2026",
-                queue_cooldown_ms=QUEUE_COOLDOWN_MS, ht3_cooldown_ms=HT3_COOLDOWN_MS,
-            )
-            await results.record_result(
-                player_id="1", player_name="alice", ign="AliceMC",
-                evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-                new_tier="LT3", display_tier="LT3", score="0-3", outcome="Lost",
-                now=NOW + QUEUE_COOLDOWN_MS + 1, date="27.09.2026",
-                queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-            )
-            await results.record_result(
-                player_id="2", player_name="carol", ign="CarolMC",
-                evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-                new_tier="LT4", display_tier="LT4", score="3-3", outcome="Won",
-                now=NOW + 2, date="23.09.2026",
-                queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-            )
-            by_player = await results.get_results_for_player("1")
-            self.assertEqual(len(by_player), 2)
-            self.assertEqual(by_player[0]["newTier"], "HT3")
-            self.assertEqual(by_player[1]["previousTier"], "HT3")
-            by_ticket = await results.get_result_by_ticket(1001)
-            self.assertEqual(by_ticket["ticketId"], "1001")
-            self.assertIsNone(await results.get_result_by_ticket(777))
-            all_results = await results.get_all_results()
-            self.assertEqual(len(all_results), 3)
-        asyncio.run(main())
-
-    def test_history_survives_restart_across_event_loops(self):
-        # zápis v jednom loopu…
-        async def record():
-            return await results.record_result(
-                player_id="1", player_name="alice", ign="AliceMC",
-                evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-                new_tier="LT3", display_tier="LT3", score="5-2", outcome="Won",
-                now=NOW, date="23.09.2026",
-                queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-            )
-        asyncio.run(record())
-
-        # …čtení + nový zápis v úplně jiném loopu (restart bota)
-        async def read_and_record_again():
-            hist = await results.get_results_for_player("1")
-            self.assertEqual(len(hist), 1)
-            second = await results.record_result(
-                player_id="1", player_name="alice", ign="AliceMC",
-                evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-                new_tier="HT4", display_tier="HT4", score="5-1", outcome="Won",
-                now=NOW + QUEUE_COOLDOWN_MS + 1, date="27.09.2026",
-                queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-            )
-            self.assertEqual(second["result"], "created")
-            self.assertEqual(second["record"]["previousTier"], "LT3")
-        asyncio.run(read_and_record_again())
-
-
-class RecordResultConcurrencyTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            ("players.json", []),
-            ("cooldowns.json", {}),
-            (results.HT_RESULTS_FILE, {}),
-            (tickets.HT_TICKETS_FILE, {"1001": _ticket()}),
-            (tickets.HT3_COOLDOWNS_FILE, {}),
-            (tickets.HT_TICKET_LOGS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    def test_two_concurrent_ticket_results_one_wins(self):
-        kwargs = dict(
-            player_id="1", player_name="alice", ign="AliceMC",
-            evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-            new_tier="HT3", display_tier="HT3", score="5-2", outcome="Won",
-            now=NOW, date="23.09.2026",
-            queue_cooldown_ms=QUEUE_COOLDOWN_MS, ht3_cooldown_ms=HT3_COOLDOWN_MS,
-        )
-
-        async def main():
-            r1, r2 = await asyncio.gather(
-                results.record_result(ticket_id=1001, **kwargs),
-                results.record_result(ticket_id=1001, **kwargs),
-            )
-            results_list = sorted((r1["result"], r2["result"]))
-            self.assertEqual(results_list, ["created", "duplicate"])
-            # historie má přesně jeden záznam
-            self.assertEqual(len(storage.load_data(results.HT_RESULTS_FILE, {})), 1)
-        asyncio.run(main())
-
-    def test_two_concurrent_queue_results_same_player_one_wins(self):
-        kwargs = dict(
-            player_id="1", player_name="alice", ign="AliceMC",
-            evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-            new_tier="LT3", display_tier="LT3", score="5-2", outcome="Won",
-            now=NOW, date="23.09.2026",
-            queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-        )
-
-        async def main():
-            r1, r2 = await asyncio.gather(
-                results.record_result(**kwargs),
-                results.record_result(**kwargs),
-            )
-            results_list = sorted((r1["result"], r2["result"]))
-            self.assertEqual(results_list, ["created", "duplicate"])
-            self.assertEqual(len(storage.load_data(results.HT_RESULTS_FILE, {})), 1)
-            players = storage.load_data("players.json", [])
-            self.assertEqual(len(players[0]["history"]["AnchorPvP"]), 1)
-        asyncio.run(main())
-
-    def test_concurrent_results_different_players_both_created(self):
-        async def main():
-            base = dict(
-                evaluator_id="9", evaluator_name="bob", kit="AnchorPvP",
-                new_tier="LT3", display_tier="LT3", score="5-2", outcome="Won",
-                now=NOW, date="23.09.2026", queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-            )
-            r1 = await results.record_result(
-                player_id="1", player_name="alice", ign="AliceMC", **base
-            )
-            r2 = await results.record_result(
-                player_id="2", player_name="carol", ign="CarolMC", **base
-            )
-            self.assertEqual((r1["result"], r2["result"]), ("created", "created"))
-            self.assertEqual(len(storage.load_data(results.HT_RESULTS_FILE, {})), 2)
-        asyncio.run(main())
-
-
 class ResultCogSelfResultTests(unittest.TestCase):
     """item 6: tester si NEMŮŽE zapsat výsledek sám sobě (admin ano)."""
 
     def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
+        self._claims = []
 
     def _interaction(self, user_id):
         inter = mock.MagicMock()
@@ -561,10 +140,8 @@ class ResultCogSelfResultTests(unittest.TestCase):
     def test_tester_cannot_record_own_result(self):
         cog = Results.__new__(Results)
         # G0 audit fix: result() now reads self.bot.db_session_factory
-        # earlier (before the self-result guard used to be the only thing
-        # reached) — a real cog always has .bot via __init__; this stub
-        # needs it explicitly. None => legacy JSON mode, matching what
-        # these tests already assume (no DB fixtures set up here).
+        # earlier — a real cog always has .bot via __init__; this stub
+        # needs it explicitly.
         cog.bot = SimpleNamespace(db_session_factory=None)
         inter = self._interaction(user_id=777)
         hrac = SimpleNamespace(id=777, name="AliceMC", display_name="AliceMC")
@@ -581,11 +158,6 @@ class ResultCogSelfResultTests(unittest.TestCase):
     def test_tester_can_record_other_players_result(self):
         """Jiný hráč → guard propustí do hlavního toku (defer → validace)."""
         cog = Results.__new__(Results)
-        # G0 audit fix: result() now reads self.bot.db_session_factory
-        # earlier (before the self-result guard used to be the only thing
-        # reached) — a real cog always has .bot via __init__; this stub
-        # needs it explicitly. None => legacy JSON mode, matching what
-        # these tests already assume (no DB fixtures set up here).
         cog.bot = SimpleNamespace(db_session_factory=None)
         inter = self._interaction(user_id=777)
         hrac = SimpleNamespace(id=999, name="BobMC", display_name="BobMC")
@@ -609,11 +181,6 @@ class ResultCogSelfResultTests(unittest.TestCase):
     def test_admin_may_record_own_result(self):
         """Admin (jiný subjekt dohledu) smí zapsat i sobě."""
         cog = Results.__new__(Results)
-        # G0 audit fix: result() now reads self.bot.db_session_factory
-        # earlier (before the self-result guard used to be the only thing
-        # reached) — a real cog always has .bot via __init__; this stub
-        # needs it explicitly. None => legacy JSON mode, matching what
-        # these tests already assume (no DB fixtures set up here).
         cog.bot = SimpleNamespace(db_session_factory=None)
         inter = self._interaction(user_id=777)
         hrac = SimpleNamespace(id=777, name="AliceMC", display_name="AliceMC")
@@ -636,12 +203,6 @@ class ResultDbMirrorTests(unittest.TestCase):
     int('LT2'). POZOR: gate už NENÍ v cogu. Cog grant pouze předá
     (včetně nepotvrzeného); rozhodnutí „zapsat do PG nebo ne" je jediná
     odpovědnost služby, která navíc vyžaduje `verified` (G0/invariant 6)."""
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
 
     def _interaction(self, user_id):
         inter = mock.MagicMock()
@@ -679,6 +240,15 @@ class ResultDbMirrorTests(unittest.TestCase):
              mock.patch.object(
                  cm, "auto_grant_kit_role", new=mock.AsyncMock(return_value=grant_result)
              ), \
+             mock.patch.object(
+                 cm, "leave_queue", new=mock.AsyncMock(return_value=False)
+             ), \
+             mock.patch.object(
+                 cm, "update_panel", new=mock.AsyncMock(return_value=None)
+             ), \
+             mock.patch.object(
+                 cm, "remove_pulled_player", new=mock.AsyncMock(return_value=False)
+             ), \
              mock.patch(
                  "db.services.commit_confirmed_promotion",
                  new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
@@ -699,7 +269,7 @@ class ResultDbMirrorTests(unittest.TestCase):
     def test_queue_promotion_commits_exact_db_kwargs(self):
         cog = Results.__new__(Results)
         cog.bot = mock.MagicMock()
-        cog.bot.db_session_factory = None  # JSON režim: viz test_sync helper
+        cog.bot.db_session_factory = _FAKE_SESSION_FACTORY
         inter = self._interaction(user_id=777)
         grant = TierRoleGrant(
             ok=True, verified=True, tier_role_id=202, note="ok"
@@ -734,7 +304,7 @@ class ResultDbMirrorTests(unittest.TestCase):
         mezi cogs/results.py a cogs/topresult.py."""
         cog = Results.__new__(Results)
         cog.bot = mock.MagicMock()
-        cog.bot.db_session_factory = None  # JSON režim: viz test_sync helper
+        cog.bot.db_session_factory = _FAKE_SESSION_FACTORY
         failed = TierRoleGrant(ok=False, note="nelze", tier_role_id=None)
         commit_mock = self._call(
             cog, self._interaction(user_id=777), grant_result=failed
@@ -745,7 +315,7 @@ class ResultDbMirrorTests(unittest.TestCase):
     def test_legacy_empty_grant_is_handed_to_the_canonical_service(self):
         cog = Results.__new__(Results)
         cog.bot = mock.MagicMock()
-        cog.bot.db_session_factory = None  # JSON režim: viz test_sync helper
+        cog.bot.db_session_factory = _FAKE_SESSION_FACTORY
         commit_mock = self._call(
             cog, self._interaction(user_id=777), grant_result=""
         )
@@ -759,7 +329,7 @@ class ResultDbMirrorTests(unittest.TestCase):
 
         async def run():
             return await commit_confirmed_promotion(
-                None,
+                _FAKE_SESSION_FACTORY,
                 grant=TierRoleGrant(ok=True, tier_role_id=202, note="ok"),
                 result_key="result:rec-abc",
                 kind="queue",
@@ -774,59 +344,47 @@ class ResultDbMirrorTests(unittest.TestCase):
         self.assertFalse(outcome.wedged)
 
 
-class CanonicalKitKeyTests(unittest.TestCase):
-    """item 8: apply_result_to_players píše modes/history pod kanonickým
-    (display-case) názvem kitu z kits.json – žádné case-duplicitní klíče."""
+class NoJsonModeTests(unittest.TestCase):
+    """services/results.py už NEMÁ JSON režim – vyžaduje PostgreSQL."""
 
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        storage.save_data("kits.json", ["MolePVP"])
+    def test_record_result_requires_session_factory(self):
+        async def main():
+            with self.assertRaises(TypeError):
+                await results.record_result(
+                    player_id="1", player_name="alice", ign="AliceMC",
+                    evaluator_id="9", evaluator_name="tester", kit="AnchorPvP",
+                    new_tier="LT3", display_tier="LT3", score="3:1",
+                    outcome="Won", notes=None, eval_flag=False, now=NOW,
+                    date="23.09.2026",
+                    queue_cooldown_ms=QUEUE_COOLDOWN_MS,
+                    ht3_cooldown_ms=0,
+                )
+        asyncio.run(main())
 
-    def test_new_result_written_under_canonical_case(self):
-        players, prev = results.apply_result_to_players(
-            [], "alice", "molepvp", "LT3", "23.09.2026"
-        )
-        self.assertEqual(prev, "N/A")
-        self.assertIn("MolePVP", players[0]["modes"])
-        self.assertNotIn("molepvp", players[0]["modes"])
-        self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
-        self.assertEqual(players[0]["history"]["MolePVP"][-1]["tier"], "LT3")
+    def test_readers_refuse_explicit_none(self):
+        async def main():
+            for coro in (
+                results.get_result_by_ticket(1001, session_factory=None),
+                results.get_results_for_player("1", session_factory=None),
+                results.get_all_results(session_factory=None),
+            ):
+                with self.assertRaises(RuntimeError, msg="PostgreSQL"):
+                    await coro
+        asyncio.run(main())
 
-    def test_existing_variant_key_migrated_without_data_loss(self):
-        src = [{
-            "username": "alice",
-            "modes": {"molepvp": "LT3"},
-            "history": {"molepvp": [{"date": "01.01.2026", "tier": "LT3"}]},
-        }]
-        players, prev = results.apply_result_to_players(
-            src, "alice", "molepvp", "HT3", "24.09.2026"
-        )
-        self.assertEqual(prev, "LT3")  # stará hodnota se našla přes migraci
-        self.assertEqual(players[0]["modes"], {"MolePVP": "HT3"})
-        self.assertEqual(
-            players[0]["history"]["MolePVP"],
-            [
-                {"date": "01.01.2026", "tier": "LT3"},
-                {"date": "24.09.2026", "tier": "HT3"},
-            ],
-        )
-        self.assertNotIn("molepvp", players[0]["history"])
+    def test_json_compat_helpers_are_gone(self):
+        """Zdrojový regresní test: JSON cesta z services/results.py je pryč."""
+        import inspect
 
-    def test_never_creates_duplicate_keys_for_same_kit(self):
-        src = [{
-            "username": "alice",
-            "modes": {"MolePVP": "HT3"},
-            "history": {"MolePVP": [{"date": "01.01.2026", "tier": "HT3"}]},
-        }]
-        players, prev = results.apply_result_to_players(
-            src, "alice", "molepvp", "LT3", "25.09.2026"
-        )
-        self.assertEqual(prev, "HT3")
-        self.assertEqual(list(players[0]["modes"].keys()), ["MolePVP"])
-        self.assertEqual(list(players[0]["history"].keys()), ["MolePVP"])
+        src = inspect.getsource(results)
+        self.assertNotIn("load_data(", src)
+        self.assertNotIn("save_data(", src)
+        self.assertNotIn("if session_factory is not None:", src)
+        self.assertNotIn("def apply_result_to_players", src)
+        self.assertNotIn("def canonical_kit_name", src)
+        self.assertNotIn("def migrate_mode_keys", src)
+        self.assertNotIn("from services.store import transaction", src)
+        self.assertNotIn("HT_RESULTS_FILE", src)
 
 
 if __name__ == "__main__":

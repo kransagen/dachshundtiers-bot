@@ -15,8 +15,8 @@ zapinguje nakonfigurovanou roli (``TOP_RESULT_ROLE_ID``, pouze ta!):
     <@&1523984977371594772>
 
 Behavior:
-- záznam jde do STEJNÉ kanonické historie jako /result (``data/ht_results.json``)
-  s ``resultType: "ht_fight"`` – žádná samostatná databáze,
+- záznam jde do STEJNÉ kanonické historie jako /result (PostgreSQL ``results``,
+  ``result_type='ht_fight'``) – žádná samostatná databáze,
 - **výhra povyšuje hráče** na další tier (services/topresult.py – kanonické
   pravidlo next_ticket_tier); výhra udělí i novou tier roli (stejná logika
   jako /result – auto_grant_kit_role); prohra tier ani roli nemění,
@@ -48,7 +48,7 @@ from config import (
 )
 from cogs.roles import TierRoleGrant, auto_grant_kit_role
 from services.kit_catalog import get_kits
-from services.results import ANNOUNCEMENT_FAILED, ANNOUNCEMENT_SENT
+from db.repositories.results import ANNOUNCEMENT_FAILED, ANNOUNCEMENT_SENT
 from services.tickets import get_ticket, is_ht_fight_ticket
 from services.topresult import (
     HT_FIGHT_TIERS,
@@ -95,9 +95,8 @@ class HTFightRetryView(discord.ui.View):
         self.result_channel = result_channel
         self.content = content
         self.allowed_mentions = allowed_mentions
-        # G0: v DB režimu se stav oznámení zapisuje do PostgreSQL, ne do
-        # `ht_results.json` – jinak by retry zapisoval do JSONu, zatímco
-        # zbytek běží v PG.
+        # G0: stav oznámení se zapisuje do PostgreSQL, ne do
+        # `ht_results.json` – retry nikdy nesahá na JSON.
         self.session_factory = session_factory
 
     @discord.ui.button(label="🔄 Zkusit odeslat znovu", style=discord.ButtonStyle.primary)
@@ -297,11 +296,9 @@ class TopResult(commands.Cog):
                 "❌ Soupeř nemůže být stejný hráč jako testovaný.", ephemeral=True
             )
 
-        # 1) Zápis do kanonické historie. V DB režimu (session_factory) jde
-        #    o kanonický PostgreSQL zápis (Result, promotion_status=
-        #    discord_pending) – players.json se NEpíše a nerozhoduje o
-        #    current tieru (G0 audit fix / H1 cutover). Bez PostgreSQL
-        #    zůstává legacy JSON chování (ht_results.json) beze změny.
+        # 1) Zápis do kanonické historie – výhradně PostgreSQL (Result,
+        #    promotion_status=discord_pending); players.json se NEpíše a
+        #    nerozhoduje o current tieru (G0 audit fix / H1 cutover).
         #    výhra = povýšení hráče, ticket zůstává otevřený; prohra = zavření
         #    ticketu + HT3+ cooldown vlastníka.
         record = await record_ht_fight(
@@ -489,9 +486,8 @@ class TopResult(commands.Cog):
         )
         allowed = discord.AllowedMentions(everyone=False, users=True, roles=[target_role])
         announce_result_id = rec.get("id")
-        # Historie žije tam, kde skutečně byla zapsána (G0 – v DB režimu je to
-        # PostgreSQL, `ht_results.json` je jen legacy/export).
-        history_label = "PostgreSQL" if sf is not None else "`ht_results.json`"
+        # Historie žije v PostgreSQL (G0 – HT fight záznam i jeho announcement).
+        history_label = "PostgreSQL"
         try:
             sent = await result_channel.send(content=message, allowed_mentions=allowed)
         except (discord.Forbidden, discord.HTTPException) as err:

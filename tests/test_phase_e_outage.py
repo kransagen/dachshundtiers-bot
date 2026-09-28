@@ -332,6 +332,15 @@ class ResultDbOutageTests(unittest.TestCase):
              ), \
              mock.patch.object(cm, "get_result_channel_id", return_value=123), \
              mock.patch.object(cm, "today_cz", return_value="01.01.2026"), \
+             mock.patch.object(
+                 cm, "leave_queue", new=mock.AsyncMock(return_value=True)
+             ), \
+             mock.patch.object(
+                 cm, "update_panel", new=mock.AsyncMock(return_value=None)
+             ), \
+             mock.patch.object(
+                 cm, "remove_pulled_player", new=mock.AsyncMock(return_value=False)
+             ), \
 mock.patch.object(
                  cm, "auto_grant_kit_role",
                  new=mock.AsyncMock(return_value=TierRoleGrant(
@@ -394,21 +403,17 @@ class TopResultDbOutageTests(unittest.TestCase):
 
     def setUp(self):
         from cogs import topresult as topresult_module
-        from services import results, tickets
 
         self.cog_module = topresult_module
         self._tmp = tempfile.mkdtemp()
         patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
         patch.start()
         self.addCleanup(patch.stop)
-        for name, default in (
-            (results.HT_RESULTS_FILE, {}),
-            ("players.json", [{"username": "mendu__",
-                               "modes": {"MolePVP": "LT3"}, "history": {}}]),
-            ("cooldowns.json", {}),
-            (tickets.HT_TICKETS_FILE, {"2001": _fight_ticket()}),
-        ):
-            storage.save_data(name, default)
+        # ht_tickets.json / ht_results.json / cooldowns.json už neexistují ani
+        # jako konstanty (JSON režim je pryč) – v tomhle scénáři se žádný
+        # soubor nečte (record_ht_fight/get_ticket jsou mocknuté).
+        storage.save_data("players.json", [{"username": "mendu__",
+                                             "modes": {"MolePVP": "LT3"}, "history": {}}])
 
     def test_db_down_wedge_surfaces_discord_never_reverted(self):
         cm = self.cog_module
@@ -498,39 +503,14 @@ class TopResultDbOutageTests(unittest.TestCase):
         alice.edit.assert_not_awaited()
 
 
-def _fight_ticket(**overrides):
-    from services import tickets
-
-    ticket = tickets.make_ticket(
-        channel_id=1001,
-        owner_id="1",
-        owner_name="mendu__",
-        ign="mendu__",
-        kit="MolePVP",
-        target_tier="HT3",
-        current_tier="LT3",
-        eval_ok=True,
-        category_id=555,
-        now=1_700_000_000_000,
-    )
-    ticket.update(
-        {
-            "id": "2001",
-            "fight": True,
-            "resultType": "ht_fight",
-            "bridge": "LT2",
-        }
-    )
-    ticket.update(overrides)
-    return ticket
-
-
 # ---------------------------------------------------------------------------
 # Cog-level: /sync web (GitHub export) při DB down
 # ---------------------------------------------------------------------------
 class SyncWebExportDbOutageTests(unittest.TestCase):
-    """GitHub export je downstream-only: výpadek DB export NEzablokuje a
-    export nikdy nemění Discord role."""
+    """GitHub export je downstream-only: zdroj je vždy PostgreSQL export
+    (_canonical_for_export → export_players) a export nikdy nemění Discord
+    role. Výpadek DB export zablokuje (žádný legacy JSON fallback) – to je
+    pokryté tests/test_sync.py::test_pg_export_failure_sends_nothing."""
 
     def setUp(self):
         from services import permissions
@@ -558,14 +538,15 @@ class SyncWebExportDbOutageTests(unittest.TestCase):
              "modes": {"randompot": "HT3"},
              "history": {"randompot": [{"date": "01.01.2026", "tier": "HT3"}]}},
         ]
-        storage.save_data("players.json", list(self.canonical))
 
-    def test_export_runs_with_db_down_and_discord_untouched(self):
+    def test_export_runs_from_postgres_with_discord_untouched(self):
+        """Export běží na kanonice z PostgreSQL (mock _canonical_for_export)
+        a nikdy se nedotýká Discord rolí."""
         from cogs.sync import Sync, SyncWebConfirmView
 
         alice = _member(1, "AliceMC")
         cog = Sync.__new__(Sync)
-        cog.bot = SimpleNamespace(db_session_factory=None)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         inter = _interaction(user=_admin_member(), guild=_guild([alice]))
         web = list(self.web)
         holder = {}
@@ -577,6 +558,10 @@ class SyncWebExportDbOutageTests(unittest.TestCase):
             ), mock.patch.object(
                 github_sync, "push_players",
                 new=mock.AsyncMock(return_value=(True, "✅ push", [])),
+            ), mock.patch(
+                # kanonika z PostgreSQL exportu – nikdy ne z players.json
+                "cogs.sync._canonical_for_export",
+                new=mock.AsyncMock(return_value=[dict(p) for p in self.canonical]),
             ):
                 await Sync.sync_web.callback(cog, inter, "apply")
                 view = inter.followup.send.call_args.kwargs["view"]

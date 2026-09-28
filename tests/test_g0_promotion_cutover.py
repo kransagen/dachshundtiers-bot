@@ -25,7 +25,6 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
-import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -1181,9 +1180,16 @@ def test_command_passes_session_factory(module_rel, qualname, callee):
     ("services/results.py", "record_result"),
     ("services/topresult.py", "record_ht_fight"),
 ])
-def test_dispatcher_gates_on_session_factory(module_rel, function):
-    """The legacy JSON branch must stay behind an explicit
-    ``session_factory is not None`` check that returns FIRST."""
+def test_dispatcher_has_no_json_branch_anymore(module_rel, function):
+    """The legacy JSON branch is GONE — not behind a gate, deleted.
+
+    H1/G0 anti-regression, post-cutover: ``record_result`` /
+    ``record_ht_fight`` must (a) require ``session_factory`` (no ``= None``
+    default, so a caller that forgets it fails loudly at the call site) and
+    (b) contain no ``transaction(`` call at all — there is no JSON file
+    write left to gate. Reintroducing any JSON fallback in these functions
+    instantly breaks this test and the json_compat allowlist.
+    """
     src = (REPO_ROOT / module_rel).read_text(encoding="utf-8")
     tree = ast.parse(src)
     fn = next(
@@ -1193,13 +1199,18 @@ def test_dispatcher_gates_on_session_factory(module_rel, function):
         and node.name == function
     )
     body_src = ast.unparse(fn)
-    gate = re.search(
-        r"if session_factory is not None:\s*\n\s*return await _db_\w+",
-        body_src,
+    # (a) required session_factory — no ``= None`` / ``| None`` default.
+    assert "session_factory=None" not in body_src, (
+        f"{module_rel}::{function} still defaults session_factory to None — "
+        "a caller could silently pick a (long-deleted) JSON path"
     )
-    assert gate, f"{module_rel}::{function} lost its DB-first dispatcher gate"
-    # The gate must precede the JSON transaction write.
-    assert gate.start() < body_src.index("transaction(")
+    # (b) no JSON transaction write anywhere in the function.
+    assert "transaction(" not in body_src, (
+        f"{module_rel}::{function} still contains a JSON transaction write"
+    )
+    # (c) it must still gate on None explicitly where the signature allows it.
+    fn_sig = ast.unparse(fn.args)
+    assert "session_factory" in fn_sig
 
 
 @pytest.mark.parametrize("module_rel,qualname", [

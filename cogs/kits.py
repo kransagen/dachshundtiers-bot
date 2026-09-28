@@ -1,6 +1,6 @@
 """Cog se správou registrovaných kitů: /addkit, /removekit, /kits.
 
-Seznam kitů je uložen v ``data/kits.json`` a používají ho:
+Seznam kitů je v PostgreSQL (`kits` – services.kit_catalog) a používají ho:
 - HT3+ panel („Žádost o TierTest“ – select menu s kity),
 - autocomplete kitu u /createturnaj, /turnajresult a /result.
 """

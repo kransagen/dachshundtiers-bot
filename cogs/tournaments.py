@@ -26,7 +26,8 @@ from cogs._shared import admin_gate_error
 from db.repositories.kits import KitRepository
 from db.repositories.tournaments import TournamentRepository
 from db.services.session import transaction
-from utils import get_kits, has_tester_role, kit_autocomplete
+from services.kit_catalog import get_kits
+from utils import has_tester_role, kit_autocomplete
 from views import TournamentSignupView
 
 TOURNAMENT_TIERS = ["LT3", "HT3", "LT2", "HT2", "LT1", "HT1"]
@@ -192,7 +193,12 @@ class Tournaments(commands.Cog):
 
         kit_key = kit.lower()
 
-        if not get_kits():
+        # Katalog z PostgreSQL; prázdný = opravdu nejsou registrované žádné
+        # kity (kit_catalog navíc vrací DEFAULT_KITS, když je DB úplně prázdná,
+        # takže tento check znamená "ani jeden nebyl nikdy přidán").
+        if not await get_kits(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        ):
             return await interaction.response.send_message(
                 "❌ Žádné kity nejsou registrované. Přidej je přes `/addkit`.",
                 ephemeral=True,

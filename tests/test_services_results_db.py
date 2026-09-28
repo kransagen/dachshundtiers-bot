@@ -350,7 +350,12 @@ async def test_record_result_readers(session_factory, clean_db):
     assert [p["id"] for p in for_player] == ["115"]
 
     all_results = await rsvc.get_all_results(session_factory=session_factory)
-    assert {p["id"] for p in all_results} == {"115", "queue-101-1700000060000"}
+    ids = {p["id"] for p in all_results}
+    assert "115" in ids
+    # H11: deterministický klíč queue-{discord}-{kit}-{window}; tvar okna se
+    # nehardcoduje, postačí předpona.
+    assert any(i.startswith("queue-101-") for i in ids)
+    assert len(ids) == 2
 
 
 async def test_commit_after_discord_success_preserves_row_metadata(
@@ -701,3 +706,107 @@ async def test_ht_fight_commit_preserves_subtype_and_ticket_channel(
         assert row.ticket_channel_id == 216
         assert row.opponent_id == 300
         assert row.notes == "Fight poznámka"
+
+
+async def test_record_result_same_ticket_concurrent_dedup(session_factory, clean_db):
+    """Souběžné ``record_result`` pro stejný ticket → max. 1 řádek a 1 zavření.
+
+    Unikátní ``result_key`` v PostgreSQL (``result:{ticketId}``) zaručuje, že
+    se souběžné odeslání nerozběhne do dvou záznamů, dvojitého zavření ani
+    dvojitého cooldownu. Nahrazuje JSON concurrency testy
+    (``RecordResultConcurrencyTests``) – invariant je „nikdy 2 záznamy",
+    ne přesný tvar odpovědi druhé transakce.
+    """
+    import asyncio
+
+    from sqlalchemy import select as _select
+
+    from db.models import Result as _Result
+    from db.models import Ticket as _Ticket
+
+    await _seed(session_factory)
+    await _ticket(session_factory, channel_id=221, owner_id=100)
+
+    outcomes = await asyncio.gather(
+        _record(session_factory, ticket_id=221),
+        _record(session_factory, ticket_id=221),
+        return_exceptions=True,
+    )
+    created = [
+        o for o in outcomes
+        if isinstance(o, dict) and o.get("result") == "created"
+    ]
+    assert len(created) == 1
+    # Druhá souběžná transakce buď uvidí hotový řádek (duplicate), nebo
+    # narazí na unikátní klíč (IntegrityError) – obojí je zachované chování;
+    # invariant je jediný záznam níže.
+    others = [
+        o for o in outcomes
+        if not (isinstance(o, dict) and o.get("result") == "created")
+    ]
+    assert len(others) == 1
+    assert isinstance(others[0], dict) or isinstance(others[0], BaseException)
+
+    async with transaction(session_factory) as session:
+        rows = (
+            await session.execute(
+                _select(_Result).where(_Result.result_key == "result:221")
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+
+        ticket = (
+            await session.execute(
+                _select(_Ticket).where(_Ticket.channel_id == 221)
+            )
+        ).scalars().first()
+        assert ticket is not None
+        assert ticket.status == "closed"
+
+
+async def test_record_result_queue_concurrent_dedup(session_factory, clean_db):
+    """Souběžné queue /result pro stejného hráče+kit ve stejném okně.
+
+    H11 audit fix: deterministický ``result_key`` (window = cooldown okno)
+    + unikátní ``uq_results_result_key`` zajistí, že druhé souběžné odeslání
+    skončí čistě jako ``duplicate`` (nikdy syrový IntegrityError ani druhý
+    řádek v ``results``). Dřív mělo každé odeslání vlastní klíč
+    ``queue-{player}-{now}``, takže obě transakce vložily vlastní záznam.
+    """
+    import asyncio
+
+    from sqlalchemy import select as _select
+
+    from db.models import Result as _Result
+
+    await _seed(session_factory)
+    outcomes = await asyncio.gather(
+        _record(session_factory, ticket_id=None),
+        _record(session_factory, ticket_id=None),
+        return_exceptions=True,
+    )
+    created = [
+        o for o in outcomes
+        if isinstance(o, dict) and o.get("result") == "created"
+    ]
+    assert len(created) == 1, outcomes
+    others = [
+        o for o in outcomes
+        if not (isinstance(o, dict) and o.get("result") == "created")
+    ]
+    assert len(others) == 1
+    assert isinstance(others[0], dict), (
+        "poražené souběžné queue odeslání musí být čistý duplicate dict, "
+        f"ne vyjímka: {others[0]!r}"
+    )
+    assert others[0]["result"] == "duplicate"
+    assert others[0].get("existing") is not None
+
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 100)
+        rows = (
+            await session.execute(
+                _select(_Result).where(_Result.player_id == player.id)
+            )
+        ).scalars().all()
+    assert len(rows) == 1

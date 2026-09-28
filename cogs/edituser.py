@@ -58,12 +58,11 @@ from services.edituser import (
 from services.player_identity import (
     CLAIM_UNCHANGED,
     PlayerIdentityConflict,
-    find_by_discord_id,
 )
 from services.permissions import has_admin_role
 from services.websync import sync_website
-from storage import load_data
-from utils import DEFAULT_KITS, get_kits
+from services.kit_catalog import get_kits
+from utils import DEFAULT_KITS
 from views import SafeModal, SafeView
 
 log = logging.getLogger("dachshundtiers")
@@ -85,32 +84,34 @@ def _current_tier(player: dict, kit_key: str) -> str:
     return ""
 
 
-def _cog_session_factory(cog) -> None | object:
-    """session_factory bota nebo None (JSON režim) – vzor cogs/ht3.py."""
+def _cog_session_factory(cog):
+    """session_factory bota – vzor cogs/ht3.py."""
     return getattr(getattr(cog, "bot", None), "db_session_factory", None)
 
 
-def _find_player_sync(player_id: str) -> dict | None:
-    players = load_data("players.json", [], strict=True) or []
-    return find_by_discord_id(players, player_id) if isinstance(players, list) else None
+async def _find_player(player_id: str, *, session_factory) -> dict | None:
+    """Kanonický tvar hráče z PostgreSQL (projekce přes player_export).
 
+    Bez ``session_factory`` je to chyba, ne „hledat v souboru": editor
+    pracuje nad zrcadlem, které potvrdil Discord, a hráč, kterého tu není,
+    v databázi opravdu neexistuje.
+    """
+    if session_factory is None:
+        raise RuntimeError(
+            "_find_player potřebuje PostgreSQL; players.json se už nepoužívá"
+        )
+    from db.repositories.players import PlayerRepository
+    from db.services.session import transaction as _db_tx
+    from services.player_export import build_player_shape
 
-async def _find_player(player_id: str, *, session_factory=None) -> dict | None:
-    """Canonical tvar hráče: DB režim z PostgreSQL, jinak players.json (JSON)."""
-    if session_factory is not None:
-        from db.repositories.players import PlayerRepository
-        from db.services.session import transaction as _db_tx
-        from services.player_export import build_player_shape
-
-        did = int(player_id) if str(player_id).isdigit() else None
-        if did is None:
+    did = int(player_id) if str(player_id).isdigit() else None
+    if did is None:
+        return None
+    async with _db_tx(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, did)
+        if player is None:
             return None
-        async with _db_tx(session_factory) as session:
-            player = await PlayerRepository().get_by_discord_id(session, did)
-            if player is None:
-                return None
-            return await build_player_shape(session, player)
-    return _find_player_sync(player_id)
+        return await build_player_shape(session, player)
 
 
 def _editor_embed(player: dict) -> discord.Embed:
@@ -132,7 +133,7 @@ def _editor_embed(player: dict) -> discord.Embed:
         color=0x3B82F6,
     )
     embed.set_footer(
-        text="Žádná změna se NEaplikuje bez potvrzení. Audit: data/edituser_log.json"
+        text="Žádná změna se NEaplikuje bez potvrzení. Audit: PostgreSQL (audit_logs)"
     )
     return embed
 
@@ -141,7 +142,7 @@ def _not_found_embed(player: discord.User) -> discord.Embed:
     return discord.Embed(
         title="❌ Hráč nebyl nalezen",
         description=(
-            f"Hráč **{player}** (`{player.id}`) nemá záznam v players.json.\n"
+            f"Hráč **{player}** (`{player.id}`) nemá záznam v databázi.\n"
             "`/edituser` edituje EXISTUJÍCÍ záznam – hráč musí mít alespoň "
             "jeden `/result` (nebo být v databázi ručně)."
         ),
@@ -219,7 +220,7 @@ def _confirm_embed(payload: dict) -> discord.Embed:
         color=0xF59E0B,
     )
     embed.set_footer(
-        text="Nic se NEaplikuje, dokud nepotvrdíš tlačítkem. Audit: data/edituser_log.json"
+        text="Nic se NEaplikuje, dokud nepotvrdíš tlačítkem. Audit: PostgreSQL (audit_logs)"
     )
     return embed
 
@@ -318,7 +319,7 @@ def _report_embed(report: dict, payload: dict) -> discord.Embed:
                 if errs:
                     wval += "\n" + "\n".join(f"  • {e}" for e in errs)
                 embed.add_field(name="Web (GitHub)", value=wval, inline=False)
-    embed.set_footer(text="Audit: data/edituser_log.json")
+    embed.set_footer(text="Audit: PostgreSQL (audit_logs)")
     return embed
 
 
@@ -346,16 +347,17 @@ class DiscordIdModal(SafeModal):
             )
         await interaction.response.defer(ephemeral=True)
         new_id = (self.input.value or "").strip()
-        players = load_data("players.json", [], strict=True) or []
-        p = find_by_discord_id(players, self.player_id)
+        p = await _find_player(
+            self.player_id, session_factory=_cog_session_factory(self.cog)
+        )
         if p is None:
             return await interaction.followup.send(
-                embed=_stale_embed("Hráč už v players.json není."), ephemeral=True
+                embed=_stale_embed("Hráč už v databázi není."), ephemeral=True
             )
         old = str(p.get("discordId") or "")
         try:
             _new_players, _target, outcome = change_player_discord(
-                players, {"discordId": self.player_id}, new_id
+                [p], {"discordId": self.player_id}, new_id
             )
         except PlayerIdentityConflict as exc:
             return await interaction.followup.send(f"❌ {exc}", ephemeral=True)
@@ -401,16 +403,17 @@ class IgnModal(SafeModal):
             )
         await interaction.response.defer(ephemeral=True)
         new_ign = (self.input.value or "").strip()
-        players = load_data("players.json", [], strict=True) or []
-        p = find_by_discord_id(players, self.player_id)
+        p = await _find_player(
+            self.player_id, session_factory=_cog_session_factory(self.cog)
+        )
         if p is None:
             return await interaction.followup.send(
-                embed=_stale_embed("Hráč už v players.json není."), ephemeral=True
+                embed=_stale_embed("Hráč už v databázi není."), ephemeral=True
             )
         old = str(p.get("username") or "")
         try:
             _new_players, target, outcome = change_player_ign(
-                players, {"discordId": self.player_id}, new_ign
+                [p], {"discordId": self.player_id}, new_ign
             )
         except PlayerIdentityConflict as exc:
             return await interaction.followup.send(f"❌ {exc}", ephemeral=True)
@@ -482,7 +485,7 @@ class PlayerEditorView(SafeView):
         sf = _cog_session_factory(self.cog)
         if await _find_player(self.player_id, session_factory=sf) is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         await interaction.response.send_modal(
             DiscordIdModal(cog=self.cog, player_id=self.player_id)
@@ -495,7 +498,7 @@ class PlayerEditorView(SafeView):
         sf = _cog_session_factory(self.cog)
         if await _find_player(self.player_id, session_factory=sf) is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         await interaction.response.send_modal(
             IgnModal(cog=self.cog, player_id=self.player_id)
@@ -505,7 +508,11 @@ class PlayerEditorView(SafeView):
     async def on_tiers(self, interaction, button) -> None:
         if not await self._admin(interaction):
             return
-        view = TierKitSelectView(cog=self.cog, player_id=self.player_id)
+        view = TierKitSelectView(
+            cog=self.cog,
+            player_id=self.player_id,
+            kits=await get_kits(session_factory=_cog_session_factory(self.cog)),
+        )
         embed = await view._embed()
         await self._swap(interaction, embed, view)
 
@@ -515,7 +522,11 @@ class PlayerEditorView(SafeView):
             return
         now = int(time.time() * 1000)
         sf = _cog_session_factory(self.cog)
-        view = CooldownEditView(cog=self.cog, player_id=self.player_id)
+        view = CooldownEditView(
+            cog=self.cog,
+            player_id=self.player_id,
+            kits=await get_kits(session_factory=_cog_session_factory(self.cog)),
+        )
         player = await _find_player(self.player_id, session_factory=sf)
         embed = await _cooldown_embed(player or {}, now, session_factory=sf)
         await self._swap(interaction, embed, view)
@@ -528,7 +539,7 @@ class PlayerEditorView(SafeView):
         player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         view = HistoryView(cog=self.cog, player_id=self.player_id)
         await self._swap(interaction, _history_embed(player), view)
@@ -551,11 +562,13 @@ class PlayerEditorView(SafeView):
 class TierKitSelectView(SafeView):
     """1) Výběr kitu pro změnu tieru."""
 
-    def __init__(self, *, cog, player_id: str):
+    def __init__(self, *, cog, player_id: str, kits: list[str] | None = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.player_id = player_id
-        kits = get_kits() or list(DEFAULT_KITS)
+        # Katalog předává volající (z DB přes services.kit_catalog) – tady se
+        # žádný soubor nečte, protože __init__ nemá session factory.
+        kits = list(kits) if kits else list(DEFAULT_KITS)
         select = discord.ui.Select(
             custom_id="edituser_tier_kit",
             placeholder="Vyber kit, jehož tier chceš změnit...",
@@ -595,7 +608,7 @@ class TierKitSelectView(SafeView):
         player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         kit_key = values[0]
         old = _current_tier(player, kit_key)
@@ -619,7 +632,7 @@ class TierKitSelectView(SafeView):
         player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         view = PlayerEditorView(cog=self.cog, player_id=self.player_id)
         await interaction.response.defer(ephemeral=True)
@@ -674,10 +687,12 @@ class TierSelectView(SafeView):
             )
         value = values[0]
         retired = (value or "").startswith("R")
-        players = load_data("players.json", [], strict=True) or []
+        shape = await _find_player(
+            self.player_id, session_factory=_cog_session_factory(self.cog)
+        ) or {}
         try:
             _new_players, target, old, outcome = change_kit_tier(
-                players,
+                [shape],
                 {"discordId": self.player_id},
                 self.kit_key,
                 value,
@@ -729,7 +744,7 @@ class TierSelectView(SafeView):
         player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         view = PlayerEditorView(cog=self.cog, player_id=self.player_id)
         await interaction.response.defer(ephemeral=True)
@@ -746,12 +761,20 @@ class TierSelectView(SafeView):
 class CooldownEditView(SafeView):
     """Přehled + úprava cooldownů (stávající výpočty/soubory)."""
 
-    def __init__(self, *, cog, player_id: str, kit_key: str | None = None):
+    def __init__(
+        self,
+        *,
+        cog,
+        player_id: str,
+        kit_key: str | None = None,
+        kits: list[str] | None = None,
+    ):
         super().__init__(timeout=300)
         self.cog = cog
         self.player_id = player_id
         self.kit_key = kit_key
-        kits = get_kits() or list(DEFAULT_KITS)
+        # Viz TierKitSelectView: katalog předává volající, tady se nic nečte.
+        kits = list(kits) if kits else list(DEFAULT_KITS)
         select = discord.ui.Select(
             custom_id="edituser_cd_kit",
             placeholder="Vyber kit pro HT3+ cooldown...",
@@ -781,7 +804,10 @@ class CooldownEditView(SafeView):
                 "ℹ️ Vyber kit z menu.", ephemeral=True
             )
         view = CooldownEditView(
-            cog=self.cog, player_id=self.player_id, kit_key=values[0]
+            cog=self.cog,
+            player_id=self.player_id,
+            kit_key=values[0],
+            kits=await get_kits(session_factory=_cog_session_factory(self.cog)),
         )
         await interaction.response.defer(ephemeral=True)
         self.stop()
@@ -904,7 +930,7 @@ class CooldownEditView(SafeView):
         player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         view = PlayerEditorView(cog=self.cog, player_id=self.player_id)
         await interaction.response.defer(ephemeral=True)
@@ -934,7 +960,7 @@ class HistoryView(SafeView):
         player = await _find_player(self.player_id, session_factory=sf)
         if player is None:
             return await interaction.response.send_message(
-                "❌ Hráč už v players.json není.", ephemeral=True
+                "❌ Hráč už v databázi není.", ephemeral=True
             )
         view = PlayerEditorView(cog=self.cog, player_id=self.player_id)
         await interaction.response.defer(ephemeral=True)
@@ -966,7 +992,7 @@ class ConfirmEditView(SafeView):
         sf = _cog_session_factory(self.cog)
         player = await _find_player(self.payload["player_id"], session_factory=sf)
         if player is None:
-            return "Hráč už v players.json není."
+            return "Hráč už v databázi není."
         field = stale.get("field")
         old = str(stale.get("old_value") or "")
         if field == "discord_id":
@@ -1120,7 +1146,7 @@ class EditUser(commands.Cog):
         description="Otevře admin editor hráče (Discord ID, IGN, tiery, cooldowny)",
     )
     @app_commands.describe(
-        player="Hráč, jehož data chceš upravit (musí mít záznam v players.json)"
+        player="Hráč, jehož data chceš upravit (musí mít záznam v PostgreSQL)"
     )
     async def edituser(
         self, interaction: discord.Interaction, player: discord.User

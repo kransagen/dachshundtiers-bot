@@ -5,12 +5,14 @@ veřejný výsledek HT Fightu v určeném kanálu a zapinguje nakonfigurovanou r
 NENÍ to žebříček a nepočítá žádné „top" hráče.
 
 Klíčové vlastnosti:
-  - záznam jde do STEJNÉ kanonické historie výsledků jako /result
-    (``data/ht_results.json``, append-only) s ``resultType: "ht_fight"`` —
-    žádná samostatná databáze (žádný topresults.json),
-  - **výhra povyšuje hráče** na další tier v players.json (canonické pravidlo:
-    ``next_ticket_tier`` ze žebříčku bez virtuálního LT3E), **prohra tier
-    nemění**; neznámý/nečitelný tier → žádné povýšení (nikdy se nehádá),
+  - záznam jde do STEJNÉ kanonické historie výsledků jako /result (tabulka
+    ``results``, append-only) s ``resultType: "ht_fight"`` — žádná samostatná
+    databáze (žádný topresults.json),
+  - **výhra povyšuje hráče** na další tier (canonické pravidlo:
+    ``next_ticket_tier`` ze žebříčku bez virtuálního LT3E) — povýšení se
+    potvrdí na Discordu a zapíše do ``player_current_tiers``,
+    **prohra tier nemění**; neznámý/nečitelný tier → žádné povýšení (nikdy
+    se nehádá, mirror je jediný zdroj aktuálního tieru),
   - **bridge** (volitelný, jen při výhře): tester může hráče povýšit
     PŘESKOČENÍM mezistupňů rovnou na zadaný cílový tier (např. topresult o
     získání HT3, ale hráč z LT3 bridgne rovnou na LT2) – cíl musí být reálný
@@ -32,6 +34,10 @@ Klíčové vlastnosti:
 
         <@&ROLE>
 
+DRUHÝ REŽIM TU UŽ NENÍ. ``players.json`` / ``ht_results.json`` /
+``ht_tickets.json`` / ``ht3_cooldowns.json`` se nečtou ani nezapisují;
+``record_ht_fight`` a čtecí funkce vyžadují ``session_factory``.
+
 Žádná závislost na discord.py → snadné testy.
 """
 
@@ -45,6 +51,7 @@ from db.repositories.cooldowns import COOLDOWN_HT3, CooldownRepository
 from db.repositories.kits import KitRepository, TierDefinitionRepository
 from db.repositories.players import PlayerIdentityError, PlayerRepository
 from db.repositories.results import (
+    ANNOUNCEMENT_STATUSES,
     PROMOTION_COMMITTED,
     PROMOTION_DISCORD_PENDING,
     ResultRepository,
@@ -53,29 +60,17 @@ from db.repositories.sync_audit import AuditRepository
 from db.repositories.tickets import TICKET_OPEN, TicketRepository
 from db.repositories.tiers import MirrorRepository
 from db.services.session import transaction as db_transaction
-from services.player_identity import PlayerIdentityConflict
 from services.results import (
-    ANNOUNCEMENT_STATUSES,
-    HT_RESULTS_FILE,
     _db_result_to_dict,
-    apply_result_to_players,
-    close_ticket_in_tx,
-    make_result,
     normalize_tier,
 )
-from services.store import read as store_read, transaction
 from services.tickets import (
-    HT3_COOLDOWNS_FILE,
     HT3_TIER_LADDER,
-    HT_TICKETS_FILE,
-    HT_TICKET_LOGS_FILE,
-    STATUS_OPEN,
     TICKET_TYPE_FIGHT,
     _db_resolve_kit,
     _db_resolve_tier,
     _db_ticket_to_dict,
     _ms_to_dt,
-    is_ht_fight_ticket,
     next_ticket_tier,
 )
 
@@ -133,58 +128,6 @@ _MSG_BRIDGE_NOT_HIGHER = (
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
-
-
-def _find_recent_ht_fight_duplicate(
-    results: dict,
-    player_id: str,
-    *,
-    kit: str,
-    fight_tier: str,
-    score: str,
-    outcome: str,
-    opponent_id,
-    tier_status: str,
-    now: int,
-):
-    """Volný HT Fight záznam identický s tímto odesláním (dedup), nebo None.
-
-    Porovnává POUZE volné záznamy (žádný ticketId – ticket režim má vlastní
-    idempotenci podle klíče) v časovém okně ``HT_FIGHT_DEDUP_WINDOW_MS``.
-    Vrací existující záznam, jinak ``None``.
-    """
-    kit_low = (kit or "").strip().lower()
-    ft = (fight_tier or "").strip().upper()
-    sc = (score or "").strip().lower()
-    oc = (outcome or "").strip()
-    op = str(opponent_id or "").strip()
-    ts = (tier_status or "").strip().upper()
-    for record in results.values():
-        if not isinstance(record, dict):
-            continue
-        if record.get("resultType") != "ht_fight":
-            continue
-        if record.get("ticketId"):
-            continue
-        if str(record.get("playerId", "")).strip() != str(player_id).strip():
-            continue
-        stamp = record.get("timestamp") or 0
-        if not stamp or now - int(stamp) > HT_FIGHT_DEDUP_WINDOW_MS:
-            continue
-        if str(record.get("kit", "")).strip().lower() != kit_low:
-            continue
-        if str(record.get("fightTier", "")).strip().upper() != ft:
-            continue
-        if str(record.get("score", "")).strip().lower() != sc:
-            continue
-        if str(record.get("outcome", "")).strip() != oc:
-            continue
-        if str(record.get("opponentId", "") or "").strip() != op:
-            continue
-        if str(record.get("tierStatus", "")).strip().upper() != ts:
-            continue
-        return record
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -315,35 +258,6 @@ def format_topresult_message(
 # ---------------------------------------------------------------------------
 # Čtení aktuálního tieru hráče (kontext záznamu + základ povýšení)
 # ---------------------------------------------------------------------------
-def find_player_tier_in(players, ign: str, kit: str, discord_id=None) -> str | None:
-    """Tier hráče (kit) v daném seznamu; Discord ID má přednost před IGN."""
-
-    def _tier_of(player):
-        if not isinstance(player, dict):
-            return None
-        modes = player.get("modes")
-        if not isinstance(modes, dict):
-            return None
-        tier = modes.get(kit)
-        return normalize_tier(tier) if tier else None
-
-    if not isinstance(players, list):
-        return None
-    if discord_id:
-        did = str(discord_id)
-        for p in players:
-            if isinstance(p, dict) and str(p.get("discordId") or "") == did:
-                return _tier_of(p)
-    ign_key = (ign or "").strip().lower()
-    for p in players:
-        if not isinstance(p, dict):
-            continue
-        if str(p.get("username", "")).strip().lower() != ign_key:
-            continue
-        return _tier_of(p)
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Záznam HT Fight výsledku (transakčně, do kanonické historie)
 # ---------------------------------------------------------------------------
@@ -367,7 +281,7 @@ async def record_ht_fight(
     now: int = None,
     date: str = "",
     ht3_cooldown_ms: int = 0,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zapíše HT Fight výsledek atomicky do kanonické historie výsledků.
 
@@ -389,7 +303,7 @@ async def record_ht_fight(
     (``ht_fight:htfight-{hráč}-{čas}``); identické opakované odeslání se
     dedupuje (2h okno).
 
-    ``session_factory`` → zápis do PostgreSQL (HT Fight tier jde do
+    ``session_factory`` (povinný) → zápis do PostgreSQL (HT Fight tier jde do
     ``Result.subtype``; výhra se vloží se stavem ``discord_pending`` – po
     potvrzení Discordu ho cog dotáhne ``commit_promotion_with_wedge`` se
     stejným ``result_key``, prohra zůstane bez promotion stavu).
@@ -403,195 +317,27 @@ async def record_ht_fight(
       - ``{"result": "wrong_player", "ticket"}`` / ``{"result": "wrong_kit", "ticket"}``
       - ``{"result": "invalid_*", "message": ...}`` (včetně ``invalid_bridge``)
     """
-    if session_factory is not None:
-        return await _db_record_ht_fight(
-            session_factory,
-            ticket_id=ticket_id,
-            player_id=player_id,
-            player_name=player_name,
-            ign=ign,
-            evaluator_id=evaluator_id,
-            evaluator_name=evaluator_name,
-            kit=kit,
-            fight_tier=fight_tier,
-            score=score,
-            outcome=outcome,
-            opponent_id=opponent_id,
-            opponent_name=opponent_name,
-            tier_status=tier_status,
-            bridge=bridge,
-            notes=notes,
-            now=now,
-            date=date,
-            ht3_cooldown_ms=ht3_cooldown_ms,
-        )
-    if now is None:
-        now = _now_ms()
-    player_id = str(player_id)
-    evaluator_id = str(evaluator_id)
-    score_clean = (score or "").strip()
-    status_clean = (tier_status or "").strip()
-    outcome_clean = "Won" if (outcome or "").strip().upper() == "WON" else "Lost"
-
-    # Základní validace (rychlá, před transakcí) ---------------------------------
-    if not player_id or not (ign or "").strip() or not (kit or "").strip():
-        return {
-            "result": "invalid_argument",
-            "message": "❌ Hráč, IGN a kit jsou povinné.",
-        }
-    ok, msg = validate_ht_fight_tier(fight_tier)
-    if not ok:
-        return {"result": "invalid_tier", "message": msg}
-    ok, msg = validate_ht_fight_score(score_clean)
-    if not ok:
-        return {"result": "invalid_score", "message": msg}
-    ok, msg = validate_ht_fight_outcome(outcome)
-    if not ok:
-        return {"result": "invalid_outcome", "message": msg}
-    ok, msg = validate_ht_fight_status(status_clean)
-    if not ok:
-        return {"result": "invalid_status", "message": msg}
-
-    # Bridge (volitelné): jen při výhře + reálný tier ze žebříčku.
-    # Podmínka „vyšší než aktuální tier hráče" se ověří a transakci
-    # (tam je znám aktuální tier z players.json).
-    bridge_clean = normalize_tier(bridge) if (bridge or "").strip() else ""
-    if bridge_clean:
-        if outcome_clean == "Lost":
-            return {"result": "invalid_bridge", "message": _MSG_BRIDGE_ONLY_ON_WIN}
-        ok, msg = validate_ht_fight_bridge(bridge_clean)
-        if not ok:
-            return {"result": "invalid_bridge", "message": msg}
-
-    files = [HT_RESULTS_FILE, "players.json"]
-    if ticket_id is not None:
-        files += [HT_TICKETS_FILE, HT3_COOLDOWNS_FILE, HT_TICKET_LOGS_FILE]
-
-    async def _run(tx):
-        results = tx.get(HT_RESULTS_FILE, {})
-
-        if ticket_id is not None:
-            tid = str(ticket_id)
-            key = f"{tid}{HT_FIGHT_TICKET_KEY_SUFFIX}"
-            existing = results.get(key)
-            if existing is not None:
-                return {"result": "duplicate", "existing": existing}
-
-            tickets = tx.get(HT_TICKETS_FILE, {})
-            ticket = tickets.get(tid)
-            if ticket is None:
-                return {"result": "not_found"}
-            if not is_ht_fight_ticket(ticket):
-                return {"result": "not_fight_ticket", "ticket": ticket}
-            if ticket.get("status") != STATUS_OPEN:
-                return {"result": "ticket_closed", "ticket": ticket}
-            if str(ticket.get("ownerId", "")) != player_id:
-                return {"result": "wrong_player", "ticket": ticket}
-            if str(ticket.get("kit", "")).strip().lower() != str(kit).strip().lower():
-                return {"result": "wrong_kit", "ticket": ticket}
-            result_id = key
-        else:
-            # Volný HT Fight výsledek: ochrana před duplicitou (dvojklik /
-            # dvakrát odeslaný identický zápas) – viz _find_recent_ht_fight_duplicate.
-            dup = _find_recent_ht_fight_duplicate(
-                results,
-                player_id,
-                kit=kit,
-                fight_tier=fight_tier,
-                score=score_clean,
-                outcome=outcome_clean,
-                opponent_id=opponent_id,
-                tier_status=status_clean,
-                now=now,
-            )
-            if dup is not None:
-                return {"result": "duplicate", "existing": dup}
-            result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
-
-        players = tx.get("players.json", [])
-        current = find_player_tier_in(players, ign, kit, discord_id=player_id)
-        previous = current or "N/A"
-
-        promoted = None
-        if outcome_clean == "Won" and bridge_clean:
-            # Bridge: povýšení přeskočením na zadaný cílový tier. Cíl MUSÍ
-            # být strictly vyšší než aktuální tier hráče (když je známý) –
-            # jinak by „bridge" bridgoval dolů / do setrvání (chyba).
-            if current and current in HT3_TIER_LADDER and (
-                HT3_TIER_LADDER.index(bridge_clean)
-                <= HT3_TIER_LADDER.index(current)
-            ):
-                return {
-                    "result": "invalid_bridge",
-                    "message": _MSG_BRIDGE_NOT_HIGHER.format(
-                        bridge=bridge_clean, current=current
-                    ),
-                }
-            promoted = bridge_clean
-        elif outcome_clean == "Won" and current:
-            promoted = next_ticket_tier(current)
-        new_tier = promoted if promoted else ""
-
-        if outcome_clean == "Won" and promoted is not None:
-            try:
-                players, _ = apply_result_to_players(
-                    players, ign, kit, promoted, date, player_id=player_id
-                )
-            except PlayerIdentityConflict as exc:
-                return {"result": "identity_conflict", "message": str(exc)}
-            tx.set("players.json", players)
-
-        record = make_result(
-            result_id=result_id,
-            kind="ht_fight",
-            ticket_id=str(ticket_id) if ticket_id is not None else None,
-            player_id=player_id,
-            player_name=player_name,
-            ign=ign,
-            evaluator_id=evaluator_id,
-            evaluator_name=evaluator_name,
-            kit=kit,
-            previous_tier=previous,
-            new_tier=new_tier,
-            display_tier="",
-            score=score_clean,
-            outcome=outcome_clean,
-            notes=notes,
-            eval_flag=False,
-            now=now,
-            date=date,
-            result_type="ht_fight",
-            fight_tier=fight_tier,
-            tier_status=status_clean,
-            opponent_id=str(opponent_id) if opponent_id else None,
-            opponent_name=opponent_name,
-        )
-        if bridge_clean:
-            record["bridgeTier"] = bridge_clean
-        results[result_id] = record
-        tx.set(HT_RESULTS_FILE, results)
-
-        # Prohra uvnitř HT Fight ticketu = vyřešený ticket → zavření + HT3+
-        # cooldown vlastníka + událost v logu (sdílené zavírání s /result).
-        # Výhra ticket NIKDY nezavírá a cooldown nenastavuje – hráč může
-        # ve výhře pokračovat, prohra ho pošle do cooldownu.
-        if ticket_id is not None and outcome_clean == "Lost":
-            close_ticket_in_tx(
-                tx,
-                tickets,
-                ticket,
-                tid,
-                now=now,
-                actor_id=evaluator_id,
-                actor_name=evaluator_name,
-                ht3_cooldown_ms=ht3_cooldown_ms,
-                log_action="ht_fight",
-                log_details=f"{previous} (prohra)",
-            )
-
-        return {"result": "created", "record": record, "previous_tier": previous}
-
-    return await transaction(tuple(files), _run)
+    return await _db_record_ht_fight(
+        session_factory,
+        ticket_id=ticket_id,
+        player_id=player_id,
+        player_name=player_name,
+        ign=ign,
+        evaluator_id=evaluator_id,
+        evaluator_name=evaluator_name,
+        kit=kit,
+        fight_tier=fight_tier,
+        score=score,
+        outcome=outcome,
+        opponent_id=opponent_id,
+        opponent_name=opponent_name,
+        tier_status=tier_status,
+        bridge=bridge,
+        notes=notes,
+        now=now,
+        date=date,
+        ht3_cooldown_ms=ht3_cooldown_ms,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -613,54 +359,44 @@ async def set_ht_fight_announcement(
     status = (status or "").strip()
     if status not in ANNOUNCEMENT_STATUSES:
         return {"result": "invalid_status"}
-    if session_factory is not None:
-        return await _db_set_ht_fight_announcement(
-            session_factory, result_id, status, message_id=message_id
+    if session_factory is None:
+        raise RuntimeError(
+            "set_ht_fight_announcement potřebuje PostgreSQL; "
+            "ht_results.json se už nepoužívá"
         )
-
-    async def _run(tx):
-        results = tx.get(HT_RESULTS_FILE, {})
-        record = results.get(str(result_id))
-        if record is None:
-            return {"result": "not_found"}
-        record["announcement"] = status
-        if message_id is not None:
-            record["messageId"] = str(message_id)
-        tx.set(HT_RESULTS_FILE, results)
-        return {"result": "ok", "record": record}
-
-    return await transaction((HT_RESULTS_FILE,), _run)
+    return await _db_set_ht_fight_announcement(
+        session_factory, result_id, status, message_id=message_id
+    )
 
 
 # ---------------------------------------------------------------------------
 # Čtení HT Fight výsledků (restart-safe)
 # ---------------------------------------------------------------------------
 async def get_ht_fight_result_for_ticket(
-    ticket_id, session_factory: async_sessionmaker[AsyncSession] | None = None
+    ticket_id, session_factory: async_sessionmaker[AsyncSession]
 ) -> dict | None:
     """HT Fight výsledek pro daný ticket (podle ID kanálu), nebo None."""
-    if session_factory is not None:
-        return await _db_get_ht_fight_result_for_ticket(session_factory, ticket_id)
-    results = await store_read(HT_RESULTS_FILE, {})
-    return results.get(f"{str(ticket_id)}{HT_FIGHT_TICKET_KEY_SUFFIX}")
+    if session_factory is None:
+        raise RuntimeError(
+            "get_ht_fight_result_for_ticket potřebuje PostgreSQL; "
+            "ht_results.json se už nepoužívá"
+        )
+    return await _db_get_ht_fight_result_for_ticket(session_factory, ticket_id)
 
 
 async def get_ht_fight_results(
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> list:
     """Všechny HT Fight výsledky v pořadí zápisu."""
-    if session_factory is not None:
-        return await _db_get_ht_fight_results(session_factory)
-    results = await store_read(HT_RESULTS_FILE, {})
-    return [
-        r
-        for r in results.values()
-        if isinstance(r, dict) and r.get("resultType") == "ht_fight"
-    ]
+    if session_factory is None:
+        raise RuntimeError(
+            "get_ht_fight_results potřebuje PostgreSQL; ht_results.json se už nepoužívá"
+        )
+    return await _db_get_ht_fight_results(session_factory)
 
 
 # ---------------------------------------------------------------------------
-# DB mode (PostgreSQL) — result_key = f"ht_fight:{result_id}" tak, aby
+# PostgreSQL implementace — result_key = f"ht_fight:{result_id}" tak, aby
 # commit_promotion_with_wedge (cog) našel řádek po Discord mutaci; HT Fight
 # tier se ukládá do Result.subtype, announcement do announcement_status.
 # ---------------------------------------------------------------------------

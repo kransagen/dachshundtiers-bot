@@ -78,31 +78,22 @@ CURRENT_TIER_FILES = ("players.json",)
 # ``session_factory`` into ``record_result``/``record_ht_fight``, so
 # players.json was written first and unconditionally, in every deployment.
 # The commands now pass the session factory (the DB dispatcher is taken
-# first), so these four sites are genuinely dead whenever PostgreSQL is
-# configured and are classified as ``json_legacy_mode_only_pg_gated``. The
-# regression that would resurrect H1 is pinned by an AST/qualname test in
-# ``tests/test_g0_promotion_cutover.py``, not by a permanent allowlist label.
+# first), so those legacy sites are gone entirely. The regression that would
+# resurrect H1 is pinned by an AST/qualname test in
+# ``tests/test_g0_promotion_cutover.py``.
+#
+# B/C FYI: the formerly listed JSON readers/writers (cogs.edituser
+# ``_find_player_sync``/modaly, cogs.sync ``_canonical_*``/``save_players``,
+# cogs.results ``removeplayertiers._run``, services.edituser
+# ``apply_player_edit``/``execute_player_edit``, services.tickets
+# ``find_player_tier``, services.results``record_result._run``,
+# services.topresult ``record_ht_fight._run``) are DELETED — nothing left to
+# classify. Jediné legacy JSON I/O, které v produkci zůstává, je datacheck
+# (migrační/inspenkční tooling na data/).
 SAFE_TIER_READER_FLOWS: dict[tuple[str, str, str], str] = {
-    ("cogs.edituser", "_find_player_sync", "load_data"): "json_ui_read",
-    ("cogs.edituser", "DiscordIdModal.on_submit", "load_data"): "json_ui_read",
-    ("cogs.edituser", "IgnModal.on_submit", "load_data"): "json_ui_read",
-    ("cogs.edituser", "TierSelectView.on_tier", "load_data"): "json_ui_read",
-    ("cogs.results", "Results.removeplayertiers._run", "tx.get"): "json_legacy_mode_only_pg_gated",
-    ("cogs.results", "Results.removeplayertiers._run", "tx.set"): "json_legacy_mode_only_pg_gated",
-    ("cogs.sync", "_canonical_for_export", "load_data"): "web_export_canonical",
-    ("cogs.sync", "_canonical_players", "load_data"): "web_export_canonical",
-    ("cogs._shared", "save_players._run", "tx.set"): "json_legacy_mode_only_pg_gated",
     ("services.datacheck", "run_datacheck", "store_read"): "discord_observe_or_analysis",
     ("services.datacheck", "perform_repairs._run", "tx.get"): "json_legacy_mode_only_pg_gated",
     ("services.datacheck", "perform_repairs._run", "tx.set"): "json_legacy_mode_only_pg_gated",
-    ("services.edituser", "apply_player_edit._run", "tx.get"): "json_legacy_mode_only_pg_gated",
-    ("services.edituser", "apply_player_edit._run", "tx.set"): "json_legacy_mode_only_pg_gated",
-    ("services.edituser", "execute_player_edit", "_store_read"): "json_legacy_mode_only_pg_gated",
-    ("services.tickets", "find_player_tier", "load_data"): "json_legacy_mode_only_pg_gated",
-    ("services.results", "record_result._run", "tx.get"): "json_legacy_mode_only_pg_gated",
-    ("services.results", "record_result._run", "tx.set"): "json_legacy_mode_only_pg_gated",
-    ("services.topresult", "record_ht_fight._run", "tx.get"): "json_legacy_mode_only_pg_gated",
-    ("services.topresult", "record_ht_fight._run", "tx.set"): "json_legacy_mode_only_pg_gated",
 }
 
 FORBIDDEN_FLOWS = {"json_tier_to_discord", "json_tier_to_pg"}

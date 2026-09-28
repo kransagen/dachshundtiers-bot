@@ -1,16 +1,19 @@
-"""DB (PostgreSQL) i JSON režim services/tester_stats.py — Phase F (todo #4).
+"""services/tester_stats.py — PostgreSQL only (Phase F todo #4).
 
-JSON režim (session_factory=None): statistika se čte/zapisuje
-``testers_stats.json`` přesně jako původní cog kód (parita chování).
+Statistiky se odvozují za běhu z ``Result`` (jen ``kind`` ticket/queue —
+ht_fight se nikdy nepočítal, ani v bývalém JSONu) + ruční kredity
+``/addtest`` (``tester_credits``) pro total/monthly.
 
-DB režim: statistiky se odvozují za běhu z ``Result`` (jen kind ticket/queue —
-ht_fight se v JSONu nikdy nepočítal) + ruční kredity ``/addtest``
-(``tester_credits``) pro total/monthly.
+JSON režim je pryč. ``testers_stats.json`` už není čtený ani zapisovaný;
+``test_json_mode_*`` je nahrazen testem, který hlídá, že se k souboru
+nesáhne (viz ``test_no_json_mode_anymore``).
 """
 
+import json
 from datetime import datetime, timezone
 from itertools import count
 
+import pytest
 from sqlalchemy import select
 
 from db.models import Result
@@ -248,20 +251,43 @@ async def test_remove_tester_credit(session_factory, clean_db):
         assert row.amount == 0
 
 
-async def test_json_mode_credit_and_stats(tmp_path, monkeypatch):
+async def test_no_json_mode_anymore(session_factory, clean_db, tmp_path, monkeypatch):
+    """``testers_stats.json`` is gone: no silent second source of truth.
+
+    A statistics function that can answer from a file when the database is not
+    reachable is exactly the failure mode this cleanup removes — the two would
+    drift, and nobody could tell which one a number came from. Every entry
+    point must therefore refuse rather than fall back.
+    """
     import storage
 
     monkeypatch.setattr(storage, "DATA_DIR", str(tmp_path))
-    await stats.credit_tester("999", 3, "04.2025")
-    data = await stats.tester_stats("999")
-    assert data["total"] == 3
-    assert data["monthly"] == {"04.2025": 3}
+    (tmp_path / "testers_stats.json").write_text(
+        '{"999": {"total": 3, "monthly": {"04.2025": 3}}}'
+    )
 
-    total = await stats.remove_tester_credit("999", 1)
-    assert total == 2
-    data = await stats.tester_stats("999")
-    assert data["total"] == 2
+    for call in (
+        stats.tester_stats("999", session_factory=None),
+        stats.tester_leaderboard("all", session_factory=None),
+        stats.credit_tester("999", 3, "04.2025", session_factory=None),
+        stats.remove_tester_credit("999", 1, session_factory=None),
+    ):
+        with pytest.raises(RuntimeError, match="PostgreSQL"):
+            await call
 
-    entries = await stats.tester_leaderboard("all")
-    assert entries == [("999", 2)]
-    assert await stats.tester_stats("555") is None
+    # The file was neither read nor written.
+    assert json.loads((tmp_path / "testers_stats.json").read_text()) == {
+        "999": {"total": 3, "monthly": {"04.2025": 3}}
+    }
+
+
+async def test_stats_refuse_without_a_session_factory():
+    """A missing argument is a TypeError, not a fallback to a file."""
+    with pytest.raises(TypeError):
+        await stats.tester_stats("999")
+    with pytest.raises(TypeError):
+        await stats.tester_leaderboard("all")
+    with pytest.raises(TypeError):
+        await stats.credit_tester("999", 1, "04.2025")
+    with pytest.raises(TypeError):
+        await stats.remove_tester_credit("999", 1)

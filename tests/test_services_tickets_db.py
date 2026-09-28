@@ -5,12 +5,13 @@ ověřuje, že produkční cesta přes ``session_factory`` dodržuje stejný JSO
 kontrakt (výsledkové dicty, prevence duplicit, cooldowny, logy).
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from db.repositories.cooldowns import COOLDOWN_HT3, CooldownRepository
-from db.repositories.kits import KitRepository, ensure_dimensions
+from db.repositories.kits import KitRepository, TierDefinitionRepository, ensure_dimensions
 from db.repositories.players import PlayerRepository
-from db.repositories.tickets import TicketRepository
+from db.repositories.tickets import TicketMemberRepository, TicketRepository
+from db.repositories.tiers import MirrorServiceRepository
 from db.services.session import transaction
 from services import tickets as svc
 
@@ -327,3 +328,148 @@ async def test_members_are_discord_ids_in_contract(session_factory, clean_db):
     assert t["members"] == ["200"]
     assert t["ownerId"] == "100"
     assert t["panelMessageId"] is None
+
+
+async def test_player_tier_resolves_from_db(session_factory, clean_db):
+    """player_tier čte aktuální tier z mirror tabulky (nikdy z players.json)."""
+    async with transaction(session_factory) as session:
+        await ensure_dimensions(session, KITS, TIERS)
+        _, player = await PlayerRepository().claim_discord_id(
+            session, discord_id=100, ign="Owner100"
+        )
+        kit = await KitRepository().get_by_key(session, "ht3")
+        tier = await TierDefinitionRepository().get_by_code(session, "LT5")
+        await MirrorServiceRepository().apply_observation(
+            session,
+            player_id=player.id,
+            kit_id=kit.id,
+            tier_id=tier.id,
+            observed_at=datetime.now(timezone.utc) - timedelta(hours=1),
+            source="manual",
+            reason="test-seed",
+        )
+
+    assert await svc.player_tier("Owner100", "HT3", session_factory=session_factory) == "LT5"
+    # case-insensitive IGN
+    assert await svc.player_tier("OWNER100", "ht3", session_factory=session_factory) == "LT5"
+    # jiný kit bez mirroru / neznámý hráč → None
+    assert (
+        await svc.player_tier("Owner100", "Tournament", session_factory=session_factory)
+        is None
+    )
+    assert (
+        await svc.player_tier("nobody", "HT3", session_factory=session_factory) is None
+    )
+
+
+async def test_claim_ticket_concurrent_single_winner(session_factory, clean_db):
+    """Dva souběžné claimy dvou testerů → přesně jeden vyhrál.
+
+    H9 audit fix: řádkový zámek (``FOR UPDATE``) v ``_db_claim_ticket``
+    serializuje souběžné claimy. Poražený tester po odemčení vidí
+    commitnutého claimera a dostane čistě ``already_claimed`` — nikdy ne
+    ``claimed`` a nikdy syrovou vyjímku.
+    """
+    import asyncio
+
+    await _seed(session_factory)
+    await _create(session_factory, channel_id=133, owner_id=100)
+    outcomes = await asyncio.gather(
+        svc.claim_ticket(133, "200", "Tester A", session_factory=session_factory),
+        svc.claim_ticket(133, "300", "Tester B", session_factory=session_factory),
+        return_exceptions=True,
+    )
+    claimed = [
+        o for o in outcomes
+        if isinstance(o, dict) and o.get("result") == "claimed"
+    ]
+    assert len(claimed) == 1, outcomes
+    others = [
+        o for o in outcomes
+        if not (isinstance(o, dict) and o.get("result") == "claimed")
+    ]
+    assert len(others) == 1, outcomes
+    assert isinstance(others[0], dict), (
+        "poražený claim musí být čistý already_claimed dict, ne vyjímka: "
+        f"{others[0]!r}"
+    )
+    assert others[0]["result"] == "already_claimed"
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, 133)
+    assert t is not None and t.claimer_id is not None
+
+
+async def test_add_member_concurrent_duplicate(session_factory, clean_db):
+    """Dva souběžné /add stejného člena → přesně 1 aktivní členství.
+
+    H10 audit fix: částečný unique index ``uq_ticket_members_active``
+    (ticket_id, player_id WHERE removed_at IS NULL) pustí jen jedno aktivní
+    členství; poražený přidání dostane čistě ``already_member`` místo syrového
+    IntegrityError. Člena předzaložíme, aby souběžnost testovala členství,
+    ne závod na vytvoření jeho players záznamu (ta je samostatný jev).
+    """
+    import asyncio
+
+    await _seed(session_factory)
+    await _create(session_factory, channel_id=134, owner_id=100)
+    async with transaction(session_factory) as session:
+        await PlayerRepository().get_or_create_by_discord_id(
+            session, discord_id=200, ign="Witness"
+        )
+    outcomes = await asyncio.gather(
+        svc.add_member(
+            134, "200", member_name="Witness", session_factory=session_factory
+        ),
+        svc.add_member(
+            134, "200", member_name="Witness", session_factory=session_factory
+        ),
+        return_exceptions=True,
+    )
+    added = [
+        o for o in outcomes
+        if isinstance(o, dict) and o.get("result") == "added"
+    ]
+    already = [
+        o for o in outcomes
+        if isinstance(o, dict) and o.get("result") == "already_member"
+    ]
+    assert len(added) == 1, outcomes
+    assert len(already) == 1, outcomes
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, 134)
+        rows = await TicketMemberRepository().list_for_ticket(
+            session, ticket_id=t.id
+        )
+    assert len(rows) == 1
+    assert len([r for r in rows if r.removed_at is None]) == 1
+
+
+async def test_remove_then_readd_preserves_membership_history(
+    session_factory, clean_db
+):
+    """Re-add po odebrání zůstává legální a historie se zachovává.
+
+    Částečný unique index se vztahuje jen na AKTIVNÍ členství
+    (``removed_at IS NULL``); po ``remove`` může být stejný hráč znovu
+    přidán a v ``ticket_members`` zůstanou obě řádky (historie).
+    """
+    await _seed(session_factory)
+    await _create(session_factory, channel_id=135, owner_id=100)
+    r1 = await svc.add_member(
+        135, "200", member_name="W1", session_factory=session_factory
+    )
+    assert r1["result"] == "added"
+    r2 = await svc.remove_member(135, "200", session_factory=session_factory)
+    assert r2["result"] == "removed"
+    r3 = await svc.add_member(
+        135, "200", member_name="W1", session_factory=session_factory
+    )
+    assert r3["result"] == "added"
+    assert r3["ticket"]["members"] == ["200"]
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, 135)
+        rows = await TicketMemberRepository().list_for_ticket(
+            session, ticket_id=t.id
+        )
+    assert len(rows) == 2  # historie zachována
+    assert len([r for r in rows if r.removed_at is None]) == 1

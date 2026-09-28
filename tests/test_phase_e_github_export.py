@@ -1,10 +1,12 @@
-"""Phase E, E7 — GitHub export is strictly downstream-only.
+"""Phase E, E7 + Phase B (B1/B2) — GitHub export is strictly downstream-only.
 
 Postgres/DB is NOT a source for the export and the export NEVER changes
 Discord:
 
-- /sync web runs even when PostgreSQL is unavailable (export reads the
-  players.json export artifact, not the DB);
+- /sync web export reads the canonical roster EXCLUSIVELY from PostgreSQL
+  (``_canonical_for_export`` → ``export_players``; players.json je export
+  artifact, nikdy zdroj); bez PostgreSQL (session_factory=None / nefunkční)
+  export NEproběhne – žádný legacy JSON fallback;
 - a failed export push is reported LOUDLY and Discord roles are never
   touched (no add_roles / remove_roles / edit anywhere in the export path);
 - the confirmed canonical fingerprint is re-verified before pushing — a
@@ -90,7 +92,6 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
         patch = mock.patch.object(permissions, "ADMIN_ROLE_IDS", [999])
         patch.start()
         self.addCleanup(patch.stop)
-        storage.save_data("players.json", [dict(p) for p in self.CANONICAL])
         self._clear_websync_log()
 
     def _clear_websync_log(self):
@@ -102,21 +103,25 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
         *,
         push_result=(True, "✅ players.json na webu nahrazen", []),
         fetch_returns=None,
-        db_session_factory=object(),
+        canonical=None,
         guild=None,
     ):
         """Spustí /sync web apply + potvrzení; vrací dict s výsledky.
 
-        Push/fetch mocky a Discord interakce se čtou UVNITŘ ``main`` –
-        ``mock.patch.object`` se po ``asyncio.run`` uklidí."""
+        Kanonická podoba hráčů přichází z PostgreSQL exportu
+        (``_canonical_for_export``) – mockuje se na „DB'' zdroj, nikdy to
+        není players.json. Push/fetch mocky a Discord interakce se čtou
+        UVNITŘ ``main`` – ``mock.patch.object`` se po ``asyncio.run`` uklidí.
+        """
         from cogs.sync import SyncWebConfirmView
 
         cog = self.Sync.__new__(self.Sync)
-        cog.bot = SimpleNamespace(db_session_factory=db_session_factory)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         inter = _interaction(
             user=_admin_member(), guild=guild if guild is not None else mock.MagicMock()
         )
         holder = {"pusher": None, "confirm": None}
+        canonical_list = [dict(p) for p in self.CANONICAL] if canonical is None else canonical
 
         async def main():
             with mock.patch.object(
@@ -126,7 +131,10 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
             ), mock.patch.object(
                 github_sync, "push_players",
                 new=mock.AsyncMock(return_value=push_result),
-            ) as pusher:
+            ) as pusher, mock.patch(
+                "cogs.sync._canonical_for_export",
+                new=mock.AsyncMock(return_value=canonical_list),
+            ):
                 holder["pusher"] = pusher
                 await self.Sync.sync_web.callback(cog, inter, "apply")
                 view = inter.followup.send.call_args.kwargs["view"]
@@ -153,10 +161,10 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
             embeds = []
         return (embeds[0] if embeds else None), kwargs
 
-    def test_export_runs_with_db_down_and_succeeds(self):
-        """DB úplně pryč (session_factory=object): export proběhne a nahraje
-        na web — export nikdy nečte DB jako zdroj."""
-        res = self._run_apply(db_session_factory=object())
+    def test_export_runs_from_postgres_and_succeeds(self):
+        """Export čte kanoniku EXKLUZIVNĚ z PostgreSQL exportu (_canonical_for_export
+        → export_players; players.json se nečte): proběhne a nahraje na web."""
+        res = self._run_apply()
         embed, _ = self._sent(res["confirm"])
         self.assertIn("✅ /sync web – web synchronizován", embed.title)
         logs = storage.load_data(WEBSYNC_LOG_FILE, [])
@@ -237,9 +245,9 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
                 self.assertNotIn(call, body)
 
     def test_confirmation_fingerprint_stale_pushes_nothing(self):
-        """Kanonika se mezi náhledem a potvrzením změnila → nic se na web
-        neposílá (export nikdy nepřidá nic automaticky navíc) a Discord se
-        nedotýká."""
+        """PostgreSQL export se mezi náhledem a potvrzením změnil → nic se
+        na web neposílá (export nikdy nepřidá nic automaticky navíc) a
+        Discord se nedotýká."""
         alice = SimpleNamespace(
             id=1, add_roles=mock.AsyncMock(), remove_roles=mock.AsyncMock(),
             edit=mock.AsyncMock(),
@@ -249,6 +257,15 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
         cog.bot = SimpleNamespace(db_session_factory=object())
         inter = _interaction(user=_admin_member(), guild=guild)
         holder = {"pusher": None, "confirm": None}
+        calls = {"n": 0}
+
+        def canonical_bump(*_args, **_kwargs):
+            # 1. volání = náhled (apply), 2. volání = potvrzení – export
+            # z PostgreSQL se mezitím změnil (nový hráč).
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [dict(p) for p in self.CANONICAL]
+            return [dict(p) for p in self.CANONICAL] + [_player(3)]
 
         async def main():
             with mock.patch.object(
@@ -256,15 +273,14 @@ class GitHubExportDownstreamOnlyTests(unittest.TestCase):
                 new=mock.AsyncMock(return_value=(self.WEB, "sha", None)),
             ), mock.patch.object(
                 github_sync, "push_players", new=mock.AsyncMock(),
-            ) as pusher:
+            ) as pusher, mock.patch(
+                "cogs.sync._canonical_for_export",
+                new=mock.AsyncMock(side_effect=canonical_bump),
+            ):
                 holder["pusher"] = pusher
                 await self.Sync.sync_web.callback(cog, inter, "apply")
                 view = inter.followup.send.call_args.kwargs["view"]
                 holder["confirm"] = _interaction(user=_admin_member(), guild=guild)
-                storage.save_data(
-                    "players.json",
-                    [dict(p) for p in self.CANONICAL] + [_player(3)],
-                )
                 await view.confirm.callback(holder["confirm"])
 
         asyncio.run(main())

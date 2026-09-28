@@ -18,7 +18,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from db.base import Base
+from db.base import Base, utcnow
 
 
 class Cooldown(Base):
@@ -189,4 +189,36 @@ class QueueTester(Base):
 
     __table_args__ = (
         Index("uq_queue_tester_player", "queue_id", "player_id", unique=True),
+    )
+
+
+class KitTesterRoom(Base):
+    """Which Discord channel is the tester room for a given kit.
+
+    ``/mktesterroom <kit>`` writes this row; ``/queue pull <kit>`` reads it to
+    find where to grant the pulled player access. The kit is the primary key
+    because the business rule is exactly one tester room per kit, and
+    ``channel_id`` is UNIQUE because a room belongs to at most one kit —
+    otherwise ``/queue pull`` could not resolve a kit unambiguously.
+
+    The channel id is a *projection* target, not the source of truth: the row
+    here is authoritative, the remote channel merely has to exist when the
+    pull runs.
+    """
+
+    __tablename__ = "kit_tester_rooms"
+
+    kit_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("kits.id"), primary_key=True
+    )
+    channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    created_by: Mapped[Optional[int]] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=utcnow,
     )

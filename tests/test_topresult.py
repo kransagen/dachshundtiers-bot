@@ -1,37 +1,25 @@
 """Testy HT Fight výsledků – /topresult (services/topresult.py, bez discord.py).
 
-Pokrývají zadání /topresult:
-- /topresult NENÍ leaderboard – je to specializovaná verze /result pro HT Fighty,
-- správný formát zprávy (přesně styl serveru včetně role mentionu <@&id>),
-- result_type = ht_fight ve stejné kanonické historii (ht_results.json),
-- TOP_RESULT_CHANNEL_ID / TOP_RESULT_ROLE_ID (konfigurace /topresult),
-- role ping se generuje z nakonfigurovaného ID (<@&ROLE_ID>),
-- neplatný hráč / kit / HT tier / skóre / status,
-- /topresult mimo HT ticket a uvnitř HT Fight ticketu (metadata z ticketu),
-- duplicitní odeslání (idempotence ticketId + result_type),
-- /topresult NEPOUŽÍVÁ běžný výsledkový kanál (jen TOP_RESULT_CHANNEL_ID),
-- VÝHRA povyšuje hráče v players.json přes kanonickou apply_result_to_players
-  (next_ticket_tier ze žebříčku bez LT3E); prohra tier nemění; neznámý nebo
-  retired aktuální tier se nikdy nehádá (žádné povýšení),
-- PROHRA uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown
-  vlastníka a připíše událost do logu ticketu (sdílené zavírání s /result);
-  výhra nechává ticket otevřený a cooldown nenastavuje,
-- oznámení výsledku do kanálu: pending → sent/failed + messageId.
-Oprávnění (tester role) se hlídá v cogy přes has_tester_role – stejně jako
-/result (tyto čisté testy discord.py nespouštějí; test_permissions.py pokrývá
-samotnou permisní logiku).
+Bývalé JSON-mode testy (``ht_results.json`` / ``players.json`` přes
+``services.store``, ``apply_result_to_players`` povýšení atd.) jsou PRYČ spolu
+s JSON režimem. Produkční chování ``record_ht_fight`` / ``set_ht_fight_announcement``
+/ readerů nad PostgreSQL je pokryté ``tests/test_services_results_db.py``
+(výhra/prohra, cooldown, ticket lifecycle, bridge, announcement, readers).
+
+Tenhle soubor drží jen čistou logiku nezávislou na úložišti (validace
+vstupů, formát zprávy, typ ticketu, řádek postupu) a cog-plumbing testy
+(bridge parametr, commit kwargs, failure matrix) + jeden regresní test, že
+JSON fallback se do services/topresult.py nevrátil.
 """
 
 import asyncio
-import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-import storage
+import storage  # noqa: F401  (imported for legacy-data smoke; unused now)
 from cogs.roles import TierRoleGrant
-from services import results, tickets
-from services import topresult
+from services import tickets, topresult
 
 try:
     import config
@@ -40,7 +28,6 @@ except Exception:  # noqa: BLE001  (config se čte i bez dotenv)
 
 NOW = 1_700_000_000_000
 
-# Příklad ze zadání („CURRENT FORMAT USED BY THE SERVER"):
 PLAYER_MENTION = 1419031701920940163
 OPPONENT_MENTION = 1018169843347882076
 ROLE_ID = 1523984977371594772
@@ -58,17 +45,9 @@ EXPECTED_MESSAGE = (
 def _fight_ticket(**overrides):
     """Otevřený HT Fight ticket (ticketType=fight) bez zápisu."""
     base = tickets.make_ticket(
-        channel_id=2001,
-        owner_id="1",
-        owner_name="alice",
-        ign="mendu__",
-        kit="MolePVP",
-        target_tier="HT3",
-        current_tier="LT3",
-        eval_ok=True,
-        category_id=555,
-        ticket_type=tickets.TICKET_TYPE_FIGHT,
-        now=NOW,
+        channel_id=2001, owner_id="1", owner_name="alice", ign="mendu__",
+        kit="MolePVP", target_tier="HT3", current_tier="LT3", eval_ok=True,
+        category_id=555, ticket_type=tickets.TICKET_TYPE_FIGHT, now=NOW,
     )
     base.update(overrides)
     return base
@@ -96,6 +75,7 @@ class TicketTypeTests(unittest.TestCase):
         old = _fight_ticket()
         del old["ticketType"]
         self.assertFalse(tickets.is_ht_fight_ticket(old))
+
 
 
 class ValidateInputTests(unittest.TestCase):
@@ -177,6 +157,7 @@ class ValidateInputTests(unittest.TestCase):
         self.assertFalse(topresult.validate_ht_fight_bridge("   ")[0])
 
 
+
 class FormatMessageTests(unittest.TestCase):
     """Formát zprávy – přesně zachovává styl serveru (sekce 4 zadání)."""
 
@@ -217,584 +198,6 @@ class FormatMessageTests(unittest.TestCase):
         self.assertIn("\n\n<@&3>", msg)
 
 
-class RecordHTFightFreeTests(unittest.TestCase):
-    """Volný HT Fight výsledek (mimo ticket)."""
-
-    FILES = (
-        (results.HT_RESULTS_FILE, {}),
-        ("players.json", [{"username": "mendu__", "modes": {"MolePVP": "LT3"}, "history": {}}]),
-        ("cooldowns.json", {}),
-        (tickets.HT_TICKETS_FILE, {}),
-    )
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in self.FILES:
-            storage.save_data(name, default)
-
-    async def _record(self, **overrides):
-        kwargs = dict(
-            player_id="1",
-            player_name="mendu__",
-            ign="mendu__",
-            evaluator_id="9",
-            evaluator_name="tester",
-            kit="MolePVP",
-            fight_tier="HT3",
-            score="0-4",
-            outcome="Lost",
-            opponent_id="2",
-            opponent_name="souper",
-            tier_status="Zůstává Low Tier 3",
-            now=NOW,
-            date="23.09.2026",
-        )
-        kwargs.update(overrides)
-        return await topresult.record_ht_fight(**kwargs)
-
-    def test_valid_free_result(self):
-        async def main():
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            data = rec["record"]
-            self.assertEqual(data["resultType"], "ht_fight")
-            self.assertEqual(data["kind"], "ht_fight")
-            self.assertIsNone(data["ticketId"])
-            self.assertEqual(data["playerId"], "1")
-            self.assertEqual(data["ign"], "mendu__")
-            self.assertEqual(data["evaluatorId"], "9")
-            self.assertEqual(data["kit"], "MolePVP")
-            self.assertEqual(data["fightTier"], "HT3")
-            self.assertEqual(data["tierStatus"], "Zůstává Low Tier 3")
-            self.assertEqual(data["score"], "0-4")
-            self.assertEqual(data["outcome"], "Lost")
-            self.assertEqual(data["opponentId"], "2")
-            self.assertEqual(data["opponentName"], "souper")
-            # tier hráče v čase zápasu – jen kontext, žádná změna
-            self.assertEqual(data["previousTier"], "LT3")
-            # žádná změna tieru = nový tier prázdný
-            self.assertEqual(data["newTier"], "")
-            # klíč záznamu (idempotence / identifikace)
-            self.assertTrue(str(rec["record"]["id"]).startswith(topresult.HT_FIGHT_RESULT_PREFIX))
-        asyncio.run(main())
-
-    def test_no_tier_change_and_no_side_effects(self):
-        async def main():
-            before_players = storage.load_data("players.json", [])
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            # players.json se NEDOTÝKÁ (žádná změna tieru, žádná historie hráče)
-            self.assertEqual(storage.load_data("players.json", []), before_players)
-            # cooldowny se NENASTAVUJÍ
-            self.assertEqual(storage.load_data("cooldowns.json", {}), {})
-            # historie má přesně 1 záznam (resultType=ht_fight)
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(len(hist), 1)
-            self.assertEqual(list(hist.values())[0]["resultType"], "ht_fight")
-        asyncio.run(main())
-
-    def test_invalid_player_argument(self):
-        async def main():
-            rec = await self._record(player_id="")
-            self.assertEqual(rec["result"], "invalid_argument")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_invalid_kit_argument(self):
-        async def main():
-            rec = await self._record(kit="")
-            self.assertEqual(rec["result"], "invalid_argument")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_invalid_fight_tier(self):
-        async def main():
-            rec = await self._record(fight_tier="LT3E")
-            self.assertEqual(rec["result"], "invalid_tier")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_invalid_score(self):
-        async def main():
-            for bad in ("abc", "4", "4-", "-4", "4-x"):
-                rec = await self._record(score=bad)
-                self.assertEqual(rec["result"], "invalid_score", bad)
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_invalid_status(self):
-        async def main():
-            rec = await self._record(tier_status="   ")
-            self.assertEqual(rec["result"], "invalid_status")
-        asyncio.run(main())
-
-    def test_restart_safe_history(self):
-        async def record():
-            return await self._record()
-        asyncio.run(record())
-
-        async def read_again():
-            rec = await self._record(
-                player_id="2", player_name="bob", ign="BobMC",
-                opponent_id="1", score="4-1", outcome="Won",
-                tier_status="Povýšen na HT3", now=NOW + 1,
-                date="24.09.2026",
-            )
-            self.assertEqual(rec["result"], "created")
-            fights = await topresult.get_ht_fight_results()
-            self.assertEqual(len(fights), 2)
-        asyncio.run(read_again())
-
-    def test_ht_fight_results_filter(self):
-        async def main():
-            await self._record()
-            fights = await topresult.get_ht_fight_results()
-            self.assertEqual(len(fights), 1)
-            self.assertEqual(fights[0]["resultType"], "ht_fight")
-        asyncio.run(main())
-
-    def test_identical_free_result_within_window_is_duplicate(self):
-        """Dvojklik / dvakrát odeslaný identický zápas → duplicate (item 10)."""
-        async def main():
-            first = await self._record()
-            self.assertEqual(first["result"], "created")
-            again = await self._record(now=NOW + 60_000)  # stejný zápas +1 min
-            self.assertEqual(again["result"], "duplicate")
-            self.assertEqual(again["existing"]["id"], first["record"]["id"])
-            # historie pořád obsahuje JEN první záznam
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(len(hist), 1)
-        asyncio.run(main())
-
-    def test_different_score_is_not_duplicate(self):
-        async def main():
-            await self._record(score="0-4", outcome="Lost")
-            other = await self._record(now=NOW + 10_000, score="2-4", outcome="Lost")
-            self.assertEqual(other["result"], "created")
-            self.assertEqual(
-                len(storage.load_data(results.HT_RESULTS_FILE, {})), 2
-            )
-        asyncio.run(main())
-
-    def test_duplicate_outside_window_allowed(self):
-        """Stejný zápas po 2h okně je nový záznam (okno už neplatí)."""
-        async def main():
-            await self._record()
-            late = await self._record(now=NOW + topresult.HT_FIGHT_DEDUP_WINDOW_MS + 1)
-            self.assertEqual(late["result"], "created")
-            self.assertEqual(
-                len(storage.load_data(results.HT_RESULTS_FILE, {})), 2
-            )
-        asyncio.run(main())
-
-    def test_ticket_result_never_dedups_free_result(self):
-        """Záznam z ticketu (ticketId) se neškrtá s volnými – vlastní režim."""
-        async def main():
-            storage.save_data(
-                tickets.HT_TICKETS_FILE,
-                {"2001": _fight_ticket(channel_id=2001)},
-            )
-            ticket_rec = await self._record(ticket_id=2001, now=NOW)
-            self.assertEqual(ticket_rec["result"], "created")
-            free_rec = await self._record(now=NOW + 60_000)
-            self.assertEqual(free_rec["result"], "created")
-            self.assertEqual(
-                len(storage.load_data(results.HT_RESULTS_FILE, {})), 2
-            )
-        asyncio.run(main())
-
-
-class RecordHTFightTicketTests(unittest.TestCase):
-    """HT Fight výsledek uvnitř HT Fight ticketu."""
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            (results.HT_RESULTS_FILE, {}),
-            ("players.json", [{"username": "mendu__", "modes": {"MolePVP": "LT3"}, "history": {}}]),
-            ("cooldowns.json", {}),
-            (tickets.HT_TICKETS_FILE, {"2001": _fight_ticket()}),
-        ):
-            storage.save_data(name, default)
-
-    async def _record(self, **overrides):
-        kwargs = dict(
-            ticket_id=2001,
-            player_id="1",
-            player_name="mendu__",
-            ign="mendu__",
-            evaluator_id="9",
-            evaluator_name="tester",
-            kit="MolePVP",
-            fight_tier="HT3",
-            score="0-4",
-            outcome="Lost",
-            opponent_id="2",
-            opponent_name="souper",
-            tier_status="Zůstává Low Tier 3",
-            now=NOW,
-            date="23.09.2026",
-        )
-        kwargs.update(overrides)
-        return await topresult.record_ht_fight(**kwargs)
-
-    def test_created_inside_fight_ticket(self):
-        async def main():
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            data = rec["record"]
-            self.assertEqual(data["ticketId"], "2001")
-            self.assertEqual(data["id"], "2001:ht_fight")
-            self.assertEqual(data["resultType"], "ht_fight")
-            # prohra zavírá HT Fight ticket (WIN ho nechává otevřený)
-            ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "closed")
-            # players.json beze změny
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
-        asyncio.run(main())
-
-    def test_duplicate_submission_blocked(self):
-        async def main():
-            first = await self._record()
-            self.assertEqual(first["result"], "created")
-            second = await self._record(now=NOW + 1000)
-            self.assertEqual(second["result"], "duplicate")
-            self.assertEqual(second["existing"]["id"], "2001:ht_fight")
-            # nic se nepošle dvakrát – historie má jediný záznam
-            self.assertEqual(len(storage.load_data(results.HT_RESULTS_FILE, {})), 1)
-            existing = await topresult.get_ht_fight_result_for_ticket(2001)
-            self.assertIsNotNone(existing)
-            self.assertEqual(existing["score"], "0-4")
-        asyncio.run(main())
-
-    def test_not_found(self):
-        async def main():
-            rec = await self._record(ticket_id=9999)
-            self.assertEqual(rec["result"], "not_found")
-        asyncio.run(main())
-
-    def test_not_fight_ticket_rejected(self):
-        async def main():
-            eval_ticket = tickets.make_ticket(
-                channel_id=3001, owner_id="1", owner_name="a", ign="mendu__",
-                kit="MolePVP", target_tier="HT3", current_tier="LT3", eval_ok=True,
-                category_id=5, ticket_type=tickets.TICKET_TYPE_EVAL, now=NOW,
-            )
-            tickets_db = storage.load_data(tickets.HT_TICKETS_FILE, {})
-            tickets_db["3001"] = eval_ticket
-            storage.save_data(tickets.HT_TICKETS_FILE, tickets_db)
-            rec = await self._record(ticket_id=3001)
-            self.assertEqual(rec["result"], "not_fight_ticket")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_closed_ticket_rejected(self):
-        async def main():
-            tickets_db = storage.load_data(tickets.HT_TICKETS_FILE, {})
-            tickets_db["2001"]["status"] = "closed"
-            storage.save_data(tickets.HT_TICKETS_FILE, tickets_db)
-            rec = await self._record()
-            self.assertEqual(rec["result"], "ticket_closed")
-        asyncio.run(main())
-
-    def test_wrong_player_rejected(self):
-        async def main():
-            rec = await self._record(player_id="9")  # ne vlastník ticketu
-            self.assertEqual(rec["result"], "wrong_player")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_wrong_kit_rejected(self):
-        async def main():
-            rec = await self._record(kit="AnchorPvP")  # ticket je na MolePVP
-            self.assertEqual(rec["result"], "wrong_kit")
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-
-class ResultTypeIntegrationTests(unittest.TestCase):
-    """result_type = normal | ht_fight ve stejné kanonické historii."""
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            (results.HT_RESULTS_FILE, {}),
-            ("players.json", [{"username": "mendu__", "modes": {"MolePVP": "LT3"}, "history": {"MolePVP": []}}]),
-            ("cooldowns.json", {}),
-            (tickets.HT_TICKETS_FILE, {"2001": _fight_ticket()}),
-            (tickets.HT3_COOLDOWNS_FILE, {}),
-            (tickets.HT_TICKET_LOGS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    def test_make_result_default_type_normal(self):
-        rec = results.make_result(
-            result_id="x", kind="queue", ticket_id=None, player_id="1",
-            player_name="a", ign="i", evaluator_id="9", evaluator_name="t",
-            kit="k", previous_tier="N/A", new_tier="LT3", display_tier="LT3",
-            score="5-2", outcome="Won", notes=None, eval_flag=False,
-            now=NOW, date="23.09.2026",
-        )
-        self.assertEqual(rec["resultType"], "normal")
-        self.assertNotIn("fightTier", rec)
-        self.assertEqual(results.get_result_type(rec), "normal")
-
-    def test_get_result_type_fallback_for_old_records(self):
-        self.assertEqual(results.get_result_type({"resultType": "ht_fight"}), "ht_fight")
-        self.assertEqual(results.get_result_type({"id": "old"}), "normal")
-        self.assertEqual(results.get_result_type(None), "normal")
-
-    def test_normal_result_still_works_and_types_coexist(self):
-        # /result (result_type=normal) na stejném ticketu musí i nadále
-        # fungovat a může koexistovat s HT Fight výsledkem (jiný idempotentní
-        # klíč: ticketId vs ticketId:ht_fight).
-        async def main():
-            # HT Fight výsledek nejdřív (výhra nechává ticket OTEVŘENÝ) –
-            # klíč ticketId:ht_fight
-            fight = await topresult.record_ht_fight(
-                ticket_id=2001, player_id="1", player_name="a",
-                ign="mendu__", evaluator_id="9", evaluator_name="t",
-                kit="MolePVP", fight_tier="HT3", score="4-1",
-                outcome="Won", opponent_id="2", tier_status="Povýšen na HT3",
-                now=NOW + 1, date="24.09.2026",
-            )
-            self.assertEqual(fight["result"], "created")
-            self.assertEqual(fight["record"]["id"], "2001:ht_fight")
-
-            # klasický /result (result_type=normal) na stejném ticketu funguje
-            # dál a ticket po něm zavře (klíč ticketId).
-            normal = await results.record_result(
-                ticket_id=2001, player_id="1", player_name="a", ign="mendu__",
-                evaluator_id="9", evaluator_name="t", kit="MolePVP",
-                new_tier="HT3", display_tier="HT3", score="5-2", outcome="Won",
-                now=NOW, date="23.09.2026",
-                queue_cooldown_ms=0, ht3_cooldown_ms=0,
-            )
-            self.assertEqual(normal["result"], "created")
-            self.assertEqual(normal["record"]["resultType"], "normal")
-            self.assertEqual(normal["record"]["id"], "2001")
-
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(sorted(hist.keys()), ["2001", "2001:ht_fight"])
-            # /result pořád vrací SVŮJ výsledek podle ticketId
-            by_ticket = await results.get_result_by_ticket(2001)
-            self.assertEqual(by_ticket["resultType"], "normal")
-            # HT Fight výsledek má vlastní čtečku
-            self.assertIsNotNone(await topresult.get_ht_fight_result_for_ticket(2001))
-        asyncio.run(main())
-
-
-class RecordHTFightPromotionTests(unittest.TestCase):
-    """Výhra povyšuje hráče, prohra/neznámý/retired tier nemění.
-
-    Výhra uvnitř HT Fight ticketu = povýšení + oznámení pending, ticket
-    zůstává OTEVŘENÝ a cooldown se nenastavuje. Prohra = žádné povýšení,
-    ale ticket se zavře + HT3+ cooldown vlastníka + událost v logu.
-    Konflikt identity (IGN patří jinému Discord ID) se odmítá bez zápisu.
-    """
-
-    COOLDOWN_MS = 604_800_000  # 7 dní, jako HT3_COOLDOWN_MS
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            (results.HT_RESULTS_FILE, {}),
-            (
-                "players.json",
-                [{"username": "mendu__", "modes": {"MolePVP": "LT3"},
-                  "history": {"MolePVP": [{"date": "01.09.2026", "tier": "LT3"}]}}],
-            ),
-            ("cooldowns.json", {}),
-            (tickets.HT_TICKETS_FILE, {"2001": _fight_ticket()}),
-            (tickets.HT3_COOLDOWNS_FILE, {}),
-            (tickets.HT_TICKET_LOGS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    async def _record(self, **overrides):
-        kwargs = dict(
-            ticket_id=None,
-            player_id="1",
-            player_name="mendu__",
-            ign="mendu__",
-            evaluator_id="9",
-            evaluator_name="tester",
-            kit="MolePVP",
-            fight_tier="HT3",
-            score="4-1",
-            outcome="Won",
-            opponent_id="2",
-            opponent_name="souper",
-            tier_status="Povýšen na HT3",
-            now=NOW,
-            date="23.09.2026",
-            ht3_cooldown_ms=self.COOLDOWN_MS,
-        )
-        kwargs.update(overrides)
-        return await topresult.record_ht_fight(**kwargs)
-
-    def test_win_promotes_player_free_mode(self):
-        async def main():
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["previous_tier"], "LT3")
-            data = rec["record"]
-            self.assertEqual(data["previousTier"], "LT3")
-            self.assertEqual(data["newTier"], "HT3")
-            self.assertEqual(data["resultType"], "ht_fight")
-            # povýšení v players.json + zápis do historie hráče
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["MolePVP"], "HT3")
-            self.assertEqual(
-                players[0]["history"]["MolePVP"][-1],
-                {"date": "23.09.2026", "tier": "HT3"},
-            )
-            # otáčení čeká na odeslání do kanálu (pending)
-            self.assertEqual(data["announcement"], "pending")
-        asyncio.run(main())
-
-    def test_win_in_ticket_promotes_keeps_ticket_open(self):
-        async def main():
-            rec = await self._record(ticket_id=2001)
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["record"]["newTier"], "HT3")
-            # výhra nechává ticket OTEVŘENÝ
-            ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "open")
-            # žádný cooldown, žádná událost v logu (zavírá až prohra / /result)
-            self.assertEqual(storage.load_data(tickets.HT3_COOLDOWNS_FILE, {}), {})
-            self.assertEqual(storage.load_data(tickets.HT_TICKET_LOGS_FILE, {}), {})
-            # oznámení pending na záznamu
-            self.assertEqual(rec["record"]["announcement"], "pending")
-        asyncio.run(main())
-
-    def test_loss_closes_ticket_and_sets_cooldown_no_promote(self):
-        async def main():
-            rec = await self._record(
-                ticket_id=2001, outcome="Lost", score="0-4",
-                tier_status="Zůstává Low Tier 3",
-            )
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["previous_tier"], "LT3")
-            self.assertEqual(rec["record"]["newTier"], "")
-            # prohra zavírá ticket
-            ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "closed")
-            # HT3+ cooldown vlastníka (klíč: diskord ID + kit ticketu)
-            cds = storage.load_data(tickets.HT3_COOLDOWNS_FILE, {})
-            self.assertEqual(cds["1"]["MolePVP"], NOW + self.COOLDOWN_MS)
-            # událost v logu ticketu
-            logs = storage.load_data(tickets.HT_TICKET_LOGS_FILE, {})["2001"]
-            self.assertEqual(logs[-1]["action"], "ht_fight")
-            self.assertEqual(logs[-1]["details"], "LT3 (prohra)")
-            self.assertEqual(logs[-1]["actorId"], "9")
-            # hráč se nemění
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
-        asyncio.run(main())
-
-    def test_unknown_current_tier_never_promoted(self):
-        async def main():
-            storage.save_data("players.json", [])
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["previous_tier"], "N/A")
-            self.assertEqual(rec["record"]["newTier"], "")
-            # hráč se nevytvořil, nic se nehádá
-            self.assertEqual(storage.load_data("players.json", []), [])
-        asyncio.run(main())
-
-    def test_retired_tier_never_promoted(self):
-        async def main():
-            storage.save_data(
-                "players.json",
-                [{"username": "mendu__", "modes": {"MolePVP": "RT1"},
-                  "history": {"MolePVP": []}}],
-            )
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["previous_tier"], "RT1")
-            self.assertEqual(rec["record"]["newTier"], "")
-            self.assertEqual(
-                storage.load_data("players.json", [])[0]["modes"]["MolePVP"], "RT1"
-            )
-        asyncio.run(main())
-
-    def test_ht1_win_no_promotion_line(self):
-        async def main():
-            storage.save_data(
-                "players.json",
-                [{"username": "mendu__", "modes": {"MolePVP": "HT1"},
-                  "history": {"MolePVP": []}}],
-            )
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            # HT1 je vrchol žebříčku: next_ticket_tier(HT1)=HT1 – nikdy neklesá
-            self.assertEqual(rec["record"]["newTier"], "HT1")
-            self.assertEqual(rec["previous_tier"], "HT1")
-            # formát zprávy: previous == new → žádný řádek postupu
-            msg = topresult.format_topresult_message(
-                player_id=1, ign="mendu__", tier_status="Povýšen na HT1",
-                kit="MolePVP", fight_tier="HT1", outcome="Won", score="4-1",
-                opponent_id=2, previous_tier="HT1", new_tier="HT1",
-                role_id=ROLE_ID,
-            )
-            self.assertNotIn("Postup", msg)
-        asyncio.run(main())
-
-    def test_identity_conflict_rejects_win(self):
-        async def main():
-            storage.save_data(
-                "players.json",
-                [
-                    {"username": "mendu__", "discordId": "999",
-                     "modes": {"MolePVP": "HT2"}, "history": {}},
-                    {"username": "aliceMC", "discordId": "1",
-                     "modes": {"MolePVP": "LT3"}, "history": {}},
-                ],
-            )
-            # IGN "mendu__" patří Discord ID 999, ale výsledek je za hráče "1"
-            rec = await self._record()
-            self.assertEqual(rec["result"], "identity_conflict")
-            self.assertIn("999", rec["message"])
-            # nic se nezapsalo – historie, hráči, ticket
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["discordId"], "999")
-            self.assertEqual(players[0]["modes"]["MolePVP"], "HT2")
-        asyncio.run(main())
-
-    def test_identity_conflict_with_ticket_keeps_ticket_open(self):
-        async def main():
-            storage.save_data(
-                "players.json",
-                [
-                    {"username": "mendu__", "discordId": "999",
-                     "modes": {"MolePVP": "HT2"}, "history": {}},
-                    {"username": "aliceMC", "discordId": "1",
-                     "modes": {"MolePVP": "LT3"}, "history": {}},
-                ],
-            )
-            rec = await self._record(ticket_id=2001)
-            self.assertEqual(rec["result"], "identity_conflict")
-            ticket = storage.load_data(tickets.HT_TICKETS_FILE, {})["2001"]
-            self.assertEqual(ticket["status"], "open")
-            self.assertEqual(storage.load_data(tickets.HT3_COOLDOWNS_FILE, {}), {})
-        asyncio.run(main())
-
 
 class PromotionLineFormatTests(unittest.TestCase):
     """Řádek postupu ve zprávě – jen when player skutečně postoupil."""
@@ -823,180 +226,6 @@ class PromotionLineFormatTests(unittest.TestCase):
         )
         self.assertNotIn("Postup", msg)
 
-
-class AnnouncementStateTests(unittest.TestCase):
-    """Stav oznámení: pending → sent/failed + messageId (na místě v záznamu)."""
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        storage.save_data(
-            results.HT_RESULTS_FILE,
-            {"2001:ht_fight": {"id": "2001:ht_fight", "resultType": "ht_fight",
-                               "score": "4-1", "announcement": "pending"}},
-        )
-
-    def test_set_sent_with_message_id(self):
-        async def main():
-            rec = await topresult.set_ht_fight_announcement("2001:ht_fight", "sent", message_id=777)
-            self.assertEqual(rec["result"], "ok")
-            self.assertEqual(rec["record"]["announcement"], "sent")
-            self.assertEqual(rec["record"]["messageId"], "777")
-            # na místě v kanonické historii (záznam zůstává jeden)
-            hist = storage.load_data(results.HT_RESULTS_FILE, {})
-            self.assertEqual(len(hist), 1)
-            self.assertEqual(hist["2001:ht_fight"]["announcement"], "sent")
-        asyncio.run(main())
-
-    def test_set_failed(self):
-        async def main():
-            rec = await topresult.set_ht_fight_announcement("2001:ht_fight", "failed")
-            self.assertEqual(rec["result"], "ok")
-            self.assertEqual(rec["record"]["announcement"], "failed")
-        asyncio.run(main())
-
-    def test_not_found(self):
-        async def main():
-            rec = await topresult.set_ht_fight_announcement("missing", "sent")
-            self.assertEqual(rec["result"], "not_found")
-        asyncio.run(main())
-
-    def test_invalid_status(self):
-        async def main():
-            rec = await topresult.set_ht_fight_announcement("2001:ht_fight", "banana")
-            self.assertEqual(rec["result"], "invalid_status")
-            self.assertEqual(
-                storage.load_data(results.HT_RESULTS_FILE, {})["2001:ht_fight"]["announcement"],
-                "pending",
-            )
-        asyncio.run(main())
-
-
-class RecordHTFightBridgeTests(unittest.TestCase):
-    """Bridge – povýšení přeskočením na zadaný vyšší tier (jen při výhře)."""
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        for name, default in (
-            (results.HT_RESULTS_FILE, {}),
-            (
-                "players.json",
-                [{"username": "mendu__", "modes": {"MolePVP": "LT3"},
-                  "history": {"MolePVP": [{"date": "01.09.2026", "tier": "LT3"}]}}],
-            ),
-            ("cooldowns.json", {}),
-            (tickets.HT_TICKETS_FILE, {}),
-        ):
-            storage.save_data(name, default)
-
-    async def _record(self, **overrides):
-        kwargs = dict(
-            player_id="1", player_name="mendu__", ign="mendu__",
-            evaluator_id="9", evaluator_name="tester", kit="MolePVP",
-            fight_tier="HT3", score="4-1", outcome="Won", opponent_id="2",
-            opponent_name="souper", tier_status="Povýšen na LT2",
-            now=NOW, date="23.09.2026",
-        )
-        kwargs.update(overrides)
-        return await topresult.record_ht_fight(**kwargs)
-
-    def test_win_bridge_promotes_directly(self):
-        async def main():
-            rec = await self._record(bridge="LT2")
-            self.assertEqual(rec["result"], "created")
-            data = rec["record"]
-            # povýšení přeskočením: LT3 → LT2 (místo standardního HT3 kroku)
-            self.assertEqual(data["previousTier"], "LT3")
-            self.assertEqual(data["newTier"], "LT2")
-            self.assertEqual(data["bridgeTier"], "LT2")
-            # kanonická players.json + historie hráče
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["MolePVP"], "LT2")
-            self.assertEqual(players[0]["history"]["MolePVP"][-1]["tier"], "LT2")
-            # zpráva ukáže „Postup: LT3 → LT2"
-            msg = topresult.format_topresult_message(
-                player_id=1, ign="mendu__", tier_status="Povýšen na LT2",
-                kit="MolePVP", fight_tier="HT3", outcome="Won", score="4-1",
-                opponent_id=2, previous_tier="LT3", new_tier="LT2", role_id=ROLE_ID,
-            )
-            self.assertIn("**Postup: LT3 → LT2**", msg)
-        asyncio.run(main())
-
-    def test_bridge_only_on_win(self):
-        async def main():
-            rec = await self._record(
-                bridge="LT2", outcome="Lost", score="0-4",
-                tier_status="Zůstává Low Tier 3",
-            )
-            self.assertEqual(rec["result"], "invalid_bridge")
-            self.assertIn("výhře", rec["message"])
-            # nic se nezapsalo – žádný záznam, hráč beze změny
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["MolePVP"], "LT3")
-        asyncio.run(main())
-
-    def test_bridge_must_be_valid_real_tier(self):
-        async def main():
-            rec = await self._record(bridge="XYZ")
-            self.assertEqual(rec["result"], "invalid_bridge")
-            self.assertIn("bridge", rec["message"].lower())
-            self.assertEqual(storage.load_data(results.HT_RESULTS_FILE, {}), {})
-        asyncio.run(main())
-
-    def test_bridge_lt3e_rejected(self):
-        async def main():
-            # LT3E je virtuální status (eval), ne reálný tier k bridge
-            rec = await self._record(bridge="LT3E")
-            self.assertEqual(rec["result"], "invalid_bridge")
-        asyncio.run(main())
-
-    def test_bridge_same_as_current_rejected(self):
-        async def main():
-            rec = await self._record(bridge="LT3")  # aktuální tier je LT3
-            self.assertEqual(rec["result"], "invalid_bridge")
-            self.assertIn("LT3", rec["message"])
-        asyncio.run(main())
-
-    def test_bridge_lower_than_current_rejected(self):
-        async def main():
-            rec = await self._record(bridge="LT4")  # LT4 < LT3 – dolů
-            self.assertEqual(rec["result"], "invalid_bridge")
-            self.assertIn("vyšší", rec["message"])
-        asyncio.run(main())
-
-    def test_bridge_unknown_current_tier_allowed(self):
-        async def main():
-            storage.save_data("players.json", [])  # nový hráč, tier neznámý
-            rec = await self._record(bridge="LT2")
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["record"]["newTier"], "LT2")
-            self.assertEqual(rec["record"]["bridgeTier"], "LT2")
-            players = storage.load_data("players.json", [])
-            self.assertEqual(players[0]["modes"]["MolePVP"], "LT2")
-        asyncio.run(main())
-
-    def test_no_bridge_keeps_next_ticket_step(self):
-        async def main():
-            rec = await self._record()
-            self.assertEqual(rec["result"], "created")
-            # standardní krok z žebříčku (LT3 → HT3) – bridge nic nemění
-            self.assertEqual(rec["record"]["newTier"], "HT3")
-            self.assertNotIn("bridgeTier", rec["record"])
-        asyncio.run(main())
-
-    def test_bridge_empty_string_is_no_bridge(self):
-        async def main():
-            rec = await self._record(bridge="")
-            self.assertEqual(rec["result"], "created")
-            self.assertEqual(rec["record"]["newTier"], "HT3")
-            self.assertNotIn("bridgeTier", rec["record"])
-        asyncio.run(main())
 
 
 class TopResultCogBridgeTests(unittest.TestCase):
@@ -1106,6 +335,7 @@ class TopResultCogBridgeTests(unittest.TestCase):
         self.assertIn("LT3", msg)
         # nic se neposlalo do kanálu a žádná role se neudělovala
         channel.send.assert_not_awaited()
+
 
 
 class TopResultDbMirrorTests(unittest.TestCase):
@@ -1355,6 +585,48 @@ class TopResultDbMirrorTests(unittest.TestCase):
         reply = inter.followup.send.await_args.args[0]
         self.assertIn("PostgreSQL není nakonfigurováno", reply)
         self.assertIn("bez DB nelze ani outbox", reply)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+class NoJsonModeTests(unittest.TestCase):
+    """services/topresult.py už NEMÁ JSON režim – vyžaduje PostgreSQL."""
+
+    def test_record_ht_fight_requires_session_factory(self):
+        async def main():
+            with self.assertRaises(TypeError):
+                await topresult.record_ht_fight(
+                    player_id="1", player_name="mendu__", ign="mendu__",
+                    evaluator_id="9", evaluator_name="tester", kit="MolePVP",
+                    fight_tier="HT3", score="4-1", outcome="Won", opponent_id="2",
+                    opponent_name="souper", tier_status="Povýšen na LT2",
+                    now=NOW, date="23.09.2026",
+                )
+        asyncio.run(main())
+
+    def test_readers_refuse_explicit_none(self):
+        # Čtecí/oznamovací funkce s explicitním None odmítnou (RuntimeError),
+        # nikdy nespadnou na ht_results.json.
+        async def main():
+            for coro in (
+                topresult.set_ht_fight_announcement("2023", "sent", session_factory=None),
+                topresult.get_ht_fight_result_for_ticket(2023, session_factory=None),
+                topresult.get_ht_fight_results(session_factory=None),
+            ):
+                with self.assertRaises(RuntimeError, msg="PostgreSQL"):
+                    await coro
+        asyncio.run(main())
+
+    def test_no_json_file_io_in_topresult(self):
+        import inspect
+
+        src = inspect.getsource(topresult)
+        self.assertNotIn("load_data(", src)
+        self.assertNotIn("save_data(", src)
+        self.assertNotIn("if session_factory is not None:", src)
+        self.assertNotIn("from services.store import transaction", src)
+
 
 
 if __name__ == "__main__":

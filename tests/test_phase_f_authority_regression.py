@@ -23,7 +23,6 @@ from sqlalchemy import select
 
 import cogs.sync as sync_mod
 import storage
-from cogs._shared import save_players
 from cogs.sync import (
     CheckWebApplyView,
     SyncImportDiscordConfirmView,
@@ -256,9 +255,18 @@ async def test_b_checkweb_never_reads_json_in_db_mode(session_factory, clean_db,
 
 
 @pytest.mark.asyncio
-async def test_b2_save_players_refuses_in_postgres_mode(pg_mode):
-    with pytest.raises(RuntimeError, match="F-FIX"):
-        await save_players([{"username": "X", "modes": {"HT3": "t1"}}])
+async def test_b2_no_legacy_players_writer_left_in_shared(pg_mode):
+    """B2 (Phase B) byl „save_players v PG režimu odmítne" – dnes je už
+    ``save_players`` z ``cogs/_shared.py`` úplně pryč (poslední legacy JSON
+    zapisovatel bez produkčního volajícího). Aba zde je, že se nevrátí ani
+    on, ani nahodilý ``tx.set("players.json", …)``."""
+    import cogs._shared as shared_mod
+
+    src = inspect.getsource(shared_mod)
+    assert "def save_players" not in src
+    assert 'tx.set("players.json"' not in src
+    assert "using_postgres" not in src
+    assert "services.store" not in src
 
 
 @pytest.mark.asyncio
@@ -331,7 +339,7 @@ async def test_d_checkweb_apply_persists_nothing(session_factory, clean_db, pg_m
         mock.patch.object(sync_mod, "admin_gate_error", lambda _i: None),
     ):
         # on_apply is a plain method (no button param) — see cogs/sync.py.
-        await view.on_apply(_interaction())
+        await view.on_apply(_interaction(session_factory))
 
     assert _json_shadow()[0]["modes"]["HT3"] == "t1", "JSONB stín se nesměl změnit"
     tiers = await _pg_tiers(session_factory, seeded["player"].id, seeded["kit"].id)
@@ -355,7 +363,7 @@ async def test_d2_importdiscord_confirm_persists_nothing(
     ):
         # discord.ui.button-decorated method — call via .callback like the
         # rest of the suite (e.g. tests/test_sync_rollback.py), not directly.
-        await view.confirm.callback(_interaction())
+        await view.confirm.callback(_interaction(session_factory))
 
     assert _json_shadow()[0]["modes"]["HT3"] == "t1"
     tiers = await _pg_tiers(session_factory, seeded["player"].id, seeded["kit"].id)
@@ -428,12 +436,12 @@ def _audit_sink():
     return _inner
 
 
-def _interaction():
+def _interaction(db_session_factory=None):
     inter = mock.Mock()
     inter.user = mock.Mock(id=42)
     inter.guild = mock.Mock(id=1)
     inter.message = mock.AsyncMock()
     inter.response = mock.AsyncMock()
     inter.followup = mock.AsyncMock()
-    inter.client = mock.Mock(db_session_factory=None)
+    inter.client = mock.Mock(db_session_factory=db_session_factory)
     return inter

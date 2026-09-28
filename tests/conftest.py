@@ -54,6 +54,9 @@ ALL_TABLES = (
     "tournaments",
     "tournament_entries",
     "tester_credits",
+    "minecraft_accounts",
+    "player_link_tokens",
+    "kit_tester_rooms",
 )
 
 

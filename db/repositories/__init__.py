@@ -10,9 +10,15 @@ Rules enforced here (design §15):
 
 from db.repositories.cooldowns import CooldownRepository, COOLDOWN_HT3, COOLDOWN_WAITLIST
 from db.repositories.evaluations import EvaluationRepository, TesterRepository
+from db.repositories.identity import (
+    MinecraftAccountRepository,
+    PlayerIdentityRepository,
+    PlayerLinkTokenRepository,
+)
 from db.repositories.kits import (
     KitRepository,
     KitRoleRepository,
+    KitTesterRoomRepository,
     TierDefinitionRepository,
     ensure_dimensions,
 )
@@ -131,12 +137,16 @@ __all__ = [
     "EvaluationRepository",
     "KitRepository",
     "KitRoleRepository",
+    "KitTesterRoomRepository",
+    "MinecraftAccountRepository",
     "MigrationIssueRepository",
     "MirrorRepository",
     "MirrorServiceRepository",
     "ObservationResult",
     "OutboxRepository",
     "PlayerIdentityError",
+    "PlayerIdentityRepository",
+    "PlayerLinkTokenRepository",
     "PlayerRepository",
     "QueueEntryRepository",
     "QueueRepository",

@@ -8,14 +8,13 @@ služeb projektu:
                           (kompatibilita s legacy zápisy jako „LT3 EVAL“),
     - retired tiery     → konvence R-prefixu z services/playersync,
     - Discord role      → services/role_sync.analyze_role_sync (jeden kit),
-    - cooldowny         → services/queue_service.cooldown_remaining +
-                          stejné soubory/klíče jako join/result (cooldowns.json,
-                          ht3_cooldowns.json),
-    - web/GitHub        → services/websync.sync_website (jeden zapisovatel webu),
-    - transakce/locks   → services/store.transaction (strict mode – poškozený
-                          JSON se nikdy nepřepíše, DataCorruptionError),
-    - audit             → data/edituser_log.json (append-only, stejný vzor jako
-                          playersync_log / websync_log / datacheck_log).
+    - cooldowny         → tabulka `cooldowns` (per (hráč, kit, typ) – stejné
+                          klíče a stejné délky jako join/result),
+    - web/GitHub        → services/websync.sync_website (jeden zapisovatel webu;
+                          export z PostgreSQL, ne fallback na soubor),
+    - transakce/locks   → db.services.session.transaction (jedna transakce na
+                          změnu + audit),
+    - audit             → tabulka `audit_logs` (append-only, `action='edituser'`).
 
 Změny identity NIKDY neslučují hráče a jsou idempotentní:
   - opakovaná stejná změna → ``unchanged`` (žádný duplicitní záznam, žádný
@@ -32,8 +31,19 @@ Invarianty tierů (kodifikované):
     povýšení jde přes /result, které zapisuje modes + historii najednou,
   - historie (``history``) se editorem NIKDY nemění ani nemaže.
 
-Stav se nikdy nemutuje na místě – čisté funkce pracují s kopiemi (stejný
-styl jako services/results.apply_result_to_players).
+Stav se nikdy nemutuje na místě – čisté funkce pracují s kopiemí
+``{discordId, username, modes}``, což je projekce jednoho hráče z
+``services/player_export.build_player_shape``. Tyhle čisté funkce slouží
+jen jako NÁHLED změny před potvrzením (starou hodnotu, „beze změny", konflikt
+identity); zápis vždy dělá ``_apply_player_edit_db`` v PostgreSQL. Náhled
+tedy může být méně přesný než databáze — autoritativní kontrola konfliktu
+proběhne až v transakci.
+
+DRUHÝ REŽIM TU UŽ NENÍ. ``apply_player_edit`` i ``execute_player_edit``
+vyžadují ``session_factory``; ``players.json`` / ``cooldowns.json`` /
+``ht3_cooldowns.json`` / ``ht_tickets.json`` / ``ht_results.json`` /
+``queue.json`` / ``pulled_players.json`` / ``evals.json`` /
+``edituser_log.json`` se nečtou ani nezapisují.
 """
 
 import logging
@@ -49,16 +59,10 @@ from services.player_identity import (
     find_by_ign,
 )
 from services.playersync import is_retired_tier
-from services.queue_service import cooldown_remaining
-from services.results import HT_RESULTS_FILE
 from services.role_sync import analyze_role_sync
-from services.store import read as store_read, transaction
-from services.tickets import HT3_TIER_LADDER, HT_TICKETS_FILE
-from storage import DataCorruptionError
+from services.tickets import HT3_TIER_LADDER
 
 log = logging.getLogger("dachshundtiers")
-
-EDITUSER_LOG_FILE = "edituser_log.json"
 
 # Stavy výsledků operace (pro report SUCCESS / PARTIAL SUCCESS / FAILURE).
 STATUS_SUCCESS = "SUCCESS"
@@ -200,7 +204,7 @@ def change_player_ign(players, ref, new_ign: str):
         raise PlayerIdentityConflict("IGN je prázdné – nelze změnit.")
     target = _locate(players, ref)
     if target is None:
-        raise PlayerIdentityConflict("Hráč nebyl v players.json nalezen.")
+        raise PlayerIdentityConflict("Hráč nebyl v databázi nalezen.")
 
     did = str(target.get("discordId") or "").strip()
     if did.isdigit():
@@ -242,7 +246,7 @@ def change_player_discord(players, ref, new_discord_id: str):
     players = _copy_players(players)
     target = _locate(players, ref)
     if target is None:
-        raise PlayerIdentityConflict("Hráč nebyl v players.json nalezen.")
+        raise PlayerIdentityConflict("Hráč nebyl v databázi nalezen.")
 
     other = find_by_discord_id(players, did_clean)
     if other is not None and other is not target:
@@ -278,7 +282,7 @@ def change_kit_tier(players, ref, kit_key: str, new_tier: str, *, retired: bool)
     players = _copy_players(players)
     target = _locate(players, ref)
     if target is None:
-        raise InvalidTierEdit("Hráč nebyl v players.json nalezen.")
+        raise InvalidTierEdit("Hráč nebyl v databázi nalezen.")
     kit_key = (kit_key or "").strip().lower()
     modes = target.setdefault("modes", {})
     existing_key = _resolve_mode_key(modes, kit_key)
@@ -383,205 +387,6 @@ def format_duration(ms) -> str:
     return f"{minutes}m"
 
 
-def ht3_cooldown_remaining(ht3_cooldowns, user_id: str, kit_key: str, now: int):
-    """Zbývající ms HT3+ cooldownu pro kit, nebo None."""
-    if not isinstance(ht3_cooldowns, dict):
-        return None
-    expiry = (ht3_cooldowns.get(user_id) or {}).get(kit_key)
-    if expiry is None:
-        return None
-    remaining = int(expiry) - now
-    return remaining if remaining > 0 else None
-
-
-def cooldown_snapshot(cooldowns, ht3_cooldowns, user_id: str, now: int, queue_cooldown_ms: int) -> dict:
-    """Stručný přehled cooldownů hráče (pro zobrazení)."""
-    queue_remaining = cooldown_remaining(cooldowns, user_id, now, queue_cooldown_ms)
-    ht3 = {
-        str(kit): format_duration(
-            ht3_cooldown_remaining(ht3_cooldowns, user_id, str(kit), now)
-        )
-        for kit in sorted((ht3_cooldowns.get(user_id) or {}).keys())
-    }
-    return {
-        "queue_remaining": queue_remaining,
-        "queue_last": (cooldowns or {}).get(user_id),
-        "ht3": ht3,
-    }
-
-
-def apply_cooldown_edit(
-    tx,
-    *,
-    player_id: str,
-    action: str,
-    kit_key: str = None,
-    now: int,
-    queue_cooldown_ms: int,
-    ht3_cooldown_ms: int,
-):
-    """Aplikuje změnu cooldownu uvnitř transakce.
-
-    Vrací ``(old_desc, new_desc)`` – popisy pro potvrzení/report („žádný“,
-    „2d 3h“). Počítá přes stávající ``cooldown_remaining``.
-    """
-    cooldowns = tx.get("cooldowns.json", {})
-    ht3 = tx.get("ht3_cooldowns.json", {})
-
-    if action == "clear_queue":
-        old = format_duration(
-            cooldown_remaining(cooldowns, player_id, now, queue_cooldown_ms)
-        )
-        cooldowns.pop(player_id, None)
-        tx.set("cooldowns.json", cooldowns)
-        return f"waitlist: {old}", "waitlist: žádný"
-
-    if action == "set_queue":
-        old = format_duration(
-            cooldown_remaining(cooldowns, player_id, now, queue_cooldown_ms)
-        )
-        cooldowns[player_id] = now
-        tx.set("cooldowns.json", cooldowns)
-        return (
-            f"waitlist: {old}",
-            f"waitlist: {format_duration(queue_cooldown_ms)} (od teď)",
-        )
-
-    kit_key = (kit_key or "").strip().lower()
-    if not kit_key:
-        raise ValueError("Pro HT3+ cooldown je potřeba kit.")
-    bucket = ht3.setdefault(player_id, {})
-    old_ht3 = format_duration(
-        ht3_cooldown_remaining(ht3, player_id, kit_key, now)
-    )
-    if action == "clear_ht3":
-        bucket.pop(kit_key, None)
-        tx.set("ht3_cooldowns.json", ht3)
-        return f"HT3 {kit_key}: {old_ht3}", f"HT3 {kit_key}: žádný"
-
-    if action == "set_ht3":
-        bucket[kit_key] = now + ht3_cooldown_ms
-        tx.set("ht3_cooldowns.json", ht3)
-        return (
-            f"HT3 {kit_key}: {old_ht3}",
-            f"HT3 {kit_key}: {format_duration(ht3_cooldown_ms)} (od teď)",
-        )
-
-    raise ValueError(f"Neznámá akce cooldownu: {action}")
-
-
-# ---------------------------------------------------------------------------
-# Migrace klíčů identity (při změně Discord ID / IGN)
-# ---------------------------------------------------------------------------
-def _migrate_identity_keys(tx, old_id: str, new_id: str) -> list:
-    """Přemapuje per-hráč klíče na nové Discord ID (stejný hráč, žádná ztráta).
-
-    - cooldowns.json / ht3_cooldowns.json – klíčované Discord ID,
-    - ht_tickets.json – ``ownerId``,
-    - ht_results.json – ``playerId`` (výsledky zůstávají hráči),
-    - queue.json / pulled_players.json – ``id`` / klíč záznamu.
-
-    Vrací názvy změněných souborů (idempotentní: nic = prázdný seznam).
-    """
-    if old_id == new_id:
-        return []
-    changed = []
-
-    cooldowns = tx.get("cooldowns.json", {})
-    if isinstance(cooldowns, dict) and old_id in cooldowns:
-        cooldowns[new_id] = cooldowns.pop(old_id)
-        tx.set("cooldowns.json", cooldowns)
-        changed.append("cooldowns.json")
-
-    ht3_cd = tx.get("ht3_cooldowns.json", {})
-    if isinstance(ht3_cd, dict) and old_id in ht3_cd:
-        bucket = ht3_cd.pop(old_id)
-        ht3_cd.setdefault(new_id, {}).update(bucket if isinstance(bucket, dict) else {})
-        tx.set("ht3_cooldowns.json", ht3_cd)
-        changed.append("ht3_cooldowns.json")
-
-    tickets = tx.get(HT_TICKETS_FILE, {})
-    touched = False
-    for t in tickets.values():
-        if isinstance(t, dict) and str(t.get("ownerId") or "") == old_id:
-            t["ownerId"] = new_id
-            touched = True
-    if touched:
-        tx.set(HT_TICKETS_FILE, tickets)
-        changed.append(HT_TICKETS_FILE)
-
-    results = tx.get(HT_RESULTS_FILE, {})
-    touched = False
-    for r in results.values():
-        if isinstance(r, dict) and str(r.get("playerId") or "") == old_id:
-            r["playerId"] = new_id
-            touched = True
-    if touched:
-        tx.set(HT_RESULTS_FILE, results)
-        changed.append(HT_RESULTS_FILE)
-
-    queue = tx.get("queue.json", [])
-    touched = False
-    for entry in queue:
-        if isinstance(entry, dict) and str(entry.get("id") or "") == old_id:
-            entry["id"] = new_id
-            touched = True
-    if touched:
-        tx.set("queue.json", queue)
-        changed.append("queue.json")
-
-    pulled = tx.get("pulled_players.json", {})
-    if isinstance(pulled, dict) and old_id in pulled:
-        pulled[new_id] = pulled.pop(old_id)
-        tx.set("pulled_players.json", pulled)
-        changed.append("pulled_players.json")
-
-    return changed
-
-
-def _migrate_eval_ign(tx, old_ign: str, new_ign: str) -> bool:
-    """Přemapuje eval statusy (evals.json) na nové IGN. Vrací, zda se změnilo."""
-    old_key = (old_ign or "").strip().lower()
-    new_key = (new_ign or "").strip().lower()
-    if not old_key or old_key == new_key:
-        return False
-    evals = tx.get("evals.json", {})
-    touched = False
-    for kit_key, bucket in (evals.items() if isinstance(evals, dict) else []):
-        if not isinstance(bucket, dict) or old_key not in bucket:
-            continue
-        bucket[new_key] = bucket.pop(old_key)
-        touched = True
-    if touched:
-        tx.set("evals.json", evals)
-    return touched
-
-
-# ---------------------------------------------------------------------------
-# Aplikace jedné potvrzené změny (transakce + audit atomicky)
-# ---------------------------------------------------------------------------
-def _files_for_edit(edit: dict) -> tuple:
-    field = edit.get("field")
-    if field == "discord_id":
-        return (
-            "players.json",
-            "cooldowns.json",
-            "ht3_cooldowns.json",
-            HT_TICKETS_FILE,
-            HT_RESULTS_FILE,
-            "queue.json",
-            "pulled_players.json",
-            EDITUSER_LOG_FILE,
-        )
-    if field == "ign":
-        return ("players.json", "evals.json", EDITUSER_LOG_FILE)
-    if field == "tier":
-        return ("players.json", EDITUSER_LOG_FILE)
-    if field == "cooldown":
-        return ("cooldowns.json", "ht3_cooldowns.json", EDITUSER_LOG_FILE)
-    raise ValueError(f"Neznámé pole úpravy: {field}")
-
-
 async def apply_player_edit(
     *,
     player_id: str,
@@ -609,152 +414,30 @@ async def apply_player_edit(
         "message", "audit" (záznam nebo None), "changed_files": [...],
       }
 
-    Konflikty identity / neplatné tiery / poškozený JSON → ``status="error"``
-    (nic se neuloží, soubor zůstává nedotčený).
+    Konflikty identity / neplatné tiery / neznámý kit → ``status="error"``
+    (vrací se beze změny, transakce se odvolá).
 
-    Když je předán ``session_factory``, běží DB cesta (PostgreSQL = autorita):
-    private/metody repozitářů, žádný JSON reader/writer (F10). Audit jde do
-    ``audit_logs`` (append-only) místo edituser_log.json; ``changed_files`` je
-    prázdný (DB se nepíše do JSON souborů).
+    ``session_factory`` je povinný. Zápis jde přes repozitáře do PostgreSQL
+    a audit do ``audit_logs`` (append-only) ve STEJNÉ transakci, takže audit
+    nemůže přežít zrušenou změnu. ``changed_files`` je vždy prázdný – databáze
+    se nepíše do žádného souboru.
     """
     if now is None:
         now = _now_ms()
-    field = edit.get("field")
-    if session_factory is not None:
-        return await _apply_player_edit_db(
-            player_id=str(player_id),
-            edit=edit,
-            actor_id=actor_id,
-            actor_name=actor_name,
-            now=now,
-            queue_cooldown_ms=queue_cooldown_ms,
-            ht3_cooldown_ms=ht3_cooldown_ms,
-            session_factory=session_factory,
+    if session_factory is None:
+        raise RuntimeError(
+            "apply_player_edit potřebuje PostgreSQL; players.json se už nepoužívá"
         )
-    files = _files_for_edit(edit)
-
-    async def _run(tx):
-        info = {"old_value": None, "new_value": None, "kit": ""}
-
-        if field == "cooldown":
-            try:
-                old_desc, new_desc = apply_cooldown_edit(
-                    tx,
-                    player_id=str(player_id),
-                    action=edit.get("action"),
-                    kit_key=edit.get("kit"),
-                    now=now,
-                    queue_cooldown_ms=queue_cooldown_ms,
-                    ht3_cooldown_ms=ht3_cooldown_ms,
-                )
-            except ValueError as exc:
-                return {"status": "error", "message": str(exc), "audit": None}
-            info["old_value"], info["new_value"] = old_desc, new_desc
-            info["kit"] = str(edit.get("kit") or "").strip().lower()
-            if old_desc == new_desc:
-                return {
-                    "status": OUTCOME_UNCHANGED,
-                    "old_value": old_desc,
-                    "new_value": new_desc,
-                    "audit": None,
-                }
-            return await _commit(tx, info, changed_files=["cooldowns.json", "ht3_cooldowns.json"])
-
-        players = tx.get("players.json", [])
-        if not isinstance(players, list):
-            players = []
-        ref = {"discordId": player_id}
-        if _locate(players, ref) is None:
-            # players.json je dict (poškozený) → transakce už selhala výše (strict)
-            return {"status": "not_found", "message": f"Hráč `<@{player_id}>` nemá záznam v players.json.", "audit": None}
-
-        if field == "discord_id":
-            old_id = str(player_id)
-            new_id = str(edit.get("new_value") or "").strip()
-            before = _locate(players, ref)
-            old_val = str((before or {}).get("discordId") or "")
-            try:
-                new_players, target, outcome = change_player_discord(players, ref, new_id)
-            except PlayerIdentityConflict as exc:
-                return {"status": "error", "message": str(exc), "audit": None}
-            if outcome == CLAIM_UNCHANGED:
-                return {"status": OUTCOME_UNCHANGED, "old_value": old_val, "new_value": old_val, "audit": None}
-            tx.set("players.json", new_players)
-            migrated = _migrate_identity_keys(tx, old_id, new_id)
-            info["old_value"], info["new_value"] = old_val, new_id
-            return await _commit(tx, info, changed_files=["players.json"] + migrated)
-
-        if field == "ign":
-            before = _locate(players, ref)
-            old_ign = str((before or {}).get("username") or "")
-            new_ign = str(edit.get("new_value") or "").strip()
-            try:
-                new_players, target, outcome = change_player_ign(players, ref, new_ign)
-            except PlayerIdentityConflict as exc:
-                return {"status": "error", "message": str(exc), "audit": None}
-            if outcome == CLAIM_UNCHANGED and str((target or {}).get("username") or "") == old_ign:
-                return {"status": OUTCOME_UNCHANGED, "old_value": old_ign, "new_value": old_ign, "audit": None}
-            tx.set("players.json", new_players)
-            changed_files = ["players.json"]
-            if _migrate_eval_ign(tx, old_ign, str((target or {}).get("username") or "")):
-                changed_files.append("evals.json")
-            info["old_value"], info["new_value"] = old_ign, str((target or {}).get("username") or "")
-            return await _commit(tx, info, changed_files=changed_files)
-
-        if field == "tier":
-            kit_key = str(edit.get("kit") or "").strip().lower()
-            try:
-                new_players, target, old_val, outcome = change_kit_tier(
-                    players,
-                    ref,
-                    kit_key,
-                    edit.get("tier"),
-                    retired=bool(edit.get("retired")),
-                )
-            except InvalidTierEdit as exc:
-                return {"status": "error", "message": str(exc), "audit": None}
-            if outcome == OUTCOME_UNCHANGED:
-                return {"status": OUTCOME_UNCHANGED, "old_value": old_val, "new_value": old_val, "kit": kit_key, "audit": None}
-            tx.set("players.json", new_players)
-            info["old_value"], info["new_value"] = old_val, _mode_tier(
-                (target or {}).get("modes") or {}, kit_key
-            )
-            info["kit"] = kit_key
-            return await _commit(tx, info, changed_files=["players.json"])
-
-        return {"status": "error", "message": f"Neznámé pole úpravy: {field}", "audit": None}
-
-    async def _commit(tx, info, changed_files):
-        entry = {
-            "ts": now,
-            "actorId": str(actor_id) if actor_id is not None else None,
-            "actorName": actor_name or "",
-            "playerId": str(player_id),
-            "field": field,
-            "kit": info.get("kit") or None,
-            "oldValue": info.get("old_value"),
-            "newValue": info.get("new_value"),
-        }
-        entries = tx.get(EDITUSER_LOG_FILE, [])
-        if not isinstance(entries, list):
-            entries = []
-        entries.append(entry)
-        tx.set(EDITUSER_LOG_FILE, entries)
-        return {
-            "status": OUTCOME_CHANGED,
-            "field": field,
-            "kit": info.get("kit"),
-            "old_value": info.get("old_value"),
-            "new_value": info.get("new_value"),
-            "message": f"Změna pole `{field}` aplikována.",
-            "audit": entry,
-            "changed_files": changed_files,
-        }
-
-    try:
-        return await transaction(tuple(files), _run)
-    except DataCorruptionError as exc:
-        return {"status": "error", "message": f"Poškozená data: {exc}", "audit": None}
+    return await _apply_player_edit_db(
+        player_id=str(player_id),
+        edit=edit,
+        actor_id=actor_id,
+        actor_name=actor_name,
+        now=now,
+        queue_cooldown_ms=queue_cooldown_ms,
+        ht3_cooldown_ms=ht3_cooldown_ms,
+        session_factory=session_factory,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1177,28 +860,21 @@ async def execute_player_edit(
         kit_key = db.get("kit") or ""
         if player_after is None:
             # Kanonickou podobu hráče PO změně doplníme z autority (právě
-            # zapsáno výše) – stejně jako když ji dodá volající.
-            if session_factory is not None:
-                from db.repositories.players import PlayerRepository
-                from db.services.session import transaction as _db_tx
-                from services.player_export import build_player_shape
+            # zapsáno výše) – stejně jako když ji dodá volající. Zrcadlo rolí
+            # se musí přepočítat z POST stavu, jinak by plán rolí počítal starý
+            # tier a Discord by dostal jinou roli, než má v databázi.
+            from db.repositories.players import PlayerRepository
+            from db.services.session import transaction as _db_tx
+            from services.player_export import build_player_shape
 
-                async with _db_tx(session_factory) as session:
-                    _did = int(player_id) if str(player_id).isdigit() else None
-                    if _did is not None:
-                        _player = await PlayerRepository().get_by_discord_id(
-                            session, _did
-                        )
-                        if _player is not None:
-                            player_after = await build_player_shape(session, _player)
-            else:
-                from services.player_identity import find_by_discord_id
-                from services.store import read as _store_read
-
-                current = await _store_read("players.json", [])
-                player_after = find_by_discord_id(
-                    current if isinstance(current, list) else [], str(player_id)
-                )
+            async with _db_tx(session_factory) as session:
+                _did = int(player_id) if str(player_id).isdigit() else None
+                if _did is not None:
+                    _player = await PlayerRepository().get_by_discord_id(
+                        session, _did
+                    )
+                    if _player is not None:
+                        player_after = await build_player_shape(session, _player)
         plan = plan_role_sync(
             player=player_after or {},
             member=role_context.get("member"),
@@ -1220,16 +896,14 @@ async def execute_player_edit(
                 a.get("error") for a in (applied or []) if not a.get("ok")
             ]
 
-    # --- Web (jen změny publikované v players.json) ---
+    # --- Web (jen změny publikované v exportu hráčů) ---
+    # Export je projekce PostgreSQL → GitHub/web, NE fallback. Nikdy se
+    # nečte players.json: kdyby push selhal, web zůstane na staré verzi
+    # (a to je vidět), místo aby se tiše propagoval souborový rozestup.
     if db["field"] in ("tier", "ign", "discord_id") and push_web is not None:
-        if session_factory is not None:
-            from services.player_export import export_players
+        from services.player_export import export_players
 
-            canonical = await export_players(session_factory)
-        else:
-            from services.store import read as _store_read
-
-            canonical = await _store_read("players.json", [])
+        canonical = await export_players(session_factory)
         if isinstance(canonical, list) and canonical:
             try:
                 wresult = await push_web(canonical)
@@ -1267,9 +941,38 @@ def _report(status, *, db, roles, web, message=""):
 
 
 # ---------------------------------------------------------------------------
-# Auditní log (data/edituser_log.json, append-only, restart-safe)
+# Auditní log – PostgreSQL `audit_logs` (action='edituser')
 # ---------------------------------------------------------------------------
-async def get_edituser_log() -> list:
-    """Všechny záznamy auditu editoru v pořadí zápisu."""
-    entries = await store_read(EDITUSER_LOG_FILE, [])
-    return [e for e in entries if isinstance(e, dict)]
+async def get_edituser_log(*, session_factory) -> list:
+    """Záznamy auditu editoru (nejnovější nahoře), ve tvaru JSON-ish.
+
+    Audit už neleží v ``data/edituser_log.json``: každá potvrzená změna jde
+    do ``audit_logs`` ve stejné transakci jako samotná změna, takže audit
+    nemůže přežít zrušenou změnu ani naopak. Bez ``session_factory`` funkce
+    odmítne (RuntimeError) – žádný fallback na soubor.
+    """
+    if session_factory is None:
+        raise RuntimeError(
+            "get_edituser_log potřebuje PostgreSQL; edituser_log.json se už nepoužívá"
+        )
+    from db.repositories.sync_audit import AuditRepository
+    from db.services.session import transaction as db_transaction
+
+    async with db_transaction(session_factory) as session:
+        rows = await AuditRepository().list(
+            session, entity_type="player", limit=200
+        )
+        return [
+            {
+                "ts": r.created_at,
+                "actorId": str(r.actor_id) if r.actor_id is not None else None,
+                "actorName": r.actor_name or "",
+                "playerId": r.entity_id,
+                "field": (r.details or {}).get("field"),
+                "kit": (r.details or {}).get("kit"),
+                "oldValue": (r.details or {}).get("oldValue"),
+                "newValue": (r.details or {}).get("newValue"),
+            }
+            for r in rows
+            if r.action == "edituser"
+        ]

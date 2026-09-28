@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import Queue, QueueEntry, QueueTester
@@ -168,6 +168,50 @@ class QueueEntryRepository:
             )
         )
         return list(result.scalars())
+
+    async def claim_next_waiting(
+        self, session: AsyncSession, *, queue_id: int, pulled_at: Optional[datetime] = None
+    ) -> Optional[QueueEntry]:
+        """Atomicky vyber a vytažne PRVNÍHO čekajícího hráče fronty.
+
+        Concurrency-safe by construction, unlike "SELECT the first waiting
+        row, then UPDATE it":
+
+        * ``FOR UPDATE SKIP LOCKED`` means two concurrent pullers get two
+          *different* players instead of both reading the same row and racing
+          to update it (which let the same player be pulled twice — the loser
+          simply overwrote the winner's ``status``/``pulled_at``);
+        * ``ORDER BY position, id`` is the queue order, so the pull is FIFO
+          and not "whatever the planner happened to return";
+        * a row that is no longer ``waiting`` can never be claimed, so a
+          player who left in the meantime is never dragged out of a queue they
+          are not in.
+
+        Returns ``None`` when the queue has nobody waiting (or every candidate
+        was momentarily locked by a concurrent puller).
+        """
+        candidate = (
+            select(QueueEntry.id)
+            .where(
+                QueueEntry.queue_id == queue_id,
+                QueueEntry.status == QUEUE_ENTRY_WAITING,
+            )
+            .order_by(QueueEntry.position, QueueEntry.id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+        )
+        stmt = (
+            update(QueueEntry)
+            .where(QueueEntry.id == candidate.scalar_subquery())
+            .values(
+                status=QUEUE_ENTRY_PULLED,
+                pulled_at=pulled_at or datetime.now(timezone.utc),
+            )
+            .returning(QueueEntry)
+        )
+        result = await session.execute(stmt)
+        await session.flush()
+        return result.scalar_one_or_none()
 
     async def transition(
         self,

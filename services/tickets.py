@@ -1,36 +1,26 @@
-"""HT ticket systém – čistá logika + transakční stav (bez discord.py).
+"""HT ticket systém – čistá logika + PostgreSQL (bez discord.py).
 
-Stav žije v ``data/ht_tickets.json`` klíčovaný podle **ID textového kanálu**
-ticketu (každý ticket = jeden kanál). Používá se pro:
+Stav ticketů žije VÝHRADNĚ v PostgreSQL (tabulky ``tickets`` /
+``ticket_members``), nikdy v ``data/ht_tickets.json``. Každý ticket = jeden
+textový kanál (``channel_id``). Používá se pro:
 
 - automatické vytvoření ticketu (z HT3 panelu),
-- prevenci duplicit (hráč nemůže mít víc otevřených ticketů na stejný kit),
-- vlastnictví ticketu (ownerId = kdo ho otevřel),
+- prevenci duplicit (hráč nemůže mít víc otevřených ticketů na stejný kit;
+  garantuje to částečný unique index ``uq_tickets_open_player_kit``),
+- vlastnictví ticketu (owner = kdo ho otevřel),
 - Claim / Unclaim (kdo si ticket převzal = tester, který test provede),
 - /add a /remove členů (+ přístup do kanálu),
 - Close / Reopen (close nastaví i HT3+ cooldown),
-- log událostí (``data/ht_ticket_logs.json``, restart-safe).
+- log událostí (audit_logs, restart-safe).
 
-Tvar ticketu::
+DRUHÝ REŽIM TU UŽ NENÍ. Každá funkce vyžaduje ``session_factory`` a bez něj
+odmítne (RuntimeError) – ``ht_tickets.json`` / ``ht_ticket_logs.json`` /
+``ht3_cooldowns.json`` se nečtou ani nezapisují. Dvojí zdroj pravdy by se
+tiš rozešel: ticket by se v jednom režimu dal claimnout a ve druhém ne.
 
-    {
-      "id": "123456789012345678",      # ID kanálu ticketu
-      "status": "open" | "closed",
-      "ownerId": "111",
-      "ownerName": "Hráč",
-      "ign": "hrac_ign",
-      "kit": "AnchorPvP",              # displejový název kitu (klíč cooldownu)
-      "targetTier": "HT3",             # o jaký tier hráč usiluje
-      "currentTier": "LT3" | None,     # aktuální tier z players.json v čase otevření
-      "eval": true,                    # měl hráč „LT3 + eval"?
-      "claimerId": None | "222",       # kdo si ticket převzal
-      "claimerName": None | "Tester",
-      "members": ["333"],              # hráči přidaní přes /add
-      "categoryId": 123,
-      "panelMessageId": "999" | None,  # zpráva s embedem a tlačítky
-      "createdAt": 1769550000000,
-      "closedAt": None | 1769550000000,
-    }
+Návratové dicty mají historicky JSON-ish tvar (``ownerId``, ``targetTier`` …)
+vytvořený z DB řádku (``_db_ticket_to_dict``) – je to jen projekce pro cogy
+a view modaly, ne formát, ve kterém jsou data uložená.
 """
 
 from datetime import datetime, timezone
@@ -46,13 +36,6 @@ from db.repositories.sync_audit import AuditRepository
 from db.repositories.tickets import Ticket, TicketMemberRepository, TicketRepository
 from db.repositories.tiers import MirrorRepository
 from db.services.session import transaction
-from services import store
-from storage import load_data
-
-HT_TICKETS_FILE = "ht_tickets.json"
-HT_TICKET_LOGS_FILE = "ht_ticket_logs.json"
-HT3_COOLDOWNS_FILE = "ht3_cooldowns.json"
-
 STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
 
@@ -130,126 +113,82 @@ def effective_ticket_tier(current_tier: str | None, eval_ok: bool) -> str | None
     return cur if HT3_TIER_LADDER.index(cur) >= eval_idx else "LT3E"
 
 
-def find_player_tier(ign: str, kit: str, discord_id=None) -> str | None:
-    """Aktuální tier hráče pro daný kit; Discord ID má přednost před IGN.
-
-    ``discord_id`` je primární identita (services/player_identity.py) – když
-    hráče podle Discord ID najdeme, IGN se ignoruje. Bez Discord ID klasická
-    case-insensitive shoda podle IGN (legacy chování).
-    """
-    try:
-        players = load_data("players.json", []) or []
-    except Exception:
-        return None
-    player = None
-    if discord_id:
-        did = str(discord_id)
-        player = next(
-            (
-                p
-                for p in players
-                if isinstance(p, dict) and str(p.get("discordId") or "") == did
-            ),
-            None,
-        )
-    if player is None:
-        player = next(
-            (
-                p
-                for p in players
-                if isinstance(p, dict)
-                and str(p.get("username", "")).strip().lower()
-                == (ign or "").strip().lower()
-            ),
-            None,
-        )
-    if player is None:
-        return None
-    modes = player.get("modes") or {}
-    tier = modes.get(kit)
-    return str(tier).strip().upper() if tier else None
-
-
 async def player_tier(
     ign: str,
     kit: str,
     discord_id=None,
     *,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> str | None:
-    """Aktuální tier hráče pro daný kit (dual-mode).
+    """Aktuální tier hráče pro daný kit – výhradně z PostgreSQL.
 
-    DB režim: zdroj pravdy je mirror tabulky aktuálního tieru (Discord-confirmed;
-    viz F10 – stávající tier se v DB neodvozuje z JSON). JSON režim deleguje na
-    sync ``find_player_tier`` (players.json, legacy).
+    Zdroj pravdy je mirror tabulky aktuálního tieru (Discord-confirmed;
+    viz F10 – stávající tier se v DB neodvozuje z JSON, ``players.json`` se
+    nečte).
     """
-    if session_factory is not None:
-        async with transaction(session_factory) as session:
-            discord_int = int(discord_id) if discord_id else None
-            player, _source = await PlayerRepository().resolve(
-                session,
-                discord_id=discord_int,
-                ign=(ign or "").strip() or None,
-            )
-            if player is None:
-                return None
-            kit_row = await KitRepository().get_by_name(session, (kit or "").strip())
-            if kit_row is None:
-                return None
-            mirror = await MirrorRepository().get_current(
-                session, player_id=player.id, kit_id=kit_row.id
-            )
-            if mirror is None:
-                return None
-            tier = await TierDefinitionRepository().get_by_id(
-                session, mirror.tier_id
-            )
-            return tier.code if tier is not None else None
-
-    return find_player_tier(ign, kit, discord_id=discord_id)
+    if session_factory is None:
+        raise RuntimeError(
+            "player_tier potřebuje PostgreSQL; players.json se už nepoužívá"
+        )
+    async with transaction(session_factory) as session:
+        discord_int = int(discord_id) if discord_id else None
+        player, _source = await PlayerRepository().resolve(
+            session,
+            discord_id=discord_int,
+            ign=(ign or "").strip() or None,
+        )
+        if player is None:
+            return None
+        kit_row = await KitRepository().get_by_name(session, (kit or "").strip())
+        if kit_row is None:
+            return None
+        mirror = await MirrorRepository().get_current(
+            session, player_id=player.id, kit_id=kit_row.id
+        )
+        if mirror is None:
+            return None
+        tier = await TierDefinitionRepository().get_by_id(
+            session, mirror.tier_id
+        )
+        return tier.code if tier is not None else None
 
 
 # ---------------------------------------------------------------------------
 # Čtení stavu
 # ---------------------------------------------------------------------------
-async def get_tickets(session_factory: async_sessionmaker[AsyncSession] | None = None) -> dict:
-    if session_factory is not None:
-        return await _db_get_tickets(session_factory)
-    return await store.read(HT_TICKETS_FILE, {})
+async def get_tickets(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> dict:
+    if session_factory is None:
+        raise RuntimeError(
+            "get_tickets potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
+    return await _db_get_tickets(session_factory)
 
 
 async def get_ticket(
     channel_id,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict | None:
-    """Vrátí ticket podle ID kanálu (nebo None)."""
-    if session_factory is not None:
-        return await _db_get_ticket(session_factory, channel_id)
-    tickets = await store.read(HT_TICKETS_FILE, {})
-    return tickets.get(str(channel_id))
+    """Vrátí ticket podle ID kanálu (nebo None) – výhradně z PostgreSQL."""
+    if session_factory is None:
+        raise RuntimeError(
+            "get_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
+    return await _db_get_ticket(session_factory, channel_id)
 
 
 async def find_open_ticket(
     owner_id,
     kit: str,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict | None:
-    """Otevřený ticket hráče na daný kit (prevence duplicit)."""
-    if session_factory is not None:
-        return await _db_find_open_ticket(session_factory, owner_id, kit)
-    owner_id = str(owner_id)
-    kit_key = str(kit).strip().lower()
-    tickets = await store.read(HT_TICKETS_FILE, {})
-    for ticket in tickets.values():
-        if not isinstance(ticket, dict):
-            continue
-        if (
-            ticket.get("status") == STATUS_OPEN
-            and str(ticket.get("ownerId", "")) == owner_id
-            and str(ticket.get("kit", "")).strip().lower() == kit_key
-        ):
-            return ticket
-    return None
+    """Otevřený ticket hráče na daný kit (prevence duplicit) – z PostgreSQL."""
+    if session_factory is None:
+        raise RuntimeError(
+            "find_open_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
+    return await _db_find_open_ticket(session_factory, owner_id, kit)
 
 
 def make_ticket(
@@ -306,105 +245,48 @@ async def create_ticket(
     panel_message_id=None,
     ticket_type: str = TICKET_TYPE_EVAL,
     now: int,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Transakčně vytvoří ticket (prevence duplicit uvnitř kritického úseku).
 
     Vrací ``{"result": "created", "ticket": {...}}``, nebo
     ``{"result": "duplicate", "ticket": {existující otevřený ticket}}``.
     """
+    if session_factory is None:
+        raise RuntimeError(
+            "create_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
     owner_id = str(owner_id)
-    kit_key = str(kit).strip().lower()
     channel_id = str(channel_id)
-
-    if session_factory is not None:
-        return await _db_create_ticket(
-            session_factory,
-            channel_id=channel_id,
-            owner_id=owner_id,
-            owner_name=owner_name,
-            ign=ign,
-            kit=kit,
-            target_tier=target_tier,
-            current_tier=current_tier,
-            eval_ok=eval_ok,
-            category_id=category_id,
-            panel_message_id=panel_message_id,
-            ticket_type=ticket_type,
-            now=now,
-        )
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        existing = next(
-            (
-                t
-                for t in tickets.values()
-                if isinstance(t, dict)
-                and t.get("status") == STATUS_OPEN
-                and str(t.get("ownerId", "")) == owner_id
-                and str(t.get("kit", "")).strip().lower() == kit_key
-            ),
-            None,
-        )
-        if existing is not None:
-            return {"result": "duplicate", "ticket": existing}
-
-        ticket = make_ticket(
-            channel_id=channel_id,
-            owner_id=owner_id,
-            owner_name=owner_name,
-            ign=ign,
-            kit=kit,
-            target_tier=target_tier,
-            current_tier=current_tier,
-            eval_ok=eval_ok,
-            category_id=category_id,
-            panel_message_id=panel_message_id,
-            ticket_type=ticket_type,
-            now=now,
-        )
-        tickets[channel_id] = ticket
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "created", "ticket": ticket}
-
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    return await _db_create_ticket(
+        session_factory,
+        channel_id=channel_id,
+        owner_id=owner_id,
+        owner_name=owner_name,
+        ign=ign,
+        kit=kit,
+        target_tier=target_tier,
+        current_tier=current_tier,
+        eval_ok=eval_ok,
+        category_id=category_id,
+        panel_message_id=panel_message_id,
+        ticket_type=ticket_type,
+        now=now,
+    )
 
 
 async def claim_ticket(
     channel_id,
     actor_id: str,
     actor_name: str,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Ticket si převezme tester (actor); bez přepisu cizího claimu."""
-    channel_id = str(channel_id)
-    actor_id = str(actor_id)
-
-    if session_factory is not None:
-        return await _db_claim_ticket(session_factory, channel_id, actor_id, actor_name)
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        ticket = tickets.get(channel_id)
-        if ticket is None:
-            return {"result": "not_found"}
-        if ticket.get("status") != STATUS_OPEN:
-            return {"result": "not_open"}
-        if actor_id == str(ticket.get("ownerId", "")):
-            return {"result": "own_ticket"}
-        if ticket.get("claimerId") and str(ticket["claimerId"]) != actor_id:
-            return {
-                "result": "already_claimed",
-                "claimer_id": str(ticket["claimerId"]),
-                "claimer_name": ticket.get("claimerName") or "",
-            }
-        ticket["claimerId"] = actor_id
-        ticket["claimerName"] = actor_name or ""
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "claimed", "ticket": ticket}
-
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    if session_factory is None:
+        raise RuntimeError(
+            "claim_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
+    return await _db_claim_ticket(session_factory, channel_id, actor_id, actor_name)
 
 
 async def unclaim_ticket(
@@ -412,105 +294,43 @@ async def unclaim_ticket(
     actor_id: str,
     *,
     force: bool = False,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zruší claim ticketu; bez ``force`` jen aktér sám (kontrola claimera)."""
-    channel_id = str(channel_id)
-    actor_id = str(actor_id)
-
-    if session_factory is not None:
-        return await _db_unclaim_ticket(
-            session_factory, channel_id, actor_id, force=force
+    if session_factory is None:
+        raise RuntimeError(
+            "unclaim_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
         )
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        ticket = tickets.get(channel_id)
-        if ticket is None:
-            return {"result": "not_found"}
-        if not ticket.get("claimerId"):
-            return {"result": "not_claimed"}
-        if not force and str(ticket["claimerId"]) != actor_id:
-            return {
-                "result": "not_claimer",
-                "claimer_id": str(ticket["claimerId"]),
-                "claimer_name": ticket.get("claimerName") or "",
-            }
-        previous = {
-            "claimer_id": str(ticket["claimerId"]),
-            "claimer_name": ticket.get("claimerName") or "",
-        }
-        ticket["claimerId"] = None
-        ticket["claimerName"] = None
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "unclaimed", "ticket": ticket, "previous": previous}
-
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    return await _db_unclaim_ticket(
+        session_factory, channel_id, actor_id, force=force
+    )
 
 
 async def add_member(
     channel_id,
     member_id: str,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
     member_name: str | None = None,
 ) -> dict:
     """Přidá člena týmu ticketu; jen vlastník-id a otevřený ticket."""
-    channel_id = str(channel_id)
-    member_id = str(member_id)
-
-    if session_factory is not None:
-        return await _db_add_member(
-            session_factory, channel_id, member_id, member_name
+    if session_factory is None:
+        raise RuntimeError(
+            "add_member potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
         )
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        ticket = tickets.get(channel_id)
-        if ticket is None:
-            return {"result": "not_found"}
-        if ticket.get("status") != STATUS_OPEN:
-            return {"result": "not_open"}
-        if member_id == str(ticket.get("ownerId", "")):
-            return {"result": "is_owner"}
-        members = ticket.setdefault("members", [])
-        if member_id in members:
-            return {"result": "already_member", "ticket": ticket}
-        members.append(member_id)
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "added", "ticket": ticket}
-
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    return await _db_add_member(session_factory, channel_id, member_id, member_name)
 
 
 async def remove_member(
     channel_id,
     member_id: str,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Odebere člena týmu ticketu; jen vlastník-id a otevřený ticket."""
-    channel_id = str(channel_id)
-    member_id = str(member_id)
-
-    if session_factory is not None:
-        return await _db_remove_member(session_factory, channel_id, member_id)
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        ticket = tickets.get(channel_id)
-        if ticket is None:
-            return {"result": "not_found"}
-        if member_id == str(ticket.get("ownerId", "")):
-            return {"result": "is_owner"}
-        if ticket.get("claimerId") and member_id == str(ticket["claimerId"]):
-            return {"result": "is_claimer"}
-        members = ticket.setdefault("members", [])
-        if member_id not in members:
-            return {"result": "not_member", "ticket": ticket}
-        members.remove(member_id)
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "removed", "ticket": ticket}
-
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    if session_factory is None:
+        raise RuntimeError(
+            "remove_member potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
+    return await _db_remove_member(session_factory, channel_id, member_id)
 
 
 async def close_ticket(
@@ -519,7 +339,7 @@ async def close_ticket(
     *,
     cooldown_ms: int = 0,
     now: int = None,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zavře ticket + nastaví HT3+ cooldown vlastníkovi (7 dní).
 
@@ -527,54 +347,17 @@ async def close_ticket(
     v tomhle kitu do dalšího cooldownu neotevře nový ticket. Vrací dict
     s klíčem ``result`` a ``ticket``.
     """
+    if session_factory is None:
+        raise RuntimeError(
+            "close_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
     channel_id = str(channel_id)
     actor_id = str(actor_id)
     if now is None:
         now = _now_ms()
-
-    if session_factory is not None:
-        return await _db_close_ticket(
-            session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
-        )
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        ticket = tickets.get(channel_id)
-        if ticket is None:
-            return {"result": "not_found"}
-        if ticket.get("status") == STATUS_CLOSED:
-            return {"result": "already_closed", "ticket": ticket}
-        ticket["status"] = STATUS_CLOSED
-        ticket["closedAt"] = now
-
-        if cooldown_ms > 0:
-            cooldowns = tx.get(HT3_COOLDOWNS_FILE, {})
-            owner_id = str(ticket.get("ownerId", ""))
-            if owner_id:
-                # klíč cooldownu = displejový název kitu (viz HT3 panel)
-                cooldowns.setdefault(owner_id, {})[str(ticket.get("kit", ""))] = now + cooldown_ms
-                tx.set(HT3_COOLDOWNS_FILE, cooldowns)
-
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "closed", "ticket": ticket}
-
-    return await store.transaction(
-        (HT_TICKETS_FILE, HT3_COOLDOWNS_FILE) if cooldown_ms > 0 else (HT_TICKETS_FILE,),
-        _run,
+    return await _db_close_ticket(
+        session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
     )
-
-
-def _cooldown_remaining_ms(
-    cooldowns: dict, owner_id: str, kit_key: str, now: int
-) -> int | None:
-    """Zbývající HT3+ cooldown hráče na kit (ms); None = žádný/vypršel."""
-    if not owner_id or not kit_key:
-        return None
-    expires = (cooldowns.get(owner_id) or {}).get(kit_key)
-    if not expires:
-        return None
-    remaining = int(expires) - now
-    return remaining if remaining > 0 else None
 
 
 async def reopen_ticket(
@@ -583,140 +366,87 @@ async def reopen_ticket(
     *,
     cooldown_ms: int = 0,
     now: int = None,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Znovu otevře zavřený ticket (Reopen).
 
     ``cooldown_ms`` > 0 – pokud má vlastník ticketu na daný kit ještě aktivní
-    HT3+ cooldown (data/ht3_cooldowns.json), ticket se NEOTEVŘE a vrátí
+    HT3+ cooldown, ticket se NEOTEVŘE a vrátí
     ``{"result": "cooldown", "remaining_ms", "kit", "ticket"}``. Výchozí 0
     zachovává původní chování bez cooldown kontroly.
     """
+    if session_factory is None:
+        raise RuntimeError(
+            "reopen_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
     channel_id = str(channel_id)
     actor_id = str(actor_id)
     if now is None:
         now = _now_ms()
-
-    if session_factory is not None:
-        return await _db_reopen_ticket(
-            session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
-        )
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        ticket = tickets.get(channel_id)
-        if ticket is None:
-            return {"result": "not_found"}
-        if ticket.get("status") != STATUS_CLOSED:
-            return {"result": "not_closed", "ticket": ticket}
-
-        if cooldown_ms > 0:
-            cooldowns = tx.get(HT3_COOLDOWNS_FILE, {})
-            remaining = _cooldown_remaining_ms(
-                cooldowns,
-                str(ticket.get("ownerId", "")),
-                str(ticket.get("kit", "")),
-                now,
-            )
-            if remaining is not None:
-                return {
-                    "result": "cooldown",
-                    "remaining_ms": remaining,
-                    "kit": ticket.get("kit", ""),
-                    "ticket": ticket,
-                }
-
-        ticket["status"] = STATUS_OPEN
-        ticket["closedAt"] = None
-        tx.set(HT_TICKETS_FILE, tickets)
-        return {"result": "reopened", "ticket": ticket}
-
-    files = (
-        (HT_TICKETS_FILE, HT3_COOLDOWNS_FILE)
-        if cooldown_ms > 0
-        else (HT_TICKETS_FILE,)
+    return await _db_reopen_ticket(
+        session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
     )
-    return await store.transaction(files, _run)
 
 
 # ---------------------------------------------------------------------------
-# Log událostí (data/ht_ticket_logs.json) – restart-safe
+# Log událostí (audit_logs) – restart-safe
 # ---------------------------------------------------------------------------
 async def log_ticket_event(
     ticket_id,
     action: str,
     actor_id: str,
     actor_name: str = "",
+    *,
     details: str = None,
     now: int = None,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """Připíše událost do logu ticketu (append-only)."""
+    """Připíše událost do logu ticketu (append-only, audit_logs)."""
+    if session_factory is None:
+        raise RuntimeError(
+            "log_ticket_event potřebuje PostgreSQL; ht_ticket_logs.json se už nepoužívá"
+        )
     if now is None:
         now = _now_ms()
-
-    if session_factory is not None:
-        return await _db_log_ticket_event(
-            session_factory,
-            ticket_id,
-            action=action,
-            actor_id=actor_id,
-            actor_name=actor_name,
-            details=details,
-            now=now,
-        )
-
-    async def _run(tx):
-        logs = tx.get(HT_TICKET_LOGS_FILE, {})
-        bucket = logs.setdefault(str(ticket_id), [])
-        bucket.append(
-            {
-                "ts": now,
-                "action": action,
-                "actorId": str(actor_id),
-                "actorName": actor_name or "",
-                "details": details,
-            }
-        )
-        tx.set(HT_TICKET_LOGS_FILE, logs)
-
-    return await store.transaction((HT_TICKET_LOGS_FILE,), _run)
+    return await _db_log_ticket_event(
+        session_factory,
+        ticket_id,
+        action=action,
+        actor_id=actor_id,
+        actor_name=actor_name,
+        details=details,
+        now=now,
+    )
 
 
 async def get_ticket_logs(
     ticket_id,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> list:
-    """Vrátí události daného ticketu (nejstarší první)."""
-    if session_factory is not None:
-        return await _db_get_ticket_logs(session_factory, ticket_id)
-    logs = await store.read(HT_TICKET_LOGS_FILE, {})
-    return logs.get(str(ticket_id), [])
+    """Vrátí události daného ticketu (nejstarší první) – z audit_logs."""
+    if session_factory is None:
+        raise RuntimeError(
+            "get_ticket_logs potřebuje PostgreSQL; ht_ticket_logs.json se už nepoužívá"
+        )
+    return await _db_get_ticket_logs(session_factory, ticket_id)
 
 
 async def set_panel_message(
     channel_id,
     message_id,
-    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Doplní ``panelMessageId`` do záznamu ticketu (po vytvoření zprávy)."""
-    if session_factory is not None:
-        return await _db_set_panel_message(session_factory, channel_id, message_id)
-
-    async def _run(tx):
-        tickets = tx.get(HT_TICKETS_FILE, {})
-        rec = tickets.get(str(channel_id))
-        if rec is None:
-            return None
-        rec["panelMessageId"] = str(message_id)
-        tx.set(HT_TICKETS_FILE, tickets)
-        return rec
-
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    if session_factory is None:
+        raise RuntimeError(
+            "set_panel_message potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
+        )
+    return await _db_set_panel_message(session_factory, channel_id, message_id)
 
 
 # ---------------------------------------------------------------------------
-# PostgreSQL režim (session_factory) – JSON-mód zůstává beze změny výše
+# PostgreSQL implementace – jediný režim. Návratové dicty (ownerId, kit …)
+# jsou projekce z DB řádků (``_db_ticket_to_dict``), ne souborový formát.
 # ---------------------------------------------------------------------------
 def _db_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -943,7 +673,13 @@ async def _db_claim_ticket(
     actor_name: str,
 ) -> dict:
     async with transaction(session_factory) as session:
-        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        # H9 audit fix: řádkový zámek (FOR UPDATE) drží od prvního čtení až
+        # do commitu — dva souběžné claimy NIKDY oba neuspějí. Druhý tester po
+        # odemčení vidí commitnutého claimera a dostane ``already_claimed``;
+        # dřív oba prošli přes ``claimer_id IS NULL`` a přepsali se navzájem.
+        t = await TicketRepository().get_by_channel_for_update(
+            session, int(channel_id)
+        )
         if t is None:
             return {"result": "not_found"}
         if t.status != STATUS_OPEN:
@@ -1071,9 +807,23 @@ async def _db_add_member(
                 "result": "already_member",
                 "ticket": await _db_ticket_to_dict(session, t),
             }
-        await TicketMemberRepository().add(
-            session, ticket_id=t.id, player_id=member.id
-        )
+        # H10 audit fix: /add není serializováno řádkovým zámkem — dva
+        # souběžné přidání stejného člena můžou obě projít has_member a obě
+        # INSERT. Částečný unique index ``uq_ticket_members_active``
+        # (ticket_id, player_id) WHERE removed_at IS NULL to odmítne na úrovni
+        # DB; SAVEPOINT + IntegrityError zpackaný INSERT vrátí zpět, aniž by
+        # rozbil další transakci, a převede se na stejný ``already_member``,
+        # který by vrátila sekvenční cesta.
+        try:
+            async with session.begin_nested():
+                await TicketMemberRepository().add(
+                    session, ticket_id=t.id, player_id=member.id
+                )
+        except IntegrityError:
+            return {
+                "result": "already_member",
+                "ticket": await _db_ticket_to_dict(session, t),
+            }
         return {"result": "added", "ticket": await _db_ticket_to_dict(session, t)}
 
 

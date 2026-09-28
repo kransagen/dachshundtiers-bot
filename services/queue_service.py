@@ -1,25 +1,29 @@
-"""Čistá logika front + transakční operace (JSON i PostgreSQL režim).
+"""Čistá logika front + transakční operace – výhradně PostgreSQL.
 
-Veškeré změny probíhají atomicky: v JSON režimu přes ``services.store``
-(kritický úsek čtení + kontrola + zápis), v DB režimu přes jednu PostgreSQL
-transakci. Souběžné interakce nemůžou duplicitně zapsat hráče do fronty,
-obejít cooldown, ztratit zápis (join vs. pull vs. leave) a vytažení (pull)
-hráče už není „dvakrát".
+Veškeré změny probíhají atomicky přes jednu PostgreSQL transakci
+(``db_transaction``). Souběžné interakce nemůžou duplicitně zapsat hráče do
+fronty, obejít cooldown ani ztratit zápis (join vs. pull vs. leave) a vytažení
+(pull) hráče už není „dvakrát" (FOR UPDATE SKIP LOCKED).
+
+Legacy JSON režim (``services.store`` / ``active_queues.json``,
+``queue.json``, ``pulled_players.json``, ``queue_messages.json``,
+``testers.json``, ``cooldowns.json``) byl zcela odebrán: tyto funkce
+vyžadují ``session_factory`` a stav front je v PostgreSQL.
 """
 
 from __future__ import annotations
 
-import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
 from db.models import Kit, Player, Queue, QueueEntry
 from db.repositories.cooldowns import CooldownRepository
-from db.repositories.kits import KitRepository
+from db.repositories.kits import KitRepository, KitTesterRoomRepository
 from db.repositories.players import PlayerIdentityError, PlayerRepository
 from db.repositories.queues import (
     QUEUE_ENTRY_LEFT,
@@ -31,62 +35,6 @@ from db.repositories.queues import (
 )
 from db.repositories.evaluations import TesterRepository
 from db.services.session import transaction as db_transaction
-from services.store import transaction
-
-
-def cooldown_remaining(cooldowns, user_id: str, now: int, cooldown_ms: int):
-    """Zbývající milisekundy cooldownu hráče, nebo ``None``, když už vypršel."""
-    if not isinstance(cooldowns, dict):
-        return None
-    last = cooldowns.get(user_id)
-    if last is None:
-        return None
-    remaining = cooldown_ms - (now - last)
-    return remaining if remaining > 0 else None
-
-
-def already_in_queue(queue, user_id: str, kit_key: str) -> bool:
-    """Je hráč (podle ID) už zapsaný ve frontě daného kitu?"""
-    kit_key = str(kit_key).lower()
-    uid = str(user_id)
-    return any(
-        p.get("id") == uid and str(p.get("kit", "")).lower() == kit_key
-        for p in queue
-    )
-
-
-def move_to_queue_end(queue: list, stored_player, player_id: str):
-    """Přesune hráče na konec fronty (ostatní jdou před něj).
-
-    Vrací ``(new_queue, kit_key, moved)``. Pokud hráč ve frontě není,
-    použije se uložený záznam z pullnutí (``stored_player``).
-    """
-    kit_key = ""
-    entry_to_move = stored_player if (stored_player and stored_player.get("kit")) else None
-    new_queue = []
-    moved = False
-    for p in queue:
-        if str(p.get("id", "")) == player_id and not moved:
-            entry_to_move = p
-            moved = True
-            continue
-        new_queue.append(p)
-    if entry_to_move and entry_to_move.get("kit"):
-        new_queue.append(entry_to_move)
-        kit_key = str(entry_to_move["kit"]).lower()
-    return new_queue, kit_key, moved
-
-
-def make_entry(user_id: str, username: str, ign: str, kit: str, joined_at_ms: int) -> dict:
-    """Nový záznam hráče ve frontě (stejný tvar jako dřív)."""
-    return {
-        "id": str(user_id),
-        "username": username,
-        "ign": ign,
-        "kit": kit,
-        "joinedAt": joined_at_ms,
-        "testerId": None,
-    }
 
 
 def _db_dt(ms: int) -> datetime:
@@ -162,6 +110,20 @@ async def _db_join_queue_once(
         if existing is not None:
             return {"result": "duplicate"}
 
+        # E4 audit fix: ``next_position`` is MAX(position)+1 — a read of
+        # shared state. Two concurrent joins (distinct players) both read the
+        # same MAX and would both insert the SAME position unless this
+        # transaction serializes on the queue row first (there is no unique
+        # index on (queue_id, position) to reject the loser, and then the
+        # queue's FIFO order would silently flip). The FOR UPDATE lock on the
+        # queue row is held to commit, so each concurrent join computes the
+        # next position after the previous one commits — EXACTLY like the
+        # advisory lock used for mirror apply (db/repositories/tiers.py).
+        await session.execute(
+            text("SELECT id FROM queues WHERE id = :qid FOR UPDATE"),
+            {"qid": queue.id},
+        )
+
         await QueueEntryRepository().enqueue(
             session,
             queue_id=queue.id,
@@ -182,9 +144,10 @@ async def join_queue(
     *,
     joined_at_ms: int,
     cooldown_ms: int,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Transakčně přidá hráče do fronty (aktivní fronta + cooldown + duplicita).
+    Vyžaduje PostgreSQL (``session_factory``).
 
     Vrací slovník s klíčem ``result``:
       - ``"joined"``    → hráč byl přidán,
@@ -192,40 +155,15 @@ async def join_queue(
       - ``"cooldown"``  → cooldown stále běží (klíč ``remaining`` = zbývající ms),
       - ``"duplicate"`` → hráč už ve frontě kitu je.
     """
-    kit_key = str(kit).lower()
     uid = str(user_id)
     now = joined_at_ms
-
-    if session_factory is not None:
-        return await _db_join_queue(
-            session_factory,
-            uid=uid,
-            username=username,
-            ign=ign,
-            kit=kit,
-            now=now,
-        )
-
-    async def _run(tx):
-        active_queues = tx.get("active_queues.json", {})
-        if not active_queues.get(kit_key):
-            return {"result": "closed"}
-
-        cooldowns = tx.get("cooldowns.json", {})
-        remaining = cooldown_remaining(cooldowns, uid, now, cooldown_ms)
-        if remaining is not None:
-            return {"result": "cooldown", "remaining": remaining}
-
-        queue = tx.get("queue.json")
-        if already_in_queue(queue, uid, kit_key):
-            return {"result": "duplicate"}
-
-        queue.append(make_entry(uid, username, ign, kit, now))
-        tx.set("queue.json", queue)
-        return {"result": "joined"}
-
-    return await transaction(
-        ("active_queues.json", "cooldowns.json", "queue.json"), _run
+    return await _db_join_queue(
+        session_factory,
+        uid=uid,
+        username=username,
+        ign=ign,
+        kit=str(kit).lower(),
+        now=now,
     )
 
 
@@ -255,28 +193,12 @@ async def _db_leave_queue(session_factory, *, uid: str, kit: str) -> bool:
 async def leave_queue(
     user_id: str,
     kit_key: str,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> bool:
     """Transakčně vyjme hráče z fronty daného kitu. Vrací True, když byl odebrán."""
     kit_key = str(kit_key).lower()
     uid = str(user_id)
-
-    if session_factory is not None:
-        return await _db_leave_queue(session_factory, uid=uid, kit=kit_key)
-
-    async def _run(tx):
-        queue = tx.get("queue.json")
-        new_queue = [
-            p
-            for p in queue
-            if not (p.get("id") == uid and str(p.get("kit", "")).lower() == kit_key)
-        ]
-        if len(new_queue) == len(queue):
-            return False
-        tx.set("queue.json", new_queue)
-        return True
-
-    return await transaction(("queue.json",), _run)
+    return await _db_leave_queue(session_factory, uid=uid, kit=kit_key)
 
 
 async def _db_pop_for_kit(
@@ -286,54 +208,205 @@ async def _db_pop_for_kit(
         kit_row, queue = await _db_resolve_queue(session, kit)
         if kit_row is None or queue is None:
             return None
-        entries = await QueueEntryRepository().list_waiting(
-            session, queue_id=queue.id
+        # Single conditional UPDATE (FOR UPDATE SKIP LOCKED) instead of
+        # "read first waiting, then update it": two concurrent pulls used to
+        # both read the same row and both report success, so one player could
+        # be handed to two testers. See QueueEntryRepository.claim_next_waiting.
+        entry = await QueueEntryRepository().claim_next_waiting(
+            session, queue_id=queue.id, pulled_at=_db_dt(now)
         )
-        if not entries:
+        if entry is None:
             return None
-        entry = entries[0]
-        await QueueEntryRepository().transition(
-            session,
-            entry_id=entry.id,
-            status=QUEUE_ENTRY_PULLED,
-            pulled_at=_db_dt(now),
-        )
         player = await session.get(Player, entry.player_id)
         return _db_entry_to_dict(entry, player, kit_row.name)
 
 
 async def pop_for_kit(
     kit_key: str,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ):
-    """Transakčně odebere PRVNÍHO hráče kitu z fronty (pull).
+    """Transakčně odebere PRVNÍHO hráče kitu z fronty (pull, legacy helper).
 
     Vrací záznam hráče, nebo ``None``, když fronta kitu už nikoho nemá.
+    Nové proudy používají ``pull_for_kit`` (roomka + fronta v jedné transakci).
     """
     kit_key = str(kit_key).lower()
+    return await _db_pop_for_kit(
+        session_factory, kit=kit_key, now=int(datetime.now(timezone.utc).timestamp() * 1000)
+    )
 
-    if session_factory is not None:
-        return await _db_pop_for_kit(
-            session_factory, kit=kit_key, now=int(datetime.now(timezone.utc).timestamp() * 1000)
-        )
 
-    async def _run(tx):
-        queue = tx.get("queue.json")
-        index = next(
-            (
-                i
-                for i, p in enumerate(queue)
-                if str(p.get("kit", "")).lower() == kit_key
-            ),
-            None,
-        )
-        if index is None:
+# ---------------------------------------------------------------------------
+# Tester roomky: kit -> Discord kanál (autoritativní mapování v PostgreSQL)
+# ---------------------------------------------------------------------------
+# Dřív tester vybíral roomku ručně (ChannelSelect) a mapování mezi kitem a
+# pokojem neexistovalo. Teď je mapování řádek v `kit_tester_rooms`, který
+# založí `/mktesterroom <kit>` a ze kterého ho `/queue pull <kit>` čte. Kanál
+# je jen projekce do Discordu; autoritou je řádek v DB.
+
+
+async def set_tester_room(
+    kit: str,
+    channel_id: int,
+    *,
+    created_by: Optional[int] = None,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> Optional[int]:
+    """Přiřadí roomku kitu; vrací ``kit_id`` nebo ``None`` pro neznámý kit.
+
+    Idempotentní: opakované volání stejného kitu *nahradí* kanál, nevytvoří
+    druhý řádek (upsert na `kit_id`). Pokud už tenhle kanál patří jinému
+    kitu, UNIQUE na ``channel_id`` to odmítne — dvě kity si jednu roomku
+    nemůžou vzít, jinak by `/queue pull` nemělo jednoznačnou odpověď.
+    """
+    kit_key = (kit or "").strip().lower()
+    if not kit_key:
+        return None
+    async with db_transaction(session_factory) as session:
+        kit_row = await _resolve_kit_any(session, kit_key)
+        if kit_row is None:
             return None
-        player = queue.pop(index)
-        tx.set("queue.json", queue)
-        return player
+        await KitTesterRoomRepository().set_room(
+            session,
+            kit_id=kit_row.id,
+            channel_id=channel_id,
+            created_by=created_by,
+        )
+        return kit_row.id
 
-    return await transaction(("queue.json",), _run)
+
+async def resolve_tester_room(
+    kit: str, *, session_factory: async_sessionmaker[AsyncSession]
+) -> Optional[int]:
+    """``channel_id`` tester roomky pro kit, nebo ``None`` když není zadaná."""
+    kit_key = (kit or "").strip().lower()
+    if not kit_key:
+        return None
+    async with db_transaction(session_factory) as session:
+        kit_row = await _resolve_kit_any(session, kit_key)
+        if kit_row is None:
+            return None
+        room = await KitTesterRoomRepository().get_for_kit(session, kit_id=kit_row.id)
+        return room.channel_id if room is not None else None
+
+
+async def clear_tester_room(
+    kit: str, *, session_factory: async_sessionmaker[AsyncSession]
+) -> bool:
+    kit_key = (kit or "").strip().lower()
+    if not kit_key:
+        return False
+    async with db_transaction(session_factory) as session:
+        kit_row = await _resolve_kit_any(session, kit_key)
+        if kit_row is None:
+            return False
+        return await KitTesterRoomRepository().clear(session, kit_id=kit_row.id)
+
+
+async def _resolve_kit_any(session: AsyncSession, kit_key: str) -> Optional[object]:
+    """Kit by key, s fallbackem na case-insensitive display name.
+
+    Stejné pořadí jako u ostatních resolve helperů: `Kit.key` je primární
+    business klíč, ale testeři i starší příkazy občas posílají display name.
+    """
+    repo = KitRepository()
+    kit_row = await repo.get_by_key(session, kit_key)
+    if kit_row is None:
+        kit_row = await repo.get_by_name(session, kit_key)
+    return kit_row
+
+
+async def resolve_kit(
+    kit: str, *, session_factory: async_sessionmaker[AsyncSession]
+) -> Optional[object]:
+    """Veřejný resolve helper: kit key nebo display name -> Kit řádek.
+
+    Používají ho cogy, které potřebují potvrdit, že zadaný kit existuje,
+    než s ním začnou něco dělat (`/mktesterroom`). Vyhazuje ``None``, ne
+    hází — volající chce vědět, jestli kit zná, a píše o tom hlášku hráči.
+    """
+    kit_key = (kit or "").strip().lower()
+    if not kit_key:
+        return None
+    async with db_transaction(session_factory) as session:
+        return await _resolve_kit_any(session, kit_key)
+
+
+# ---------------------------------------------------------------------------
+# Kanonický pull: fronta kitu + automatické dohledání tester roomky
+# ---------------------------------------------------------------------------
+
+PULL_OK = "ok"
+PULL_EMPTY = "empty"
+PULL_NO_ROOM = "no_tester_room"
+PULL_NO_KIT = "no_such_kit"
+
+
+@dataclass(frozen=True)
+class PullResult:
+    """Výsledek ``pull_for_kit`` — strukturovaný místo řetězce."""
+
+    status: str
+    player: Optional[dict] = None
+    channel_id: Optional[int] = None
+    kit_name: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == PULL_OK
+
+
+async def _db_pull_for_kit(
+    session_factory, *, kit: str, now: int
+) -> PullResult:
+    async with db_transaction(session_factory) as session:
+        kit_row = await _resolve_kit_any(session, kit)
+        if kit_row is None:
+            return PullResult(status=PULL_NO_KIT)
+
+        # Roomku řešíme PRVNÍ. Když chybí, hráče z fronty vůbec nevybavíme —
+        # vzít ho z fronty a pak zjistit, že nemáme kam ho pustit, by znamenalo
+        # ztraceného hráče.
+        room = await KitTesterRoomRepository().get_for_kit(session, kit_id=kit_row.id)
+        if room is None:
+            return PullResult(status=PULL_NO_ROOM, kit_name=kit_row.name)
+
+        queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
+        if queue is None:
+            return PullResult(status=PULL_EMPTY, kit_name=kit_row.name)
+
+        # Přechod waiting -> pulled je jeden podmíněný UPDATE
+        # (FOR UPDATE SKIP LOCKED), takže dvě souběžná pullnutí vyberou dva
+        # různé hráče a žádný se nevytáhne dvakrát.
+        entry = await QueueEntryRepository().claim_next_waiting(
+            session, queue_id=queue.id, pulled_at=_db_dt(now)
+        )
+        if entry is None:
+            return PullResult(status=PULL_EMPTY, kit_name=kit_row.name)
+        player = await session.get(Player, entry.player_id)
+        return PullResult(
+            status=PULL_OK,
+            player=_db_entry_to_dict(entry, player, kit_row.name),
+            channel_id=room.channel_id,
+            kit_name=kit_row.name,
+        )
+
+
+async def pull_for_kit(
+    kit: str, *, session_factory: Optional[async_sessionmaker[AsyncSession]]
+) -> PullResult:
+    """Vytažení PRVNÍHO hráče kitu do jeho tester roomky — jedna transakce.
+
+    Tohle je jediná kanonická cesta pro „vytáhnout hráče na test". Roomka se
+    už nebere od testera, ale z tabulky ``kit_tester_rooms``; chybí-li, vrátí
+    ``no_tester_room`` a hráč ve frontě zůstane.
+    """
+    kit_key = (kit or "").strip().lower()
+    if not kit_key:
+        return PullResult(status=PULL_NO_KIT)
+    return await _db_pull_for_kit(
+        session_factory, kit=kit_key, now=int(datetime.now(timezone.utc).timestamp() * 1000)
+    )
 
 
 async def _db_remove_by_player_id(session_factory, *, uid: str) -> bool:
@@ -359,26 +432,14 @@ async def _db_remove_by_player_id(session_factory, *, uid: str) -> bool:
 
 async def remove_by_player_id(
     player_id: str,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> bool:
     """Transakčně vyjme hráče z fronty podle Discord ID (nezávisle na kitu).
 
     Vrací True, když byl ve frontě nalezen a odebrán.
     """
     uid = str(player_id)
-
-    if session_factory is not None:
-        return await _db_remove_by_player_id(session_factory, uid=uid)
-
-    async def _run(tx):
-        queue = tx.get("queue.json")
-        new_queue = [p for p in queue if p.get("id") != uid]
-        if len(new_queue) == len(queue):
-            return False
-        tx.set("queue.json", new_queue)
-        return True
-
-    return await transaction(("queue.json",), _run)
+    return await _db_remove_by_player_id(session_factory, uid=uid)
 
 
 async def _db_save_pulled_player(
@@ -429,70 +490,33 @@ async def _db_preset_player_room(
 async def preset_player_room(
     player: dict,
     channel_id: int,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Zapíše přednastavený přístup hráče do roomky/ticketu.
 
-    JSON režim: ``pulled_players.json`` (jeden záznam na hráče, přepis záměrný).
-    DB režim: ``room_channel_id`` na čekajícím záznamu hráče ve frontě
-    (přednastavený přístup = hráč zůstává ve frontě); bez čekajícího záznamu
-    se nic nezapíše — /result stejně odebere práva přepisem všech kanálů.
+    ``room_channel_id`` na čekajícím záznamu hráče ve frontě (přednastavený
+    přístup = hráč zůstává ve frontě); bez čekajícího záznamu se nic nezapíše
+    — /result stejně odebere práva přepisem všech kanálů. PostgreSQL.
     """
-
-    if session_factory is not None:
-        return await _db_preset_player_room(
-            session_factory, player=player, channel_id=channel_id
-        )
-
-    async def _run(tx):
-        pulled = tx.get("pulled_players.json", {})
-        pulled[str(player.get("id", ""))] = {
-            "channel": str(channel_id),
-            "player": {
-                "id": str(player.get("id", "")),
-                "username": player.get("username", ""),
-                "ign": player.get("ign", ""),
-                "kit": str(player.get("kit", "")),
-                "joinedAt": player.get("joinedAt", 0),
-            },
-        }
-        tx.set("pulled_players.json", pulled)
-
-    return await transaction(("pulled_players.json",), _run)
+    return await _db_preset_player_room(
+        session_factory, player=player, channel_id=channel_id
+    )
 
 
 async def save_pulled_player(
     player: dict,
     channel_id: int,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Zapíše/aktualizuje záznam vytaženého hráče (roomka, kde testuje).
 
-    JSON režim: ``pulled_players.json`` (jeden záznam na hráče, přepis záměrný).
-    DB režim: nejnovější ``pulled`` záznam hráče v ``queue_entries`` dostane
+    Nejnovější ``pulled`` záznam hráče v ``queue_entries`` dostane
     ``room_channel_id``. Hráč bez aktivního záznamu (přednastavený přístup přes
-    ``/mktesterroom`` mimo frontu) se v DB režimu nezaznamená – tu větu řeší
-    rewiring cogs v todo #3.
+    ``/mktesterroom`` mimo frontu) se nezaznamená. PostgreSQL.
     """
-
-    if session_factory is not None:
-        return await _db_save_pulled_player(session_factory, player=player, channel_id=channel_id)
-
-    async def _run(tx):
-        pulled = tx.get("pulled_players.json", {})
-        pulled[str(player.get("id", ""))] = {
-            "channel": str(channel_id),
-            "player": {
-                "id": str(player.get("id", "")),
-                "username": player.get("username", ""),
-                "ign": player.get("ign", ""),
-                "kit": str(player.get("kit", "")),
-                "joinedAt": player.get("joinedAt", 0),
-            },
-        }
-        tx.set("pulled_players.json", pulled)
-
-    return await transaction(("pulled_players.json",), _run)
+    return await _db_save_pulled_player(
+        session_factory, player=player, channel_id=channel_id
+    )
 
 
 async def _db_remove_pulled_player(session_factory, *, uid: str) -> bool:
@@ -517,28 +541,15 @@ async def _db_remove_pulled_player(session_factory, *, uid: str) -> bool:
 
 async def remove_pulled_player(
     player_id: str,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> bool:
-    """Smaže záznam vytaženého hráče. Vrací True, když existoval."""
+    """Smaže záznam vytaženého hráče (pulled → tested). Vrací True, když existoval."""
     uid = str(player_id)
-
-    if session_factory is not None:
-        return await _db_remove_pulled_player(session_factory, uid=uid)
-
-    async def _run(tx):
-        pulled = tx.get("pulled_players.json", {})
-        if uid not in pulled:
-            return False
-        del pulled[uid]
-        tx.set("pulled_players.json", pulled)
-        return True
-
-    return await transaction(("pulled_players.json",), _run)
+    return await _db_remove_pulled_player(session_factory, uid=uid)
 
 # ---------------------------------------------------------------------------
 # Active-queue lifecycle (todo #10b): /openq, /closeq, /joinasqueue, /leaveq,
-# /queue list, /pull display, /removeq, /skip. JSON režim zachovává původní
-# tvary (active_queues.json / queue.json / pulled_players.json) beze změny.
+# /queue list, /pull display, /removeq, /skip. Vše v PostgreSQL.
 # ---------------------------------------------------------------------------
 
 
@@ -629,40 +640,22 @@ async def open_queue(
     opener_uid: str,
     opener_ign: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[str, Optional[dict]]:
-    """Transakčně otevře frontu kitu (jen jednu aktivní na kit).
+    """Transakčně otevře frontu kitu (jen jednu aktivní na kit). PostgreSQL.
 
     Vrací ``(status, qdata)``: status in ``ok`` / ``exists`` /
     ``unknown_kit`` / ``identity_conflict``; qdata = JSON tvar
     ``active_queues[kit_key]`` (name, opener, testers, time).
     """
     kit_key = str(kit_key).lower()
-
-    if session_factory is not None:
-        return await _db_open_queue(
-            session_factory,
-            kit_key=kit_key,
-            name=name,
-            opener_uid=opener_uid,
-            opener_ign=opener_ign,
-        )
-
-    async def _run(tx):
-        active_queues = tx.get("active_queues.json", {})
-        if kit_key in active_queues:
-            return ("exists", active_queues[kit_key])
-        qdata = {
-            "name": name,
-            "opener": opener_uid,
-            "testers": [opener_uid],
-            "time": int(time.time() * 1000),
-        }
-        active_queues[kit_key] = qdata
-        tx.set("active_queues.json", active_queues)
-        return ("ok", qdata)
-
-    return await transaction(("active_queues.json",), _run)
+    return await _db_open_queue(
+        session_factory,
+        kit_key=kit_key,
+        name=name,
+        opener_uid=opener_uid,
+        opener_ign=opener_ign,
+    )
 
 
 async def set_queue_panel(
@@ -670,28 +663,19 @@ async def set_queue_panel(
     channel_id: int,
     message_id: int,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Zapíše panel fronty (channel + message) pro re-registraci po restartu."""
     kit_key = str(kit_key).lower()
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            kit_row = await KitRepository().get_by_name(session, kit_key)
-            if kit_row is None:
-                return
-            queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
-            if queue is not None:
-                queue.panel_channel_id = int(channel_id)
-                queue.panel_message_id = int(message_id)
-                await session.flush()
-        return
-
-    async def _run(tx):
-        queue_messages = tx.get("queue_messages.json", {})
-        queue_messages[kit_key] = {"message_id": str(message_id), "kit": kit_key}
-        tx.set("queue_messages.json", queue_messages)
-
-    return await transaction(("queue_messages.json",), _run)
+    async with db_transaction(session_factory) as session:
+        kit_row = await KitRepository().get_by_name(session, kit_key)
+        if kit_row is None:
+            return
+        queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
+        if queue is not None:
+            queue.panel_channel_id = int(channel_id)
+            queue.panel_message_id = int(message_id)
+            await session.flush()
 
 
 async def _db_close_queue(session_factory, *, kit_key: str) -> Optional[dict]:
@@ -725,186 +709,134 @@ async def _db_close_queue(session_factory, *, kit_key: str) -> Optional[dict]:
 async def close_queue(
     kit_key: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> Optional[dict]:
-    """Transakčně zavře frontu: promazá čekající hráče + panel záznam.
+    """Transakčně zavře frontu: promazá čekající hráče + panel záznam. PostgreSQL.
 
     Vrací záznam panelu ({message_id}) nebo None.
     """
     kit_key = str(kit_key).lower()
-
-    if session_factory is not None:
-        return await _db_close_queue(session_factory, kit_key=kit_key)
-
-    async def _close(tx):
-        active = tx.get("active_queues.json", {})
-        active.pop(kit_key, None)
-        tx.set("active_queues.json", active)
-
-        queue = tx.get("queue.json")
-        remaining = [p for p in queue if str(p.get("kit", "")).lower() != kit_key]
-        if len(remaining) != len(queue):
-            tx.set("queue.json", remaining)
-
-        messages = tx.get("queue_messages.json", {})
-        old = messages.pop(kit_key, None)
-        tx.set("queue_messages.json", messages)
-        return old
-
-    return await transaction(
-        ("active_queues.json", "queue.json", "queue_messages.json"), _close
-    )
+    return await _db_close_queue(session_factory, kit_key=kit_key)
 
 
 async def queue_state(
     kit_key: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> Optional[dict]:
     """Aktivní fronta kitu v JSON tvaru (name/opener/testers/time) nebo None."""
     kit_key = str(kit_key).lower()
-
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            kit_row = await KitRepository().get_by_name(session, kit_key)
-            if kit_row is None:
-                return None
-            queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
-            if queue is None:
-                return None
-            return await _db_qdata(session, queue)
-
-    return _json_active_queues().get(kit_key)
-
-
-def _json_active_queues() -> dict:
-    from storage import load_data
-
-    return load_data("active_queues.json", {}) or {}
+    async with db_transaction(session_factory) as session:
+        kit_row = await KitRepository().get_by_name(session, kit_key)
+        if kit_row is None:
+            return None
+        queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
+        if queue is None:
+            return None
+        return await _db_qdata(session, queue)
 
 
 async def active_queues(
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Mapa {kit_key: qdata} všech aktivních front (for /queue list + panel)."""
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            queues = await QueueRepository().list_active(session)
-            result = {}
-            for queue in queues:
-                kit = await session.get(Kit, queue.kit_id)
-                if kit is None:
-                    continue
-                result[kit.key] = await _db_qdata(session, queue)
-            return result
-
-    return _json_active_queues()
+    async with db_transaction(session_factory) as session:
+        queues = await QueueRepository().list_active(session)
+        result = {}
+        for queue in queues:
+            kit = await session.get(Kit, queue.kit_id)
+            if kit is None:
+                continue
+            result[kit.key] = await _db_qdata(session, queue)
+        return result
 
 
 async def list_queue_entries(
     kit_key: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> list[dict]:
-    """Čekající hráči kitu (JSON tvar entry dictů; queue.json filtr v JSON režimu)."""
+    """Čekající hráči kitu (JSON tvar entry dictů). PostgreSQL."""
     kit_key = str(kit_key).lower()
-
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            kit_row = await KitRepository().get_by_name(session, kit_key)
-            if kit_row is None:
-                return []
-            queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
-            if queue is None:
-                return []
-            entries = await QueueEntryRepository().list_waiting(
-                session, queue_id=queue.id
-            )
-            players = {
-                p.id: p
-                for p in (
-                    await session.execute(
-                        select(Player).where(
-                            Player.id.in_([e.player_id for e in entries])
-                        )
+    async with db_transaction(session_factory) as session:
+        kit_row = await KitRepository().get_by_name(session, kit_key)
+        if kit_row is None:
+            return []
+        queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
+        if queue is None:
+            return []
+        entries = await QueueEntryRepository().list_waiting(
+            session, queue_id=queue.id
+        )
+        players = {
+            p.id: p
+            for p in (
+                await session.execute(
+                    select(Player).where(
+                        Player.id.in_([e.player_id for e in entries])
                     )
-                ).scalars()
-            }
-            return [
-                _db_entry_to_dict(e, players.get(e.player_id), kit_row.name)
-                for e in entries
-            ]
-
-    from storage import load_data
-
-    queue = load_data("queue.json") or []
-    return [p for p in queue if str(p.get("kit", "")).lower() == kit_key]
+                )
+            ).scalars()
+        }
+        return [
+            _db_entry_to_dict(e, players.get(e.player_id), kit_row.name)
+            for e in entries
+        ]
 
 
 async def queue_snapshot(
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[list[dict], dict]:
     """(celá global fronta, aktivní fronty) pro /queue list — JSON tvar."""
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            queues = await QueueRepository().list_active(session)
-            entries: list[dict] = []
-            for queue in queues:
-                kit = await session.get(Kit, queue.kit_id)
-                if kit is None:
-                    continue
-                for e in await QueueEntryRepository().list_waiting(
-                    session, queue_id=queue.id
-                ):
-                    player = await session.get(Player, e.player_id)
-                    entries.append(_db_entry_to_dict(e, player, kit.name))
-            entries.sort(key=lambda d: d["joinedAt"])
-            result: dict = {}
-            for queue in queues:
-                kit = await session.get(Kit, queue.kit_id)
-                if kit is None:
-                    continue
-                result[kit.key] = await _db_qdata(session, queue)
-            return entries, result
-
-    from storage import load_data
-
-    return load_data("queue.json") or [], _json_active_queues()
+    async with db_transaction(session_factory) as session:
+        queues = await QueueRepository().list_active(session)
+        entries: list[dict] = []
+        for queue in queues:
+            kit = await session.get(Kit, queue.kit_id)
+            if kit is None:
+                continue
+            for e in await QueueEntryRepository().list_waiting(
+                session, queue_id=queue.id
+            ):
+                player = await session.get(Player, e.player_id)
+                entries.append(_db_entry_to_dict(e, player, kit.name))
+        entries.sort(key=lambda d: d["joinedAt"])
+        result: dict = {}
+        for queue in queues:
+            kit = await session.get(Kit, queue.kit_id)
+            if kit is None:
+                continue
+            result[kit.key] = await _db_qdata(session, queue)
+        return entries, result
 
 
 async def peek_first_player(
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> Optional[dict]:
     """První čekající hráč napříč aktivními frontami (/pull display)."""
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            stmt = (
-                select(QueueEntry, Queue, Kit)
-                .join(Queue, Queue.id == QueueEntry.queue_id)
-                .join(Kit, Kit.id == QueueEntry.kit_id)
-                .where(
-                    Queue.closed_at.is_(None),
-                    QueueEntry.status == "waiting",
-                )
-                .order_by(QueueEntry.joined_at.asc(), QueueEntry.id.asc())
-                .limit(1)
+    async with db_transaction(session_factory) as session:
+        stmt = (
+            select(QueueEntry, Queue, Kit)
+            .join(Queue, Queue.id == QueueEntry.queue_id)
+            .join(Kit, Kit.id == QueueEntry.kit_id)
+            .where(
+                Queue.closed_at.is_(None),
+                QueueEntry.status == "waiting",
             )
-            row = (
-                await session.execute(stmt)
-            ).first()
-            if row is None:
-                return None
-            entry, _queue, kit = row
-            player = await session.get(Player, entry.player_id)
-            return _db_entry_to_dict(entry, player, kit.name)
-
-    from storage import load_data
-
-    queue = load_data("queue.json") or []
-    return queue[0] if queue else None
+            .order_by(QueueEntry.joined_at.asc(), QueueEntry.id.asc())
+            .limit(1)
+        )
+        row = (
+            await session.execute(stmt)
+        ).first()
+        if row is None:
+            return None
+        entry, _queue, kit = row
+        player = await session.get(Player, entry.player_id)
+        return _db_entry_to_dict(entry, player, kit.name)
 
 
 async def _db_join_queue_tester(
@@ -943,29 +875,14 @@ async def join_queue_tester(
     uid: str,
     ign: str = "",
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[str, Optional[dict]]:
     """Přidá testera k aktivní frontě (joinasqueue). Status ok/closed/duplicate."""
     kit_key = str(kit_key).lower()
     uid = str(uid)
-
-    if session_factory is not None:
-        return await _db_join_queue_tester(
-            session_factory, kit_key=kit_key, uid=uid, ign=ign
-        )
-
-    async def _join(tx):
-        active_queues = tx.get("active_queues.json", {})
-        qdata = active_queues.get(kit_key)
-        if not qdata:
-            return ("closed", None)
-        if uid in qdata.get("testers", []):
-            return ("duplicate", qdata)
-        qdata.setdefault("testers", []).append(uid)
-        tx.set("active_queues.json", active_queues)
-        return ("ok", qdata)
-
-    return await transaction(("active_queues.json",), _join)
+    return await _db_join_queue_tester(
+        session_factory, kit_key=kit_key, uid=uid, ign=ign
+    )
 
 
 async def _db_leave_queue_tester(
@@ -992,32 +909,14 @@ async def leave_queue_tester(
     kit_key: str,
     uid: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[str, Optional[dict]]:
     """Odebere testera z aktivní fronty. Status ok/closed/not_listed."""
     kit_key = str(kit_key).lower()
     uid = str(uid)
-
-    if session_factory is not None:
-        return await _db_leave_queue_tester(
-            session_factory, kit_key=kit_key, uid=uid
-        )
-
-    async def _leave(tx):
-        active_queues = tx.get("active_queues.json", {})
-        qdata = active_queues.get(kit_key)
-        if not qdata:
-            return ("closed", None)
-        testers = qdata.get("testers", [])
-        if uid not in testers:
-            return ("not_listed", qdata)
-        testers.remove(uid)
-        if qdata.get("opener") == uid and testers:
-            qdata["opener"] = testers[0]
-        tx.set("active_queues.json", active_queues)
-        return ("ok", qdata)
-
-    return await transaction(("active_queues.json",), _leave)
+    return await _db_leave_queue_tester(
+        session_factory, kit_key=kit_key, uid=uid
+    )
 
 
 async def _db_register_global_tester(
@@ -1043,28 +942,14 @@ async def register_global_tester(
     uid: str,
     ign: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> bool:
-    """Zaregistruje globálně aktivního testera (joinastester).
+    """Zaregistruje globálně aktivního testera (joinastester). PostgreSQL.
 
-    JSON režim: testers.json append. DB režim: `testers` řádek (graceful
-    no-op při už existujícím — unique PK).
+    `testers` řádek (graceful no-op při už existujícím — unique PK).
     """
     uid = str(uid)
-
-    if session_factory is not None:
-        return await _db_register_global_tester(
-            session_factory, uid=uid, ign=ign
-        )
-
-    from storage import load_data, save_data
-
-    testers = load_data("testers.json")
-    if uid in testers:
-        return True
-    testers.append(uid)
-    save_data("testers.json", testers)
-    return True
+    return await _db_register_global_tester(session_factory, uid=uid, ign=ign)
 
 
 async def _db_removeq(session_factory, *, uid: str) -> Optional[dict]:
@@ -1092,23 +977,11 @@ async def _db_removeq(session_factory, *, uid: str) -> Optional[dict]:
 async def removeq(
     uid: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> Optional[dict]:
     """Vyhození hráče z fronty (/removeq). Vrací záznam hráče nebo None."""
     uid = str(uid)
-
-    if session_factory is not None:
-        return await _db_removeq(session_factory, uid=uid)
-
-    async def _run(tx):
-        queue = tx.get("queue.json")
-        entry = next((p for p in queue if p.get("id") == uid), None)
-        if entry is None:
-            return None
-        tx.set("queue.json", [p for p in queue if p.get("id") != uid])
-        return entry
-
-    return await transaction(("queue.json",), _run)
+    return await _db_removeq(session_factory, uid=uid)
 
 
 async def _db_skip_player(session_factory, *, uid: str) -> dict:
@@ -1134,6 +1007,14 @@ async def _db_skip_player(session_factory, *, uid: str) -> dict:
         was_pulled = bool(pulled)
         in_queue = bool(waiting)
         if pulled:
+            # E4 audit fix: requeue computes MAX(position)+1 — same shared
+            # state as enqueue, so serialize on the queue row before reading
+            # it (otherwise a concurrent join could insert the same position
+            # and the requeued player would silently invert queue order).
+            await session.execute(
+                text("SELECT id FROM queues WHERE id = :qid FOR UPDATE"),
+                {"qid": entry.queue_id},
+            )
             await QueueEntryRepository().transition(
                 session,
                 entry_id=entry.id,
@@ -1165,77 +1046,28 @@ async def _db_skip_player(session_factory, *, uid: str) -> dict:
 async def skip_player(
     uid: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Přeskočení AFK hráče: přesun na konec fronty (+ záznam roomky /skip).
 
     Vrací {channel_id, kit_key, was_pulled, requeued, moved, next}.
     """
     uid = str(uid)
-
-    if session_factory is not None:
-        return await _db_skip_player(session_factory, uid=uid)
-
-    async def _run(tx):
-        pulled = tx.get("pulled_players.json", {})
-        entry = pulled.get(uid)
-        channel_id_raw = None
-        stored_player = None
-        kit_key = ""
-        was_pulled = False
-        if entry is not None:
-            was_pulled = True
-            if isinstance(entry, dict):
-                channel_id_raw = entry.get("channel")
-                stored_player = entry.get("player")
-                if isinstance(stored_player, dict):
-                    kit_key = str(stored_player.get("kit", "")).lower()
-            else:
-                channel_id_raw = entry
-            del pulled[uid]
-            tx.set("pulled_players.json", pulled)
-
-        queue = tx.get("queue.json")
-        new_queue, new_kit_key, moved = move_to_queue_end(queue, stored_player, uid)
-        if not kit_key:
-            kit_key = new_kit_key
-        requeued = len(new_queue) != len(queue)
-        if requeued:
-            tx.set("queue.json", new_queue)
-        next_player = next(
-            (p for p in new_queue if str(p.get("kit", "")).lower() == kit_key), None
-        )
-        return {
-            "channel_id": int(channel_id_raw) if channel_id_raw else None,
-            "kit_key": kit_key,
-            "was_pulled": was_pulled,
-            "requeued": requeued,
-            "moved": moved,
-            "next": next_player,
-        }
-
-    return await transaction(("pulled_players.json", "queue.json"), _run)
+    return await _db_skip_player(session_factory, uid=uid)
 
 
 async def panel_message_id(
     kit_key: str,
     *,
-    session_factory: Optional[async_sessionmaker[AsyncSession]] = None,
+    session_factory: async_sessionmaker[AsyncSession],
 ) -> Optional[str]:
     """ID zprávy panelu kitu (pro update_panel) nebo None."""
     kit_key = str(kit_key).lower()
-
-    if session_factory is not None:
-        async with db_transaction(session_factory) as session:
-            kit_row = await KitRepository().get_by_name(session, kit_key)
-            if kit_row is None:
-                return None
-            queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
-            if queue is None or queue.panel_message_id is None:
-                return None
-            return str(queue.panel_message_id)
-
-    from storage import load_data
-
-    entry = (load_data("queue_messages.json", {}) or {}).get(kit_key)
-    return entry.get("message_id") if isinstance(entry, dict) else entry
+    async with db_transaction(session_factory) as session:
+        kit_row = await KitRepository().get_by_name(session, kit_key)
+        if kit_row is None:
+            return None
+        queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
+        if queue is None or queue.panel_message_id is None:
+            return None
+        return str(queue.panel_message_id)

@@ -8,7 +8,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Kit, KitRole, TierDefinition
+from db.models import Kit, KitRole, KitTesterRoom, TierDefinition
 
 
 class KitRepository:
@@ -168,6 +168,69 @@ class KitRoleRepository:
     ) -> list[KitRole]:
         result = await session.execute(
             select(KitRole).where(KitRole.kit_id == kit_id).order_by(KitRole.tier_id)
+        )
+        return list(result.scalars())
+
+
+class KitTesterRoomRepository:
+    """The authoritative ``kit -> tester channel`` map.
+
+    ``channel_id`` is UNIQUE, so "find the tester room for this kit" has at
+    most one answer and "which kit owns this room" has at most one answer.
+    :meth:`set_room` is an upsert keyed on the kit, which is what makes
+    ``/mktesterroom`` idempotent: running it twice for the same kit replaces
+    the channel rather than failing or creating a second mapping.
+    """
+
+    async def set_room(
+        self,
+        session: AsyncSession,
+        *,
+        kit_id: int,
+        channel_id: int,
+        created_by: Optional[int] = None,
+    ) -> KitTesterRoom:
+        stmt = (
+            pg_insert(KitTesterRoom)
+            .values(kit_id=kit_id, channel_id=int(channel_id), created_by=created_by)
+            .on_conflict_do_update(
+                index_elements=["kit_id"],
+                set_={
+                    "channel_id": int(channel_id),
+                    "created_by": created_by,
+                    "updated_at": func.now(),
+                },
+            )
+            .returning(KitTesterRoom)
+            .execution_options(populate_existing=True)
+        )
+        row = (await session.execute(stmt)).scalar_one()
+        await session.flush()
+        return row
+
+    async def get_for_kit(
+        self, session: AsyncSession, *, kit_id: int
+    ) -> Optional[KitTesterRoom]:
+        return await session.get(KitTesterRoom, kit_id)
+
+    async def get_for_channel(
+        self, session: AsyncSession, *, channel_id: int
+    ) -> Optional[KitTesterRoom]:
+        result = await session.execute(
+            select(KitTesterRoom).where(KitTesterRoom.channel_id == int(channel_id))
+        )
+        return result.scalar_one_or_none()
+
+    async def clear(self, session: AsyncSession, *, kit_id: int) -> bool:
+        result = await session.execute(
+            delete(KitTesterRoom).where(KitTesterRoom.kit_id == kit_id)
+        )
+        await session.flush()
+        return (result.rowcount or 0) > 0
+
+    async def list_all(self, session: AsyncSession) -> list[KitTesterRoom]:
+        result = await session.execute(
+            select(KitTesterRoom).order_by(KitTesterRoom.kit_id)
         )
         return list(result.scalars())
 

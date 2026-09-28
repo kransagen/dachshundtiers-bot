@@ -217,8 +217,19 @@ class SyncCheckTests(unittest.TestCase):
             _member(4, "DaveMC", []),
         ]
         storage.save_data("players.json", _deep(self.players))
-        # kit_roles už nemá JSON úložiště (jen PostgreSQL) – bez DB v tomhle
-        # scénáři (cog.bot není nastaveno) se mapa vrací mockem, ne souborem.
+        # DB zdroje: /sync check čte kanonickou podobu hráčů a role mapu
+        # výhradně z PostgreSQL (_canonical_players/_kit_role_maps_or_empty/
+        # kit_display_map). Kanonická data v testu = same obsah jako players.json
+        # export (player_current_tiers mirror), který čte legacy datacheck
+        # tooling; ostatní analýzy jsou čisté funkce.
+        patch = mock.patch.object(
+            sync_mod,
+            "_canonical_players",
+            new=mock.AsyncMock(return_value=_deep(self.players)),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
         patch = mock.patch.object(
             sync_mod,
             "_kit_role_maps_or_empty",
@@ -229,8 +240,25 @@ class SyncCheckTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
+        patch = mock.patch.object(
+            sync_mod,
+            "kit_display_map",
+            new=mock.AsyncMock(return_value={"randompot": "RandomPot"}),
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        # G0 health report je samostatný embed z db.services.health – v tomhle
+        # scénáři nepřidáváme, počty severit zůstávají z 3-cestné analýzy.
+        patch = mock.patch.object(
+            sync_mod, "_db_health_embed", new=mock.AsyncMock(return_value=[])
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def _run(self, inter, area="all", *, web=(True,)):
         cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())  # DB režim
 
         async def main():
             if web:
@@ -524,18 +552,26 @@ class SyncWebTests(unittest.TestCase):
             _player("AliceMC", {"randompot": "HT3"},
                     history={"randompot": [{"date": "01.01.2026", "tier": "HT3"}]}),
         ]
-        storage.save_data("players.json", _deep(self.canonical))
 
-    def _run(self, inter, mode, *, web=None, push=None):
+    def _run(self, inter, mode, *, web=None, push=None, canonical=None):
+        # Kanonická podoba hráčů jde z PostgreSQL (_canonical_for_export →
+        # export_players) – nikdy ne z players.json.
         cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         fetch_result = (_deep(self.web), "sha", None) if web is None else web
+        canonical_list = _deep(self.canonical) if canonical is None else canonical
 
         async def main():
             fetcher = mock.AsyncMock(return_value=fetch_result)
             pusher = mock.AsyncMock(return_value=push or (True, "✅ push", []))
             self.pusher = pusher
             with mock.patch.object(github_sync, "fetch_players", new=fetcher), \
-                 mock.patch.object(github_sync, "push_players", new=pusher):
+                 mock.patch.object(github_sync, "push_players", new=pusher), \
+                 mock.patch.object(
+                     sync_mod,
+                     "_canonical_for_export",
+                     new=mock.AsyncMock(return_value=canonical_list),
+                 ):
                 await Sync.sync_web.callback(cog, inter, mode)
 
         asyncio.run(main())
@@ -558,6 +594,7 @@ class SyncWebTests(unittest.TestCase):
     def test_confirm_pushes_and_reports_success(self):
         inter = _interaction(user=_admin_member())
         cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         holder = {}
 
         async def main():
@@ -567,6 +604,9 @@ class SyncWebTests(unittest.TestCase):
             ), mock.patch.object(
                 github_sync, "push_players",
                 new=mock.AsyncMock(return_value=(True, "✅ players.json na webu nahrazen", [])),
+            ), mock.patch.object(
+                sync_mod, "_canonical_for_export",
+                new=mock.AsyncMock(return_value=_deep(self.canonical)),
             ):
                 await Sync.sync_web.callback(cog, inter, "apply")
                 view = inter.followup.send.call_args.kwargs["view"]
@@ -583,6 +623,7 @@ class SyncWebTests(unittest.TestCase):
     def test_confirm_push_failure_never_reported_as_success(self):
         inter = _interaction(user=_admin_member())
         cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         holder = {}
 
         async def main():
@@ -595,6 +636,9 @@ class SyncWebTests(unittest.TestCase):
                 new=mock.AsyncMock(
                     return_value=(False, "❌ GITHUB_TOKEN chybí pro zápis", [])
                 ),
+            ), mock.patch.object(
+                sync_mod, "_canonical_for_export",
+                new=mock.AsyncMock(return_value=_deep(self.canonical)),
             ):
                 await Sync.sync_web.callback(cog, inter, "apply")
                 view = inter.followup.send.call_args.kwargs["view"]
@@ -618,38 +662,46 @@ class SyncWebTests(unittest.TestCase):
         self.assertIsNone(kwargs.get("view"))
         self.pusher.assert_not_awaited()
 
-    def test_pg_export_failure_is_labeled_as_legacy_json_fallback(self):
-        """H6: pokud je PostgreSQL nakonfigurovaný, ale export z něj selže,
-        výsledek MUSÍ jasně říct, že šlo o legacy JSON fallback – nesmí se
-        tvářit jako normální PostgreSQL export."""
+    def test_pg_export_failure_sends_nothing(self):
+        """H6 dokončeno: selhání exportu z PostgreSQL NIKDY nespadá na legacy
+        players.json – /sync web neproběhne a na web se nic nepošle."""
         inter = _interaction(user=_admin_member())
         cog = Sync.__new__(Sync)
         cog.bot = SimpleNamespace(db_session_factory=object())
+        pusher = mock.AsyncMock()
 
         async def main():
-            with (
-                mock.patch.object(
-                    sync_mod,
-                    "export_players",
-                    new=mock.AsyncMock(side_effect=RuntimeError("DB down")),
-                ),
-                mock.patch.object(
-                    github_sync,
-                    "fetch_players",
-                    new=mock.AsyncMock(return_value=(_deep(self.web), "sha", None)),
-                ),
+            with mock.patch.object(
+                sync_mod,
+                "_canonical_for_export",
+                new=mock.AsyncMock(side_effect=RuntimeError("DB down")),
+            ), mock.patch.object(
+                github_sync, "push_players", new=pusher,
             ):
-                await Sync.sync_web.callback(cog, inter, "preview")
+                await Sync.sync_web.callback(cog, inter, "apply")
 
         asyncio.run(main())
-        embed, _ = _sent(inter)
-        fields = " ".join(f.name + " " + str(f.value) for f in embed.fields)
-        self.assertIn("LEGACY JSON FALLBACK", fields)
+        msg = inter.followup.send.await_args.args[0]
+        self.assertIn("PostgreSQL nedostupný", msg)
+        self.assertIn("nic jiného než data z DB", msg)
+        pusher.assert_not_awaited()
 
     def test_stale_nothing_pushes(self):
         inter = _interaction(user=_admin_member())
         cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
         holder = {}
+        calls = {"n": 0}
+
+        def canonical_bump(*_args, **_kwargs):
+            # 1. volání = náhled (apply), 2. volání = potvrzení – DB se změnila
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _deep(self.canonical)
+            return _deep(self.canonical) + [
+                _player("CarolMC", {"randompot": "LT1"},
+                        history={"randompot": [{"date": "x", "tier": "LT1"}]}),
+            ]
 
         async def main():
             with mock.patch.object(
@@ -657,16 +709,12 @@ class SyncWebTests(unittest.TestCase):
                 new=mock.AsyncMock(return_value=(_deep(self.web), "sha", None)),
             ), mock.patch.object(
                 github_sync, "push_players", new=mock.AsyncMock()
-            ) as pusher:
+            ) as pusher, mock.patch.object(
+                sync_mod, "_canonical_for_export",
+                new=mock.AsyncMock(side_effect=canonical_bump),
+            ):
                 await Sync.sync_web.callback(cog, inter, "apply")
                 view = inter.followup.send.call_args.kwargs["view"]
-                # kanonická DB se mezitím změnila
-                storage.save_data(
-                    "players.json", _deep(self.canonical) + [
-                        _player("CarolMC", {"randompot": "LT1"},
-                                history={"randompot": [{"date": "x", "tier": "LT1"}]}),
-                    ]
-                )
                 holder["confirm"] = _interaction(user=_admin_member())
                 await view.confirm.callback(holder["confirm"])
                 holder["pusher"] = pusher
@@ -677,9 +725,8 @@ class SyncWebTests(unittest.TestCase):
         self.assertIn("🔄 /sync web – stav se změnil", embed.title)
 
     def test_empty_db_never_pushed(self):
-        storage.save_data("players.json", [])
         inter = _interaction(user=_admin_member())
-        self._run(inter, "apply")
+        self._run(inter, "apply", canonical=[])
         _, kwargs = _sent(inter)
         # žádný view, žádný push – prázdná DB se nikdy neposílá
         self.assertIsNone(kwargs.get("view"))

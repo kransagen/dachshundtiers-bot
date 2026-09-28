@@ -1,18 +1,19 @@
 """Cog s výsledky tier testů a statistikami testerů.
 
-- /result            – zápis výsledku testu (cooldown, players.json, statistiky)
+- /result            – zápis výsledku testu (cooldown, `results`, role)
 - /testerstats       – portfolio jednoho testera
 - /testersstats      – tabulka testerů (tento měsíc / všechny časy)
-- /addtest           – admin: přidání historických testů
+- /addtest           – admin: přidání historických testů (do `tester_credits`)
 - /removetest        – admin: odečtení testů (upraví total i aktuální měsíc, min 0)
-- /removeplayertiers – admin: odebrání všech aktuálních tierů hráče (historie zůstává)
+- /removeplayertiers – tiery v PostgreSQL režimu nelze mazat; píše, jak to udělat
 
-Pozn.: /result NEZapisuje na GitHub automaticky – kanonická players.json se
-na web propaguje výhradně přes /websync (jeden zápis do webu).
+Statistiky testerů se nepočítají do žádného JSONu: odvozují se za běhu z
+tabulky `results` (viz `services.tester_stats`), ruční kredity z `/addtest`
+leží v `tester_credits`. Zápis na GitHub/web je oddělený projekce přes
+`/websync`, nikoli součást `/result`.
 """
 
 import logging
-import time
 
 import discord
 from discord import app_commands
@@ -40,13 +41,10 @@ from services.tester_stats import (
 )
 from services.evals import set_eval
 from services.kit_catalog import add_kit, get_kits
-from services.store import transaction
-from storage import using_postgres
 from services.tickets import HT3_TIER_LADDER, get_ticket
 from utils import (
     has_tester_role,
     kit_autocomplete,
-    month_key,
     now_ms,
     today_cz,
 )
@@ -103,27 +101,12 @@ async def tier_autocomplete(
     return out[:25]
 
 
-async def _log_tester_stat(tester_id: str, kit: str, tier: str, month: str) -> None:
-    """Zaloguje statistiky testera (total, kits, tiers, monthly, hourlyLogs).
-
-    Probíhá transakčně – dvě souběžné interakce si nemůžou navzájem přepsat
-    statistiku (ztráta testu).
-    """
-    async def _run(tx):
-        stats_db = tx.get("testers_stats.json", {})
-        stat = stats_db.setdefault(
-            tester_id,
-            {"total": 0, "lastTested": "", "kits": {}, "tiers": {}, "monthly": {}, "hourlyLogs": []},
-        )
-        stat["total"] = stat.get("total", 0) + 1
-        stat["lastTested"] = today_cz()
-        stat["kits"][kit] = stat["kits"].get(kit, 0) + 1
-        stat["tiers"][tier] = stat["tiers"].get(tier, 0) + 1
-        stat["monthly"][month] = stat["monthly"].get(month, 0) + 1
-        stat["hourlyLogs"].append(time.localtime().tm_hour)
-        tx.set("testers_stats.json", stats_db)
-
-    return await transaction(("testers_stats.json",), _run)
+# Statistiky testera se už tady nepočítají. `/result` zapisuje řádek do
+# `results` (jednou, transakčně, jako součást `record_result`) a
+# `services.tester_stats` je odvozuje za běhu. Dřív to byla JSON agregace
+# nad `testers_stats.json`, která se musela hlídat proti souběžnému
+# přepisování – to je právě ta třída chyby, kterou odvozování z řádků
+# odstraňuje.
 
 
 class Results(commands.Cog):
@@ -152,8 +135,6 @@ class Results(commands.Cog):
         tier="New achieved tier",
         score="Score of the match (e.g. 5-2)",
         outcome="Tester outcome",
-        add_role="Role, kterou hráči přidat (nepovinné)",
-        remove_role="Role, kterou hráči odebrat (nepovinné)",
         notes="Poznámky k testu – uloží se do historie výsledku (nepovinné)",
     )
     @app_commands.choices(
@@ -172,8 +153,6 @@ class Results(commands.Cog):
         tier: str,
         score: str,
         outcome: str,
-        add_role: discord.Role = None,
-        remove_role: discord.Role = None,
         notes: str = None,
     ) -> None:
         if not has_tester_role(interaction.user):
@@ -232,9 +211,9 @@ class Results(commands.Cog):
             return await interaction.followup.send(tier_msg, ephemeral=True)
 
         # 0b) „LT3 + eval" (LT3E) = tier LT3 (stejná role) + eval status.
-        #     Do players.json / webu / role jde „LT3", eval se uloží zvlášť.
+        #     Do webu (export) / role jde „LT3", eval se uloží zvlášť.
         is_eval = tier_up == EVAL_TIER
-        stored_tier = "LT3" if is_eval else tier_up  # players.json + web + role
+        stored_tier = "LT3" if is_eval else tier_up  # web export + role
         display_tier = "LT3 + eval" if is_eval else tier_up  # embed / texty
 
         # 0) Auto-registrace nového kitu (jako /addkit) – aby se hned objevil
@@ -257,11 +236,11 @@ class Results(commands.Cog):
                     pass
 
         # 1) Zápis výsledku – atomicky: validace + idempotence + historie.
-        #    V DB režimu (session_factory) jde o kanonický PostgreSQL zápis
-        #    (Result, promotion_status=discord_pending) – players.json se
-        #    NEpíše a nerozhoduje o current tieru (G0 audit fix / H1
-        #    cutover). Bez PostgreSQL (session_factory=None) zůstává
-        #    legacy JSON chování beze změny. Viz services/results.record_result.
+        #    PostgreSQL je JEDINÝ režim (Result, promotion_status=
+        #    discord_pending) – players.json se NEpíše a nerozhoduje o current
+        #    tieru (G0 audit fix / H1 cutover). Bez session_factory
+        #    record_result odmítne (RuntimeError), žádný JSON fallback.
+        #    Viz services/results.record_result.
         record = await record_result(
             ticket_id=ticket["id"] if ticket is not None else None,
             player_id=target_id,
@@ -292,7 +271,7 @@ class Results(commands.Cog):
                     f"- **Nový tier:** {existing.get('displayTier') or existing.get('newTier')}\n"
                     f"- **Kdy:** {existing.get('date') or '?'}\n"
                     f"- **Tester:** <@{existing.get('evaluatorId', 0)}>\n"
-                    "Historie běží v `data/ht_results.json`.",
+                    "Historie běží v PostgreSQL (`results`, propojené s ticketem).",
                     ephemeral=True,
                 )
             summary = ""
@@ -367,15 +346,15 @@ class Results(commands.Cog):
             except Exception:  # noqa: BLE001
                 log.exception("Nelze obnovit embed ticketu po /result")
 
-        # 2) Odebrání z fronty (atomické v obou režimech – viz services; přes
-        #    session_factory i DB režim jde do transakce, bez něj JSON)
+        # 2) Odebrání z fronty (atomicky v transakci – viz services; bez
+        #    session_factory leave_queue odmítne, žádný JSON fallback)
         removed_from_queue = await leave_queue(target_id, kit_key, session_factory=sf)
         if removed_from_queue and interaction.guild is not None:
             await update_panel(interaction.guild, kit_key, session_factory=sf)
 
         # 3) Odebrání práv z tester roomek – po výsledku hráč nesmí zůstat
-        #    v žádné roomce. Pokrývá pull tlačítko / /queue pull (záznam ve
-        #    pulled_players.json) i přednastavený přístup přes `/mktesterroom
+        #    v žádné roomce. Pokrývá pull tlačítko / /queue pull (záznam
+        #    pulled v DB frontě) i přednastavený přístup přes `/mktesterroom
         #    hrac:` – vždy odstraníme hráčův osobní overwrite ve VŠECH
         #    kanálech serveru.
         await remove_pulled_player(target_id, session_factory=sf)
@@ -433,20 +412,18 @@ class Results(commands.Cog):
                         err,
                     )
 
-        # 4) Statistiky testera (transakčně) – jen JSON režim; v DB režimu se
-        #    statistiky odvozují za běhu z Result (viz services.tester_stats).
+        # 4) Statistiky testera se nepočítají – odvozují se za běhu z tabulky
+        #    `results` (viz services.tester_stats). Kdyby se tady agregoval
+        #    počet, šel by mimo `record_result` a o souběžné /result by se
+        #    ztratil. Datum v patičce embeda drží popisek dne.
         current_date = today_cz()
-        if getattr(self.bot, "db_session_factory", None) is None:
-            await _log_tester_stat(
-                str(interaction.user.id), kit_clean, display_tier, month_key()
-            )
 
-        # 5) record_result (krok 1) už uložil kanonický záznam – v DB režimu
-        #    Result (discord_pending), v legacy JSON režimu players.json.
-        #    previous_tier už je vyřešený, tady jen navazující kroky.
+        # 5) record_result (krok 1) už uložil kanonický záznam do `results`
+        #    (řádek `discord_pending`). previous_tier už je vyřešený, tady jen
+        #    navazující kroky.
 
-        # 5a) „LT3 + eval" → status evalu (data/evals.json). Tier/role zůstávají
-        #     LT3 – hráč ale nově může otevírat HT3+ tickety.
+        # 5a) „LT3 + eval" → eval flag. Tier/role zůstávají LT3 – hráč ale
+        #     nově může otevírat HT3+ tickety.
         eval_note = ""
         if is_eval and await set_eval(
             ign_clean,
@@ -458,29 +435,14 @@ class Results(commands.Cog):
                 "může otevírat HT3+ tickety."
             )
 
-        # 5b) Volitelné role (add_role / remove_role) – jako v originále
-        #     (aplikuje se tiše, nezobrazuje se v embedu výsledku)
-        if add_role is not None or remove_role is not None:
-            member = interaction.guild.get_member(int(target_id))
-            if member is None:
-                try:
-                    member = await interaction.guild.fetch_member(int(target_id))
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    member = None
-            if member is not None:
-                try:
-                    if add_role is not None:
-                        await member.add_roles(add_role)
-                    if remove_role is not None:
-                        await member.remove_roles(remove_role)
-                except (discord.Forbidden, discord.HTTPException) as err:
-                    log.warning(
-                        "Nelze upravit role hráče %s: %s", target_id, err
-                    )
-
-        # 5c) Automatická role kitu+tieru (data/kit_roles.json) – po uložení
-        #     výsledku dostane hráč roli nového tieru, staré tiery kitu se
-        #     odeberou. Poznámka se připojí k potvrzení.
+        # 5b) Automatická role kitu+tieru – po uložení výsledku dostane hráč
+        #     roli nového tieru, staré tiery kitu se odeberou. Volitelné
+        #     `add_role` / `remove_role` byly odebrány: role se odvozují z
+        #     tieru podle business logiky a ruční zásah do rolí nebylo
+        #     auditovatelné (roli mohl tester přidat komukoli, bez stop, a
+        #     nešlo to zjistit později). Změna je tu auditovaná přes
+        #     `commit_confirmed_promotion` v kroku 5d + `audit_logs`.
+        #     Poznámka se připojí k potvrzení.
         role_note = ""
         grant = None
         try:
@@ -584,15 +546,16 @@ class Results(commands.Cog):
             f"Hráč: <@{target_id}> | Tester: <@{interaction.user.id}>"
         )
         saved_msg = (
-            f"✅ Výsledek uložen do players.json pro hráče **{ign_clean}** — "
+            f"✅ Výsledek uložen do PostgreSQL pro hráče **{ign_clean}** — "
             f"mód **{kit_clean}**, tier **{display_tier}**."
             "\n🌐 Web se aktualizuje samostatně přes **/websync** "
-            "(players.json → GitHub) – /result už na GitHub neposílá."
+            "(PostgreSQL → players.json export → GitHub) – /result už na "
+            "GitHub neposílá."
         )
         if new_kit_added:
             saved_msg += (
                 f"\n🎉 Nový kit **{kit_clean}** byl automaticky zaregistrován "
-                "do data/kits.json (autocomplete, HT3+ panel, turnaje)."
+                "do databáze (`kits` – autocomplete, HT3+ panel, turnaje)."
             )
         if eval_note:
             saved_msg += eval_note
@@ -604,7 +567,7 @@ class Results(commands.Cog):
             saved_msg += (
                 "\n🔒 Ticket byl zavřený – hráč má 7denní HT3+ cooldown na "
                 "tento kit. Výsledek je propojený s ticketem "
-                "(`data/ht_results.json`)."
+                "(historie v PostgreSQL)."
             )
 
         if result_channel is not None:
@@ -766,56 +729,27 @@ class Results(commands.Cog):
     )
     @app_commands.describe(ign="Minecraft jméno hráče (IGN)")
     async def removeplayertiers(self, interaction: discord.Interaction, ign: str) -> None:
+        """V PostgreSQL režimu tiery mazat nejde — a nejde to omylem, ne chybou.
+
+        `player_current_tiers` je zrcadlo toho, co potvrzuje Discord, a zrcadlo
+        nemá „clear" operaci: chybějící role je anomálie, kterou má odhalit
+        `/sync check`, ne tichý výmaz. Dřív tu byla JSON větev, která tiery
+        skutečně smazala; kdyby zůstala, `/removeplayertiers` by v produkci
+        tiše neudělal nic a admin by si myslel, že ano. Příkaz proto zůstává
+        (aby se nezmenšilo API), ale už nikdy nemění stav — a říká přesně, jak
+        tier opravdu zrušit.
+        """
         if not has_admin_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
             )
-        if using_postgres():
-            return await interaction.response.send_message(
-                "❌ **V PostgreSQL režimu nelze tiery mazat.**\n"
-                "Current tier je zrcadlo toho, co potvrzuje Discord, a zrcadlo "
-                "nemá clear operaci (viz `MirrorRepository`: chybějící role je "
-                "anomálie, ne smazání). Tier zrušíš tak, že **odstraníš Discord "
-                "tier roli** a pak spustíš `/sync discord` (Discord → "
-                "PostgreSQL). Historie zůstává nedotčená.",
-                ephemeral=True,
-            )
-
-        async def _run(tx):
-            players = tx.get("players.json", [])
-            if not isinstance(players, list):
-                return None
-            for p in players:
-                if not isinstance(p, dict):
-                    continue
-                if str(p.get("username", "") or "").strip().lower() != ign.strip().lower():
-                    continue
-                modes = p.get("modes")
-                if not isinstance(modes, dict) or not modes:
-                    return []
-                cleared = sorted(str(k) for k in modes.keys())
-                p["modes"] = {}
-                tx.set("players.json", players)
-                return cleared
-            return None
-
-        cleared = await transaction(("players.json",), _run)
-        if cleared is None:
-            return await interaction.response.send_message(
-                f"Hráč **{ign}** nebyl v databázi nalezen.", ephemeral=True
-            )
-        if not cleared:
-            return await interaction.response.send_message(
-                f"Hráč **{ign}** nemá žádné aktuální tiery. Záznam a historie "
-                "zůstávají beze změny.",
-                ephemeral=True,
-            )
-
-        await interaction.response.send_message(
-            f"✅ Hráči **{ign}** byly odebrány aktuální tiery: "
-            f"`{', '.join(cleared)}`.\n"
-            "Záznam hráče a historie zůstávají. Web se aktualizuje přes "
-            "**/websync** (players.json → GitHub).",
+        return await interaction.response.send_message(
+            "❌ **V PostgreSQL režimu nelze tiery mazat.**\n"
+            "Current tier je zrcadlo toho, co potvrzuje Discord, a zrcadlo "
+            "nemá clear operaci (viz `MirrorRepository`: chybějící role je "
+            "anomálie, ne smazání). Tier zrušíš tak, že **odstraníš Discord "
+            "tier roli** a pak spustíš `/sync discord` (Discord → "
+            "PostgreSQL). Historie zůstává nedotčená.",
             ephemeral=True,
         )
 

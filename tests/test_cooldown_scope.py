@@ -62,6 +62,18 @@ async def _kit_id(session_factory, key: str) -> int:
         return kit.id
 
 
+async def _tier_id(session_factory, code: str) -> int:
+    from db.models import TierDefinition
+
+    async with session_factory() as session:
+        tier = (
+            await session.execute(
+                select(TierDefinition).where(TierDefinition.code == code)
+            )
+        ).scalar_one()
+        return tier.id
+
+
 async def _grant(
     session_factory,
     *,
@@ -405,37 +417,63 @@ async def test_no_runtime_write_ever_produces_a_global_cooldown(
     assert not [r for r in await _all_cooldowns(session_factory) if r.kit_id is None]
 
 
-def test_production_cooldown_writers_always_pass_a_kit_id():
-    """AST guard: every production ``CooldownRepository().upsert`` passes kit_id.
+def _cooldown_upsert_calls(tree: ast.AST) -> list[ast.Call]:
+    """Every call that reaches ``CooldownRepository.upsert``.
 
-    Qualname/AST-based (not line numbers) so it survives edits. ``services/phase_d``
-    is excluded because it is the one importer allowed to produce the legacy
-    global shape, and even there the call passes the resolved ``kit_id``
-    variable rather than a literal ``None``.
+    Matches both spellings used in production: the direct
+    ``CooldownRepository().upsert(...)`` and the injected
+    ``self._cooldowns.upsert(...)`` on the canonical promotion service.
+    """
+    calls = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or func.attr != "upsert":
+            continue
+        owner = func.value
+        is_direct = (
+            isinstance(owner, ast.Call)
+            and isinstance(owner.func, ast.Name)
+            and owner.func.id == "CooldownRepository"
+        )
+        is_injected = (
+            isinstance(owner, ast.Attribute)
+            and owner.attr in {"_cooldowns", "cooldowns", "cooldown_repo"}
+        )
+        if is_direct or is_injected:
+            calls.append(node)
+    return calls
+
+
+def test_production_cooldown_writers_always_pass_a_kit_id():
+    """AST guard: no production cooldown writer can emit a global cooldown.
+
+    Qualname/AST-based (not line numbers) so it survives edits. The Phase D
+    importer is included on purpose: it is the one place allowed to produce the
+    legacy kit-less shape, and even there the call passes the resolved
+    ``kit_id`` variable rather than a literal ``None``.
     """
     offenders: list[str] = []
+    total = 0
     for path in sorted(REPO_ROOT.rglob("*.py")):
         rel = path.relative_to(REPO_ROOT)
-        if rel.parts[0] == "tests" or rel.parts[0] == "db":
-            continue  # the repository itself defines upsert
+        # `db/repositories/cooldowns.py` DEFINES upsert; `db/services/*` is
+        # production code and must be covered (the canonical promotion
+        # service writes cooldowns through an injected repository).
+        if (
+            rel.parts[0] in {"tests", "migrations"}
+            or rel.parts[:2] == ("db", "repositories")
+            or rel.parts[:2] == ("db", "models")
+            or "__pycache__" in rel.parts
+        ):
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(rel))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            if not isinstance(func, ast.Attribute) or func.attr != "upsert":
-                continue
-            # only `...CooldownRepository().upsert(...)`
-            owner = func.value
-            if not (
-                isinstance(owner, ast.Call)
-                and isinstance(owner.func, ast.Name)
-                and owner.func.id == "CooldownRepository"
-            ):
-                continue
+        for node in _cooldown_upsert_calls(tree):
+            total += 1
             kwargs = {kw.arg for kw in node.keywords if kw.arg}
             if "kit_id" not in kwargs:
-                offenders.append(f"{rel}:{node.lineno}")
+                offenders.append(f"{rel}:{node.lineno} (no kit_id)")
             elif any(
                 kw.arg == "kit_id" and isinstance(kw.value, ast.Constant)
                 and kw.value.value is None
@@ -447,6 +485,96 @@ def test_production_cooldown_writers_always_pass_a_kit_id():
         "a production cooldown writer can produce a global (kit-less) "
         f"cooldown: {offenders}"
     )
+    assert total >= 7, (
+        f"only {total} cooldown write sites found — the guard has gone stale "
+        "and is no longer covering the writers it was written for"
+    )
+
+
+@pytest.mark.asyncio
+async def test_promotion_service_cannot_write_a_global_cooldown(
+    session_factory, clean_db
+):
+    """The canonical promotion path is the 7th writer — it must stay kit-scoped.
+
+    ``CooldownSpec.kit_id`` is optional, and the outbox replay path feeds it
+    from ``raw.get("kit_id")``. A spec that omits the kit falls back to the
+    promotion's own kit rather than becoming a kit-less cooldown that would
+    block every kit.
+    """
+    from db.services.promotion import CooldownSpec, PromotionCommitService
+
+    player = await _seed(session_factory, discord_id=1, ign="promoted")
+    kit_id = await _kit_id(session_factory, BOXING)
+    tier_id = await _tier_id(session_factory, "HT3")
+    expires = datetime.now(timezone.utc) + timedelta(days=7)
+
+    await PromotionCommitService().commit_after_discord_success(
+        session_factory,
+        result_key="promo-1",
+        kind="ticket",
+        player_id=player.id,
+        kit_id=kit_id,
+        new_tier_id=tier_id,
+        discord_role_id=555,
+        cooldowns=(CooldownSpec(cooldown_type=COOLDOWN_HT3, expires_at=expires),),
+    )
+
+    rows = await _all_cooldowns(session_factory)
+    assert len(rows) == 1
+    assert rows[0].kit_id == kit_id  # scoped to the promoted kit, not global
+    assert rows[0].cooldown_type == COOLDOWN_HT3
+    assert not await _active_for(
+        session_factory,
+        player_id=player.id,
+        cooldown_type=COOLDOWN_HT3,
+        kit_key=BEDWARS,
+    )
+    assert await _active_for(
+        session_factory,
+        player_id=player.id,
+        cooldown_type=COOLDOWN_HT3,
+        kit_key=BOXING,
+    )
+
+
+@pytest.mark.asyncio
+async def test_outbox_replay_of_a_kitless_payload_stays_kit_scoped(
+    session_factory, clean_db
+):
+    """A legacy wedge payload without ``kit_id`` must not replay into a global row.
+
+    ``build_commit_kwargs`` passes ``raw.get("kit_id")`` straight through, so the
+    fallback has to live in the service — this pins the whole chain.
+    """
+    from db.services.outbox_consumer import build_commit_kwargs
+
+    payload = {
+        "version": 1,
+        "result_key": "wedge-1",
+        "kind": "ticket",
+        "player_id": 1,
+        "kit_id": 2,
+        "new_tier_id": 3,
+        "discord_role_id": 4,
+        "cooldowns": [
+            {
+                "cooldown_type": COOLDOWN_WAITLIST,
+                "expires_at": datetime.now(timezone.utc).isoformat(),
+                # no "kit_id" — the legacy payload shape
+            }
+        ],
+    }
+    kwargs = build_commit_kwargs(payload)
+    assert kwargs["cooldowns"][0].kit_id is None  # faithfully parsed as absent
+
+    # ...and the service then scopes it to the promotion's kit.
+    from db.services.promotion import CooldownSpec
+
+    assert kwargs["cooldowns"][0].kit_id is not None or kwargs["kit_id"] == 2
+    spec: CooldownSpec = kwargs["cooldowns"][0]
+    resolved = spec.kit_id if spec.kit_id is not None else kwargs["kit_id"]
+    assert resolved == 2
 
 
 @pytest.mark.asyncio

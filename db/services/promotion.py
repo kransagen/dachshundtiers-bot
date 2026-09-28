@@ -177,12 +177,20 @@ class PromotionCommitService:
             )
 
             for spec in cooldowns:
+                # Cooldown identity is (player, kit, type) — a promotion
+                # cooldown for kit X must never become a kit-less GLOBAL
+                # cooldown that blocks every kit. A spec that omits kit_id
+                # falls back to THIS promotion's kit: that is not a guess,
+                # it is the kit the cooldown was granted for. (The outbox
+                # replay path in `db/services/outbox_consumer.py` passes
+                # `raw.get("kit_id")`, so a legacy payload without it lands
+                # here too and is normalized the same way.)
                 await self._cooldowns.upsert(
                     session,
                     player_id=player_id,
                     cooldown_type=spec.cooldown_type,
                     expires_at=spec.expires_at,
-                    kit_id=spec.kit_id,
+                    kit_id=spec.kit_id if spec.kit_id is not None else kit_id,
                     source="promotion",
                 )
 

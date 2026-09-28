@@ -40,6 +40,12 @@ Concurrent same-tier promotions deduplicate (mirror updated, history not duplica
 ## LEGACY JSON
 JSON is legacy/export only. Promotion current-tier determination uses no `players.json`. JSON compat scan reports zero `json_to_discord` and zero `json_to_pg` violations; promotion sites reclassified to `json_legacy_mode_only_pg_gated`. `find_player_tier` reads from players.json only where legitimately read-only/UI or in JSON-only paths (not for promotion decision). Web export remains downstream-only.
 
+**Cooldown identity and the legacy `cooldowns.json` import.** The cooldown identity is `(player_id, kit_id, cooldown_type)`, enforced by `uq_cooldowns_kit`. The source `cooldowns.json` is kit-less (`{discord_id: expires_ms}` — the old bot had one global 4-day cooldown), so the importer originally wrote every row with `kit_id=NULL`, producing a global cooldown that blocked all kits. The kit is however *derivable*: the legacy writer set `cooldowns[playerId] = now` in the same transaction as the result carrying that `now`, its `kit` and its `timestamp`. The importer now indexes `ht_results.json` by `(playerId, timestamp)` and writes a per-kit row when — and only when — exactly one distinct kit matches. Every other outcome (`no_result`, `ambiguous`, `unknown_registry`) keeps the row global (never deleted, never rewritten) and records an open `MigrationImportIssue` with category `cooldown_kit_unattributable` / `cooldown_kit_unknown_in_registry`, surfaced in the `BUCKET_COOLDOWN` operator report. `ht3_cooldowns.json` is already per-kit and stays per-kit. Idempotency is preserved (second run adds no rows and no issues).
+
+**No new global cooldowns.** All seven production cooldown writers pass a resolved `kit_id`, pinned by an AST guard (`tests/test_cooldown_scope.py::test_production_cooldown_writers_always_pass_a_kit_id`) that also fails if the writer set shrinks below seven, so the guard cannot silently go stale. The seventh writer is the canonical promotion service (`db/services/promotion.py`), where `CooldownSpec.kit_id` is optional and the outbox replay path feeds it from `raw.get("kit_id")`; a spec that omits the kit now falls back to the promotion's own kit instead of writing a kit-less row that would block every kit. A global (`kit_id IS NULL`) row can therefore only ever originate from the Phase D importer, and only ever already flagged with an open issue — asserted end-to-end by `test_legacy_global_row_is_always_paired_with_an_open_issue`.
+
+**Check constraint naming.** `db/models/ops.py::Cooldown` declares the constraint as the bare suffix `type`; `db/base.py`'s convention (`"ck": "ck_%(table_name)s_%(constraint_name)s"`) expands it to `ck_cooldowns_type`, exactly what migration `63bdbcfda74a` created, so `alembic revision --autogenerate` sees no phantom diff. Spelling the full name out in the model would produce `ck_cooldowns_ck_cooldowns_type` and cause exactly the DROP+CREATE that was to be avoided. Both halves are pinned by `tests/test_cooldown_scope.py::test_check_constraint_name_matches_the_migration`.
+
 ## DEAD CODE/DUPLICATION
 Gate duplication removed; `dual_write.py` quarantined with no production callers (guard test). Dead/unused paths documented as deferred where appropriate.
 
@@ -47,6 +53,7 @@ Gate duplication removed; `dual_write.py` quarantined with no production callers
 - `tests/test_g0_promotion_cutover.py`: 42 passed
 - `tests/test_topresult.py` + `tests/test_results.py` (DB mirror/canonical): updated, passing
 - `tests/test_roles.py`: 19 passed with realistic Discord doubles
+- `tests/test_cooldown_scope.py`: 14 passed — the cooldown identity regression suite (see LEGACY JSON)
 - Full suite: 1061 passed, 24 warnings across 3 runs (randomized and non-randomized consistent)
 
 ## REMAINING RISKS

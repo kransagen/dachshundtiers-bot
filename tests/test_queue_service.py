@@ -199,6 +199,102 @@ class QueueServiceTests(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_pop_for_kit_with_pulled_atomic(self):
+        """Pop + záznam vytaženého hráče = jedna transakce (F3)."""
+
+        async def main():
+            storage.save_data(
+                "queue.json",
+                [
+                    queue_service.make_entry("2", "b", "B", "AnchorPvP", _ms()),
+                    queue_service.make_entry("3", "c", "C", "AnchorPvP", _ms()),
+                ],
+            )
+            first = await queue_service.pop_for_kit_with_pulled("anchorpvp", 123456)
+            self.assertEqual(first["id"], "2")
+            # vytažený hráč je zaznamenaný, ne ve frontě (a naopak)
+            queue = storage.load_data("queue.json")
+            self.assertEqual([p["id"] for p in queue], ["3"])
+            pulled = storage.load_data("pulled_players.json", {})
+            self.assertEqual(pulled["2"]["channel"], "123456")
+            self.assertEqual(pulled["2"]["player"]["ign"], "B")
+            self.assertNotIn("3", pulled)
+
+            second = await queue_service.pop_for_kit_with_pulled("anchorpvp", 123456)
+            self.assertEqual(second["id"], "3")
+            self.assertEqual(storage.load_data("queue.json"), [])
+            self.assertEqual(len(storage.load_data("pulled_players.json", {})), 2)
+
+            self.assertIsNone(
+                await queue_service.pop_for_kit_with_pulled("anchorpvp", 123456)
+            )
+
+        asyncio.run(main())
+
+    def test_remove_by_player_id_with_pulled_atomic(self):
+        async def main():
+            storage.save_data(
+                "queue.json",
+                [
+                    queue_service.make_entry("1", "a", "A", "AnchorPvP", _ms()),
+                    queue_service.make_entry("2", "b", "B", "MolePVP", _ms()),
+                ],
+            )
+            removed = await queue_service.remove_by_player_id_with_pulled("1", 888)
+            self.assertEqual(removed["id"], "1")
+            pulled = storage.load_data("pulled_players.json", {})
+            self.assertEqual(pulled["1"]["channel"], "888")
+            queue = storage.load_data("queue.json")
+            self.assertEqual([p["id"] for p in queue], ["2"])
+
+            self.assertIsNone(
+                await queue_service.remove_by_player_id_with_pulled("1", 888)
+            )
+
+        asyncio.run(main())
+
+    def test_concurrent_pulls_with_pulled_no_double_record(self):
+        """Souběžný pull dvou testerů → každý hráč právě jeden záznam."""
+
+        async def main():
+            storage.save_data(
+                "queue.json",
+                [
+                    queue_service.make_entry("1", "a", "A", "AnchorPvP", _ms()),
+                    queue_service.make_entry("2", "b", "B", "AnchorPvP", _ms()),
+                ],
+            )
+            results = await asyncio.gather(
+                queue_service.pop_for_kit_with_pulled("anchorpvp", 111),
+                queue_service.pop_for_kit_with_pulled("anchorpvp", 222),
+            )
+            self.assertEqual(sorted(r["id"] for r in results), ["1", "2"])
+            self.assertEqual(storage.load_data("queue.json"), [])
+            pulled = storage.load_data("pulled_players.json", {})
+            self.assertEqual(sorted(pulled.keys()), ["1", "2"])
+
+        asyncio.run(main())
+
+    def test_pull_with_corrupted_pulled_db_keeps_player_in_queue(self):
+        """Persistenční selhání (poškozený pulled_players.json) → transakce se
+        přeruší a hráč ZŮSTÁVÁ ve frontě – nikdy se neztratí (F3)."""
+
+        async def main():
+            storage.save_data(
+                "queue.json",
+                [queue_service.make_entry("1", "a", "A", "AnchorPvP", _ms())],
+            )
+            with open(
+                storage.data_path("pulled_players.json"), "w", encoding="utf-8"
+            ) as f:
+                f.write("{broken")
+            with self.assertRaises(storage.DataCorruptionError):
+                await queue_service.pop_for_kit_with_pulled("anchorpvp", 123)
+            queue = storage.load_data("queue.json")
+            self.assertEqual([p["id"] for p in queue], ["1"])
+
+        asyncio.run(main())
+
 
 class CooldownRemainingTests(unittest.TestCase):
     """cooldowns.json ukládá čas POSLEDNÍHO testu (ne expiry).

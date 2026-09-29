@@ -16,15 +16,15 @@ from services.permissions import get_tester_roles
 from services.queue_service import (
     join_queue,
     leave_queue,
-    pop_for_kit,
-    remove_by_player_id,
-    save_pulled_player,
+    pop_for_kit_with_pulled,
+    remove_by_player_id_with_pulled,
 )
 from services.tickets import (
     HT3_TIER_LADDER,
     claim_ticket,
     close_ticket,
     create_ticket,
+    delete_ticket,
     effective_ticket_tier,
     find_open_ticket,
     find_player_tier,
@@ -241,19 +241,13 @@ class QueueView(SafeView):
             return
 
         channel_id = int(interaction.data["values"][0])
-
-        # Atomický pull: odebere se PRVNÍ hráč kitu. Když ho mezitím někdo
-        # jiný vyřadil (odešel / pullul jiný tester / /result), řekne se to
-        # narovinu a nikdo není vytažený dvakrát.
-        player = await pop_for_kit(kit_key)
-        if player is None:
-            return await interaction.response.send_message(
-                "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
-            )
-
         active_queues = load_data("active_queues.json", {})
         kit_name = active_queues.get(kit_key, {}).get("name", self.kit)
-        await grant_pull_access(interaction, player, channel_id, kit_name)
+        # Vytažení (pop + záznam vytaženého hráče) je atomické a řeší se až
+        # po vyřešení roomky uvnitř grant_pull_access – hráč se nikdy neztratí.
+        await grant_pull_access(
+            interaction, channel_id, kit_name, kit_key=kit_key
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -261,15 +255,30 @@ class QueueView(SafeView):
 # ---------------------------------------------------------------------------
 async def grant_pull_access(
     interaction: discord.Interaction,
-    player: dict,
     channel_id: int,
     kit_name: str,
+    *,
+    kit_key: str | None = None,
+    player_id: str | None = None,
 ) -> None:
-    """Udělí hráči přístup do roomky, pošle uvítací zprávu a zaloguje pulled player.
+    """Vytažení hráče do roomky bez ztráty při selhání Discord vrstvy.
 
-    Pokud se práva udělit nepodaří (např. hráč není na serveru), hláška to řekne
-    narovinu, ale vytažení z fronty tím není ztraceno.
+    Pořadí je kritické:
+      1. Discord READ – roomka se vyřeší PŘED zásahem do DB; neexistuje-li,
+         hráč zůstává ve frontě (žádný ztracený pull).
+      2. DB transakce – atomický pop + záznam do pulled_players.json (hráč je
+         buď ve frontě, NEBO zaznamenaný jako vytažený – nikdy „vytažený a
+         ztracený", když dál selže práva/zpráva/panel). Žádné zámky se
+         nedrží přes Discord API volání – transakce hned končí.
+      3. Discord WRITE – práva + uvítací zpráva + panel (po konzistentní DB).
+
+    ``kit_key`` (pull tlačítko) → vytáhne prvního hráče kitu;
+    ``player_id`` (/queue pull) → odebere konkrétního hráče. Právě jedno
+    musí být zadáno.
     """
+    if (kit_key is None) == (player_id is None):
+        raise ValueError("Musí být zadán právě jeden z kit_key / player_id.")
+
     guild = interaction.guild
     channel = guild.get_channel(channel_id)
     if channel is None:
@@ -280,7 +289,18 @@ async def grant_pull_access(
 
     if channel is None:
         return await interaction.response.send_message(
-            "❌ Roomka se nepodařila najít. Zkus to znovu.", ephemeral=True
+            "❌ Roomka se nepodařila najít. Hráč zůstává ve frontě – zkus to znovu.",
+            ephemeral=True,
+        )
+
+    if kit_key is not None:
+        player = await pop_for_kit_with_pulled(kit_key, channel_id)
+    else:
+        assert player_id is not None
+        player = await remove_by_player_id_with_pulled(player_id, channel_id)
+    if player is None:
+        return await interaction.response.send_message(
+            "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
         )
 
     member = guild.get_member(int(player["id"]))
@@ -304,10 +324,6 @@ async def grant_pull_access(
                 player["id"],
                 err,
             )
-
-    # Záznam vytaženého hráče (kvůli odebrání práv po /result a kvůli /skip) –
-    # nový formát uloží i info o hráči (kit/ign), aby šel vrátit na konec fronty.
-    await save_pulled_player(player, channel_id)
 
     if isinstance(channel, discord.TextChannel):
         try:
@@ -354,21 +370,14 @@ class PullChannelSelectView(SafeView):
         if not interaction.data.get("values"):
             return
 
-        # Hráče z fronty vyřadíme až teď, po výběru roomky (jako u tlačítka –
-        # kdyby tester roomku nevybral, hráč zůstane ve frontě). Odebrání je
-        # atomické: když hráče mezitím vyřadil někdo jiný (pull/leave/result),
-        # přístup se znovu neuděluje (žádný dvojitý pull).
-        removed = await remove_by_player_id(self.player["id"])
-        if not removed:
-            return await interaction.response.send_message(
-                "❌ Mezitím už z fronty někdo odešel.", ephemeral=True
-            )
-
+        # Hráč se z fronty odebere až po výběru roomky (jako u tlačítka –
+        # kdyby tester roomku nevybral, hráč zůstane ve frontě). Odebrání +
+        # záznam vytaženého je atomické uvnitř grant_pull_access.
         await grant_pull_access(
             interaction,
-            self.player,
             int(interaction.data["values"][0]),
             self.kit_name,
+            player_id=str(self.player["id"]),
         )
 
 
@@ -584,19 +593,31 @@ class HT3Modal(SafeModal):
             overwrites=_apply_ticket_overwrites(guild, owner_member=owner_member),
         )
 
-        ticket = None
-        result = await create_ticket(
-            channel_id=channel.id,
-            owner_id=str(interaction.user.id),
-            owner_name=interaction.user.display_name or interaction.user.name,
-            ign=ign,
-            kit=kit,
-            target_tier=target_tier,
-            current_tier=current_tier,
-            eval_ok=eval_ok,
-            category_id=category_id,
-            now=int(time.time() * 1000),
-        )
+        # Zápis ticketu do DB proběhne hned po vytvoření kanálu. Selže-li
+        # (poškozený JSON / výpadek DB), kanál by zůstal sirotek bez záznamu –
+        # smaže se a chyba nechá projít do SafeModal.on_error.
+        try:
+            result = await create_ticket(
+                channel_id=channel.id,
+                owner_id=str(interaction.user.id),
+                owner_name=interaction.user.display_name or interaction.user.name,
+                ign=ign,
+                kit=kit,
+                target_tier=target_tier,
+                current_tier=current_tier,
+                eval_ok=eval_ok,
+                category_id=category_id,
+                cooldown_ms=HT3_COOLDOWN_MS,
+                now=int(time.time() * 1000),
+            )
+        except Exception:
+            log.exception("Vytvoření ticketu selhalo po vytvoření kanálu %s", channel.id)
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            raise
+
         if result["result"] == "duplicate":
             # Závod: ticket pro stejný kit mezitím vznikl jinde – tenhle kanál
             # je prázdný, smažeme ho a pošleme odkaz na existující ticket.
@@ -610,13 +631,46 @@ class HT3Modal(SafeModal):
                 f"<#{existing_dup.get('id')}>. Nejprve ho zavři.",
                 ephemeral=True,
             )
+
+        if result["result"] == "cooldown":
+            # RACE: hráč mezitím ticket zavřel (close) – 7denní HT3+ cooldown
+            # teď běží a kanál by zůstal prázdný. Smaže se a ukáže zbývající čas.
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            remaining = int(result.get("remaining_ms") or 0)
+            days = remaining // (24 * 60 * 60 * 1000)
+            hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
+            return await interaction.followup.send(
+                f"❌ Na kit **{kit}** máš stále HT3+ cooldown! Zbývá: **{days}d {hours}h**. "
+                "Ticket se nevytvořil.",
+                ephemeral=True,
+            )
+
         ticket = result["ticket"]
 
         embed = ticket_embed(ticket)
         ticket_view = HTTicketView()
-        message = await channel.send(
-            content=f"<@{interaction.user.id}>", embed=embed, view=ticket_view
-        )
+        try:
+            message = await channel.send(
+                content=f"<@{interaction.user.id}>", embed=embed, view=ticket_view
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            # Duch: ticket by v DB zůstal, ale bez ovládací zprávy (close/reopen)
+            # by byl neovladatelný. Kompenzační rollback – smaže se kanál i
+            # záznam ticketu, hráč to zkusí znovu.
+            log.exception("Nelze poslat úvodní zprávu ticketu %s", channel.id)
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            await delete_ticket(channel.id)
+            return await interaction.followup.send(
+                "❌ Ticket se nepodařilo připravit (uvítací zprávu nešlo odeslat) – "
+                "kanál byl smazán. Zkus to znovu.",
+                ephemeral=True,
+            )
 
         # Registrace persistentní view – tlačítka ticketu přežijí restart
         # (interaction.client = bot; u nové registrace i po restartu).
@@ -625,16 +679,24 @@ class HT3Modal(SafeModal):
         except (ValueError, discord.ClientException) as err:
             log.warning("Nelze zaregistrovat view ticketu %s: %s", channel.id, err)
 
-        # Do záznamu doplníme ID panel zprávy (restart-safe readd view)
-        await set_panel_message(channel.id, str(message.id))
+        # Do záznamu doplníme ID panel zprávy (restart-safe readd view).
+        # Selhání tady/na logu už ticket nezhorší (embed + view + tlačítka
+        # fungují) – zaloguje se a pokračuje se.
+        try:
+            await set_panel_message(channel.id, str(message.id))
+        except Exception:
+            log.exception("Nelze doplnit panelMessageId ticketu %s", channel.id)
 
-        await log_ticket_event(
-            channel.id,
-            "created",
-            str(interaction.user.id),
-            interaction.user.display_name or interaction.user.name,
-            details=f"Ticket {target_tier} / {kit} (IGN {ign})",
-        )
+        try:
+            await log_ticket_event(
+                channel.id,
+                "created",
+                str(interaction.user.id),
+                interaction.user.display_name or interaction.user.name,
+                details=f"Ticket {target_tier} / {kit} (IGN {ign})",
+            )
+        except Exception:
+            log.exception("Nelze zalogovat vytvoření ticketu %s", channel.id)
 
         note = ""
         if current_tier and limit_tier and target_tier != limit_tier:

@@ -42,7 +42,6 @@ from utils import (
     kit_autocomplete,
     month_key,
     now_ms,
-    set_eval,
     today_cz,
 )
 
@@ -410,10 +409,10 @@ class Results(commands.Cog):
         # 5) Kanonická players.json už aktualizoval record_result (krok 1)
         #    včetně previous_tier – tady už jen navazující kroky.
 
-        # 5a) „LT3 + eval" → status evalu (data/evals.json). Tier/role zůstávají
-        #     LT3 – hráč ale nově může otevírat HT3+ tickety.
+        # 5a) „LT3 + eval" → status evalu (data/evals.json) zapíše už
+        #     record_result v téže transakci jako tier a historie.
         eval_note = ""
-        if is_eval and set_eval(ign_clean, kit_clean):
+        if record.get("eval_applied"):
             eval_note = (
                 f"\n🎖️ **{ign_clean}** dostal **LT3 + eval** pro **{kit_clean}** – "
                 "může otevírat HT3+ tickety."

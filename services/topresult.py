@@ -38,6 +38,7 @@ Klíčové vlastnosti:
 import logging
 import re
 import time
+from uuid import uuid4
 
 from services.player_identity import PlayerIdentityConflict
 from services.results import (
@@ -469,7 +470,9 @@ async def record_ht_fight(
             )
             if dup is not None:
                 return {"result": "duplicate", "existing": dup}
-            result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
+            # UUID (ne timestamp): dva volné HT Fighty ve stejnou ms by měly
+            # stejný klíč a druhý by přepsal první (dedup výše je oddělený).
+            result_id = f"{HT_FIGHT_RESULT_PREFIX}{uuid4().hex}"
 
         players = tx.get("players.json", [])
         current = find_player_tier_in(players, ign, kit, discord_id=player_id)

@@ -240,12 +240,19 @@ async def create_ticket(
     category_id: int,
     panel_message_id=None,
     ticket_type: str = TICKET_TYPE_EVAL,
+    cooldown_ms: int = 0,
     now: int,
 ) -> dict:
     """Transakčně vytvoří ticket (prevence duplicit uvnitř kritického úseku).
 
     Vrací ``{"result": "created", "ticket": {...}}``, nebo
     ``{"result": "duplicate", "ticket": {existující otevřený ticket}}``.
+    ``cooldown_ms`` > 0 – pokud má vlastník na daný kit stále aktivní HT3+
+    cooldown (data/ht3_cooldowns.json), ticket se NEVYTVOŘÍ a vrátí
+    ``{"result": "cooldown", "remaining_ms", "kit", "owner_id"}``. Kontrola
+    běží UVNITŘ transakce, takže souběžný ``close_ticket`` (který cooldown
+    nastavuje) nemůže vytvoření obejít. Výchozí 0 zachovává chování bez
+    cooldown kontroly.
     """
     owner_id = str(owner_id)
     kit_key = str(kit).strip().lower()
@@ -267,6 +274,19 @@ async def create_ticket(
         if existing is not None:
             return {"result": "duplicate", "ticket": existing}
 
+        if cooldown_ms > 0:
+            cooldowns = tx.get(HT3_COOLDOWNS_FILE, {})
+            remaining = _cooldown_remaining_ms(
+                cooldowns, owner_id, str(kit), now
+            )
+            if remaining is not None:
+                return {
+                    "result": "cooldown",
+                    "remaining_ms": remaining,
+                    "kit": kit,
+                    "owner_id": owner_id,
+                }
+
         ticket = make_ticket(
             channel_id=channel_id,
             owner_id=owner_id,
@@ -285,7 +305,12 @@ async def create_ticket(
         tx.set(HT_TICKETS_FILE, tickets)
         return {"result": "created", "ticket": ticket}
 
-    return await store.transaction((HT_TICKETS_FILE,), _run)
+    files = (
+        (HT_TICKETS_FILE, HT3_COOLDOWNS_FILE)
+        if cooldown_ms > 0
+        else (HT_TICKETS_FILE,)
+    )
+    return await store.transaction(files, _run)
 
 
 async def claim_ticket(channel_id, actor_id: str, actor_name: str) -> dict:
@@ -553,6 +578,26 @@ async def set_panel_message(channel_id, message_id) -> None:
         rec["panelMessageId"] = str(message_id)
         tx.set(HT_TICKETS_FILE, tickets)
         return rec
+
+    return await store.transaction((HT_TICKETS_FILE,), _run)
+
+
+async def delete_ticket(channel_id) -> bool:
+    """Smaže záznam ticketu z ht_tickets.json (kompenzační rollback).
+
+    Vrací True, když záznam existoval a byl smazán. Používá se při selhání
+    Discord vrstvy po vytvoření kanálu (kanál se smaže a záznam ticketu
+    nesmí zůstat jako „duch“ v DB).
+    """
+    channel_id = str(channel_id)
+
+    async def _run(tx):
+        tickets = tx.get(HT_TICKETS_FILE, {})
+        if channel_id not in tickets:
+            return False
+        del tickets[channel_id]
+        tx.set(HT_TICKETS_FILE, tickets)
+        return True
 
     return await store.transaction((HT_TICKETS_FILE,), _run)
 

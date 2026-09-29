@@ -153,6 +153,76 @@ async def remove_by_player_id(player_id: str) -> bool:
     return await transaction(("queue.json",), _run)
 
 
+def _pulled_entry(player: dict, channel_id) -> dict:
+    """Záznam vytaženého hráče (stejný tvar pro pulled_players.json)."""
+    return {
+        "channel": str(channel_id),
+        "player": {
+            "id": str(player.get("id", "")),
+            "username": player.get("username", ""),
+            "ign": player.get("ign", ""),
+            "kit": str(player.get("kit", "")),
+            "joinedAt": player.get("joinedAt", 0),
+        },
+    }
+
+
+async def pop_for_kit_with_pulled(kit_key: str, channel_id: int):
+    """Atomicky vyjme PRVNÍHO hráče kitu z fronty A zapíše ho do
+    ``pulled_players.json`` (JEDNA transakce).
+
+    Hráč je v každém okamžiku buď ve frontě (pop ještě neproběhl), nebo
+    zaznamenaný jako vytažený – nikdy „vytažený a ztracený", když Discord
+    volání (práva/zpráva/panel) selžou; /skip ho umí vrátit do fronty.
+    Vrací záznam hráče, nebo ``None``, když fronta kitu už nikoho nemá.
+    """
+    kit_key = str(kit_key).lower()
+
+    async def _run(tx):
+        queue = tx.get("queue.json")
+        index = next(
+            (
+                i
+                for i, p in enumerate(queue)
+                if str(p.get("kit", "")).lower() == kit_key
+            ),
+            None,
+        )
+        if index is None:
+            return None
+        player = queue.pop(index)
+        pulled = tx.get("pulled_players.json", {})
+        pulled[str(player.get("id", ""))] = _pulled_entry(player, channel_id)
+        tx.set("queue.json", queue)
+        tx.set("pulled_players.json", pulled)
+        return player
+
+    return await transaction(("queue.json", "pulled_players.json"), _run)
+
+
+async def remove_by_player_id_with_pulled(player_id: str, channel_id: int):
+    """Atomicky vyjme hráče z fronty podle Discord ID A zapíše ho do
+    ``pulled_players.json`` (JEDNA transakce) – viz ``pop_for_kit_with_pulled``.
+
+    Vrací záznam hráče, nebo ``None``, když už ve frontě nebyl.
+    """
+    uid = str(player_id)
+
+    async def _run(tx):
+        queue = tx.get("queue.json")
+        entry = next((p for p in queue if p.get("id") == uid), None)
+        if entry is None:
+            return None
+        queue.remove(entry)
+        pulled = tx.get("pulled_players.json", {})
+        pulled[uid] = _pulled_entry(entry, channel_id)
+        tx.set("queue.json", queue)
+        tx.set("pulled_players.json", pulled)
+        return entry
+
+    return await transaction(("queue.json", "pulled_players.json"), _run)
+
+
 async def save_pulled_player(player: dict, channel_id: int) -> None:
     """Zapíše/aktualizuje záznam vytaženého hráče do ``pulled_players.json``.
 
@@ -162,16 +232,7 @@ async def save_pulled_player(player: dict, channel_id: int) -> None:
 
     async def _run(tx):
         pulled = tx.get("pulled_players.json", {})
-        pulled[str(player.get("id", ""))] = {
-            "channel": str(channel_id),
-            "player": {
-                "id": str(player.get("id", "")),
-                "username": player.get("username", ""),
-                "ign": player.get("ign", ""),
-                "kit": str(player.get("kit", "")),
-                "joinedAt": player.get("joinedAt", 0),
-            },
-        }
+        pulled[str(player.get("id", ""))] = _pulled_entry(player, channel_id)
         tx.set("pulled_players.json", pulled)
 
     return await transaction(("pulled_players.json",), _run)

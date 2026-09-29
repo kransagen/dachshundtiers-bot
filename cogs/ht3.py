@@ -23,7 +23,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import HT3_PANEL_CHANNEL_ID, PLAYER_COOLDOWN_MS
-from services.queue_service import cooldown_remaining
+from services.queue_service import cooldown_remaining, save_pulled_player
 from services.tickets import (
     add_member,
     claim_ticket,
@@ -190,19 +190,20 @@ class HT3(commands.Cog):
                 ephemeral=True,
             )
 
-        # Záznam, aby /result hráči práva po testu odebral i v tomhle kanálu
-        pulled = load_data("pulled_players.json", {})
-        pulled[str(hrac.id)] = {
-            "channel": str(channel.id),
-            "player": {
+        # Záznam, aby /result hráči práva po testu odebral i v tomhle kanálu.
+        # Transakční zápis místo celého souboru: souběžný pull by jinak svůj
+        # záznam o hráči přepsal tímto čtením+zápisem a hráč by zůstal
+        # vytažený a nedohledatelný.
+        await save_pulled_player(
+            {
                 "id": str(hrac.id),
                 "username": hrac.display_name,
                 "ign": hrac.display_name,
                 "kit": "",
                 "joinedAt": 0,
             },
-        }
-        save_data("pulled_players.json", pulled)
+            channel.id,
+        )
 
         await interaction.response.send_message(
             f"✅ Hráč **{hrac.display_name}** (<@{hrac.id}>) byl přidán do "

@@ -29,3 +29,40 @@ jobs:
 
       - name: Tests (unittest)
         run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  postgres:
+    name: PostgreSQL backend
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: bot
+          POSTGRES_PASSWORD: bot
+          POSTGRES_DB: dachshundtiers
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://bot:bot@127.0.0.1:5432/dachshundtiers
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Spouští se VELMI OMEZENÚ: ostatní testy přepisují storage.DATA_DIR na temp
+      # adresář, takže by nad PostgreSQL (kde DATA_DIR nehraje roli) nemohly
+      # izolovat data a selhaly by bezvýznamně. Job navíc běží jen s modulem,
+      # který je na PostgreSQL psaný.
+      - name: Tests (real PostgreSQL backend)
+        run: python -m unittest tests.test_store_postgres -v

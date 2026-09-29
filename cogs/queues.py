@@ -26,6 +26,15 @@ from views import PullChannelSelectView, QueueView, TesterRoomView
 log = logging.getLogger("dachshundtiers")
 
 
+def _pulled_signature(entry) -> str:
+    """Odkaz na záznam vytažení pro revalidaci mezi fázemi ``/skip``.
+
+    Cokoliv jiného, než co /skip přečetl před Discordem (jiný pull, /add,
+    /result), změní obsah – a pak se nesmí přepsat cizí záznam.
+    """
+    return "-" if entry is None else repr(entry)
+
+
 def _move_to_queue_end(queue: list, stored_player, player_id: str):
     """Přesune hráče na konec fronty (ostatní jdou před něj).
 
@@ -605,39 +614,56 @@ class Queues(commands.Cog):
         was_pulled = False
         access_revoked = False
         next_player = None
+        files = ("pulled_players.json", "queue.json")
 
-        # 1) Vše atomicky: odebrání práv z roomky + smazání záznamu
-        #    (pulled_players.json) + přesun hráče na konec fronty. Dvě souběžné
-        #    interakce si navzájem nemůžou ztratit zápis.
+        # 1) Čtení stavu pod zámkem – bez zápisu a bez Discord API. Získáme si
+        #    otisk záznamu, podle kterého ve 3) ověříme, že se mezitím nezměnil.
+        async def _read_tx(tx):
+            entry = tx.get("pulled_players.json", {}).get(player_id)
+            if isinstance(entry, dict):
+                player = entry.get("player")
+                return (
+                    entry,
+                    player if isinstance(player, dict) else None,
+                    str(entry.get("channel") or ""),
+                )
+            return entry, None, (str(entry) if entry is not None else "")
+
+        pulled_before, stored_player, channel_id_raw = await transaction(files, _read_tx)
+        was_pulled = pulled_before is not None
+        signature = _pulled_signature(pulled_before)
+        if stored_player is not None:
+            kit_key = str(stored_player.get("kit", "")).lower()
+
+        # 2) Discord MIMO zámků a MIMO transakce – načtení roomky i odebrání
+        #    přístupu jsou síťové awaity. Uvnitř transakce by držely zámky
+        #    pulled_players.json/queue.json (v Postgres i DB transakci) po celou
+        #    dobu síťové latence a blokovaly ostatní frontové operace.
+        if channel_id_raw:
+            channel = interaction.guild.get_channel(int(channel_id_raw))
+            if channel is None:
+                try:
+                    channel = await interaction.guild.fetch_channel(int(channel_id_raw))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    channel = None
+            if channel is not None:
+                try:
+                    await channel.set_permissions(hrac, overwrite=None)
+                    access_revoked = True
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
+        # 3) Zápis pod zámkem, ale až po revalidaci otisku. Když se záznam
+        #    mezitím změnil (hráč dostal /result, byl znovu vytažen, nebo byl
+        #    přepsán přes /add), nesmíme smazat cizí zápis ani vrátit hráče,
+        #    kterého už někdo zpracoval, do fronty – tester to zopakuje.
         async def _skip_tx(tx):
-            nonlocal kit_key, stored_player, was_pulled, access_revoked, next_player
+            nonlocal kit_key, next_player
 
             pulled = tx.get("pulled_players.json", {})
-            entry = pulled.get(player_id)
-            channel_id_raw = None
-            if entry is not None:
-                was_pulled = True
-                if isinstance(entry, dict):
-                    channel_id_raw = entry.get("channel")
-                    stored_player = entry.get("player")
-                    if isinstance(stored_player, dict):
-                        kit_key = str(stored_player.get("kit", "")).lower()
-                else:
-                    # starší formát záznamu (string = channel id)
-                    channel_id_raw = entry
-                if channel_id_raw:
-                    channel = interaction.guild.get_channel(int(channel_id_raw))
-                    if channel is None:
-                        try:
-                            channel = await interaction.guild.fetch_channel(int(channel_id_raw))
-                        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                            channel = None
-                    if channel is not None:
-                        try:
-                            await channel.set_permissions(hrac, overwrite=None)
-                            access_revoked = True
-                        except (discord.Forbidden, discord.HTTPException):
-                            pass
+            if _pulled_signature(pulled.get(player_id)) != signature:
+                return None
+            if pulled_before is not None:
                 del pulled[player_id]
                 tx.set("pulled_players.json", pulled)
 
@@ -653,11 +679,16 @@ class Queues(commands.Cog):
             )
             return requeued, moved
 
-        requeued, moved = await transaction(
-            ("pulled_players.json", "queue.json"), _skip_tx
-        )
+        outcome = await transaction(files, _skip_tx)
+        if outcome is None:
+            return await interaction.response.send_message(
+                "⚠️ Stav hráče se mezitím změnil (už byl zpracovaný nebo "
+                "znovu vytažený) – nic jsem nezměnil. Zkus to prosím znovu.",
+                ephemeral=True,
+            )
+        requeued, moved = outcome
 
-        # 1b) Voice: skipnutý hráč nesmí zůstat připojený ve voice roomce
+        # 4) Voice: skipnutý hráč nesmí zůstat připojený ve voice roomce
         #     (odebrání práv ho z voice kanálu samo neodpojí).
         try:
             vs = hrac.voice
@@ -682,7 +713,7 @@ class Queues(commands.Cog):
                 ephemeral=True,
             )
 
-        # 3) Kdo bude další na řadě?
+        # 5) Kdo bude další na řadě?
         parts = [f"⏭️ **{hrac.display_name}** byl přeskočen (AFK)."]
         if access_revoked:
             parts.append("• Přístup do roomky mu byl odebrán.")

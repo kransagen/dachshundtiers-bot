@@ -664,6 +664,26 @@ class RecordHTFightPromotionTests(unittest.TestCase):
             self.assertEqual(data["announcement"], "pending")
         asyncio.run(main())
 
+    def test_two_free_results_same_now_unique_ids(self):
+        """F9 regression: dva volné fighty ve stejnou ms → různé id."""
+
+        async def main():
+            first = await self._record()
+            self.assertEqual(first["result"], "created")
+            self.assertTrue(first["record"]["id"].startswith("htfight-"))
+            # druhý VOLNÝ fight ve STEJNOU ms, ale JINÝ zápas (jiné skóre +
+            # outcome → jiný dedup fingerprint) → jiný id. Timestamp-klíč by
+            # kolidoval a přepsal by první záznam.
+            second = await self._record(
+                score="4-2", outcome="Lost", tier_status="Zůstává Low Tier 3"
+            )
+            self.assertEqual(second["result"], "created")
+            self.assertNotEqual(second["record"]["id"], first["record"]["id"])
+            self.assertTrue(second["record"]["id"].startswith("htfight-"))
+            hist = storage.load_data(results.HT_RESULTS_FILE, {})
+            self.assertEqual(len(hist), 2)
+        asyncio.run(main())
+
     def test_win_in_ticket_promotes_keeps_ticket_open(self):
         async def main():
             rec = await self._record(ticket_id=2001)

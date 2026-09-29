@@ -164,14 +164,26 @@ def has_eval(ign: str, kit: str) -> bool:
     return isinstance(bucket, dict) and _eval_ign(ign) in bucket
 
 
-def set_eval(ign: str, kit: str) -> bool:
-    """Nastaví hráči eval pro kit. Vrátí False při neplatném vstupu."""
+def apply_eval_status(evals, ign: str, kit: str, now: int) -> bool:
+    """Zapíše „LT3 + eval" do už načteného dictu ``evals`` – bez I/O.
+
+    Stejná normalizace i tvar záznamu jako :func:`set_eval`; díky absenci
+    čtení/zápisu souboru může zápis běžet uvnitř transakce ``services.store``.
+    Při neplatném vstupu se dict nesahne a vrátí se ``False``.
+    """
     kit_key = (kit or "").strip().lower()
     key = _eval_ign(ign)
-    if not key or not kit_key:
+    if not key or not kit_key or not isinstance(evals, dict):
         return False
+    evals.setdefault(kit_key, {})[key] = now
+    return True
+
+
+def set_eval(ign: str, kit: str) -> bool:
+    """Nastaví hráči eval pro kit. Vrátí False při neplatném vstupu."""
     evals = get_evals()
-    evals.setdefault(kit_key, {})[key] = now_ms()
+    if not apply_eval_status(evals, ign, kit, now_ms()):
+        return False
     save_data(EVALS_FILE, evals)
     return True
 

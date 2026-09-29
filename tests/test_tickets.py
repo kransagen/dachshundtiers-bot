@@ -176,6 +176,124 @@ class TicketServiceTests(unittest.TestCase):
         asyncio.run(main())
 
     # ------------------------------------------------------------------
+    # create_ticket + HT3+ cooldown (F2: kontrola uvnitř DB transakce)
+    # ------------------------------------------------------------------
+    def test_create_blocked_by_active_cooldown(self):
+        async def main():
+            storage.save_data(
+                tickets.HT3_COOLDOWNS_FILE,
+                {"1": {"AnchorPvP": NOW + COOLDOWN_MS}},
+            )
+            result = await tickets.create_ticket(
+                channel_id=1002, owner_id="1", owner_name="alice", ign="A",
+                kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                eval_ok=True, category_id=555, cooldown_ms=COOLDOWN_MS,
+                now=NOW + 1000,
+            )
+            self.assertEqual(result["result"], "cooldown")
+            self.assertEqual(result["remaining_ms"], COOLDOWN_MS - 1000)
+            self.assertEqual(result["kit"], "AnchorPvP")
+            self.assertEqual(result["owner_id"], "1")
+            self.assertNotIn("1002", storage.load_data(tickets.HT_TICKETS_FILE, {}))
+
+        asyncio.run(main())
+
+    def test_create_allowed_after_cooldown_expires(self):
+        async def main():
+            storage.save_data(
+                tickets.HT3_COOLDOWNS_FILE,
+                {"1": {"AnchorPvP": NOW}},
+            )
+            result = await tickets.create_ticket(
+                channel_id=1002, owner_id="1", owner_name="alice", ign="A",
+                kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                eval_ok=True, category_id=555, cooldown_ms=COOLDOWN_MS,
+                now=NOW + COOLDOWN_MS + 1,
+            )
+            self.assertEqual(result["result"], "created")
+            self.assertIn("1002", storage.load_data(tickets.HT_TICKETS_FILE, {}))
+
+        asyncio.run(main())
+
+    def test_create_without_cooldown_preserves_legacy_behavior(self):
+        # default cooldown_ms=0 = žádná cooldown kontrola (jako dřív)
+        async def main():
+            storage.save_data(
+                tickets.HT3_COOLDOWNS_FILE,
+                {"1": {"AnchorPvP": NOW + COOLDOWN_MS}},
+            )
+            result = await tickets.create_ticket(
+                channel_id=1002, owner_id="1", owner_name="alice", ign="A",
+                kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                eval_ok=True, category_id=555, now=NOW,
+            )
+            self.assertEqual(result["result"], "created")
+
+        asyncio.run(main())
+
+    def test_concurrent_create_no_cooldown_bypass(self):
+        """Souběžné vytvoření při aktivním cooldownu → ani jedno neprojde."""
+
+        async def create(channel_id):
+            return await tickets.create_ticket(
+                channel_id=channel_id, owner_id="1", owner_name="alice", ign="A",
+                kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                eval_ok=True, category_id=555, cooldown_ms=COOLDOWN_MS, now=NOW,
+            )
+
+        async def main():
+            storage.save_data(
+                tickets.HT3_COOLDOWNS_FILE,
+                {"1": {"AnchorPvP": NOW + COOLDOWN_MS}},
+            )
+            results = await asyncio.gather(create(1001), create(1002))
+            statuses = sorted(r["result"] for r in results)
+            self.assertEqual(statuses, ["cooldown", "cooldown"])
+            self.assertEqual(storage.load_data(tickets.HT_TICKETS_FILE, {}), {})
+
+        asyncio.run(main())
+
+    def test_concurrent_close_and_create_no_cooldown_bypass(self):
+        """close_ticket (nastaví cooldown) a create_ticket nesmí cooldown obejít.
+
+        Pořadí je nedeterministické, ale „created" je v obou případech
+        nemožné: běží-li create první, blokuje ho OTEVŘENÝ ticket (duplicate);
+        běží-li close první, blokuje ho čerstvě nastavený cooldown. Kompenzace
+        přes zámky + opětovný průchod cooldown kontrolou uvnitř transakce.
+        """
+
+        async def main():
+            await tickets.create_ticket(
+                channel_id=1001, owner_id="1", owner_name="alice", ign="A",
+                kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                eval_ok=True, category_id=555, now=NOW,
+            )
+            closed, created = await asyncio.gather(
+                tickets.close_ticket("1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW),
+                tickets.create_ticket(
+                    channel_id=1002, owner_id="1", owner_name="alice", ign="A",
+                    kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                    eval_ok=True, category_id=555, cooldown_ms=COOLDOWN_MS,
+                    now=NOW + 1,
+                ),
+            )
+            self.assertEqual(closed["result"], "closed")
+            self.assertIn(created["result"], {"duplicate", "cooldown"})
+            # cooldown je vždy nastavený a třetí create už nikdy neprojde
+            cds = storage.load_data(tickets.HT3_COOLDOWNS_FILE, {})
+            self.assertEqual(cds["1"]["AnchorPvP"], NOW + COOLDOWN_MS)
+            third = await tickets.create_ticket(
+                channel_id=1003, owner_id="1", owner_name="alice", ign="A",
+                kit="AnchorPvP", target_tier="HT3", current_tier="LT3",
+                eval_ok=True, category_id=555, cooldown_ms=COOLDOWN_MS,
+                now=NOW + 2,
+            )
+            self.assertEqual(third["result"], "cooldown")
+            self.assertNotIn("1003", storage.load_data(tickets.HT_TICKETS_FILE, {}))
+
+        asyncio.run(main())
+
+    # ------------------------------------------------------------------
     # Claim / Unclaim
     # ------------------------------------------------------------------
     async def _open_ticket(self, channel_id=1001, owner_id="1"):
@@ -414,6 +532,26 @@ class TicketServiceTests(unittest.TestCase):
             await tickets.close_ticket("1001", "9", cooldown_ms=COOLDOWN_MS, now=NOW)
             result = await tickets.reopen_ticket("1001", "9")
             self.assertEqual(result["result"], "reopened")
+
+        asyncio.run(main())
+
+    def test_delete_ticket(self):
+        async def main():
+            await self._open_ticket()
+            self.assertTrue(await tickets.delete_ticket("1001"))
+            self.assertNotIn("1001", storage.load_data(tickets.HT_TICKETS_FILE, {}))
+            self.assertFalse(await tickets.delete_ticket("1001"))
+
+        asyncio.run(main())
+
+    def test_delete_ticket_keeps_other_tickets(self):
+        async def main():
+            await self._open_ticket(1001)
+            await self._open_ticket(1002, owner_id="2")
+            await tickets.delete_ticket("1001")
+            state = storage.load_data(tickets.HT_TICKETS_FILE, {})
+            self.assertNotIn("1001", state)
+            self.assertIn("1002", state)
 
         asyncio.run(main())
 

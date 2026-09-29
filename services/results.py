@@ -32,6 +32,7 @@ Vlastnosti:
 
 import logging
 import time
+from uuid import uuid4
 
 from services.player_identity import PlayerIdentityConflict, claim_ign
 from services.store import read as store_read, transaction
@@ -43,7 +44,7 @@ from services.tickets import (
     STATUS_CLOSED,
     STATUS_OPEN,
 )
-from utils import migrate_mode_keys
+from utils import EVALS_FILE, apply_eval_status, migrate_mode_keys
 
 log = logging.getLogger("dachshundtiers")
 
@@ -404,6 +405,8 @@ async def record_result(
     files = ["players.json", "cooldowns.json", HT_RESULTS_FILE]
     if ticket_id is not None:
         files += [HT_TICKETS_FILE, HT3_COOLDOWNS_FILE, HT_TICKET_LOGS_FILE]
+    if eval_flag:
+        files.append(EVALS_FILE)
 
     async def _run(tx):
         results = tx.get(HT_RESULTS_FILE, {})
@@ -449,7 +452,9 @@ async def record_result(
             ok_validate, msg_validate = validate_result_tier(new_tier)
             if not ok_validate:
                 return {"result": "invalid_tier", "message": msg_validate}
-            result_id = f"{QUEUE_RESULT_PREFIX}{player_id}-{now}"
+            # Kolize nemožné: UUID místo času (dva souběžné výsledky ve stejnou
+            # ms by měly stejný timestamp-klíč a druhý by přepsal první).
+            result_id = f"{QUEUE_RESULT_PREFIX}{uuid4().hex}"
             kind = "queue"
 
         # --- Kanonická databáze hráčů (players.json) ---
@@ -461,6 +466,16 @@ async def record_result(
         except PlayerIdentityConflict as exc:
             return {"result": "identity_conflict", "message": str(exc)}
         tx.set("players.json", players)
+
+        # --- Eval status „LT3 + eval" – ve stejné transakci jako tier i
+        #     historie; samostatný zápis po commitu by nechal výsledek bez
+        #     evalu (hráč by si HT3+ ticket neotevřel) a bez cesty k opravě.
+        eval_applied = False
+        if eval_flag:
+            evals = tx.get(EVALS_FILE, {})
+            if apply_eval_status(evals, ign, kit, now):
+                tx.set(EVALS_FILE, evals)
+                eval_applied = True
 
         # --- Historie výsledků (append-only, nikdy se nemaže) ---
         result = make_result(
@@ -487,9 +502,15 @@ async def record_result(
         tx.set(HT_RESULTS_FILE, results)
 
         # --- Cooldown hráče (queue, 4 dny) ---
-        cooldowns = tx.get("cooldowns.json", {})
-        cooldowns[player_id] = now
-        tx.set("cooldowns.json", cooldowns)
+        # Queue cooldown (pro /queue join) zapisuje JEN queue výsledek. Výsledek
+        # z HT3+ ticketu má vlastní 7denní HT3+ cooldown (ht3_cooldowns.json,
+        # nastavený v close_ticket_in_tx níže) – kdyby zapisoval i queue
+        # cooldown, hráč by po ticketovém testu nemohl hned znovu do queue
+        # fronty (a naopak queue cooldown by falešně blokoval i další ticket).
+        if ticket_id is None:
+            cooldowns = tx.get("cooldowns.json", {})
+            cooldowns[player_id] = now
+            tx.set("cooldowns.json", cooldowns)
 
         # --- Ticket: zavření + HT3+ cooldown + event log (atomicky) ---
         if ticket_id is not None:
@@ -510,6 +531,7 @@ async def record_result(
             "result": "created",
             "record": result,
             "previous_tier": previous,
+            "eval_applied": eval_applied,
         }
 
     return await transaction(tuple(files), _run)

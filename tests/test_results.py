@@ -238,6 +238,23 @@ class RecordResultQueueTests(unittest.TestCase):
             self.assertIsNone(rec["record"]["notes"])
         asyncio.run(main())
 
+    def test_two_queue_results_same_now_unique_ids(self):
+        """F9 regression: dva queue výsledky ve stejnou ms → různé id."""
+
+        async def main():
+            first = await self._record()
+            self.assertEqual(first["result"], "created")
+            # queue_cooldown_ms=0 vypne duplicitní ochranu; druhý výsledek ve
+            # STEJNOU ms musí dostat JINÝ id – timestamp-klíč by kolidoval
+            # a přepsal by první záznam.
+            second = await self._record(now=NOW, queue_cooldown_ms=0)
+            self.assertEqual(second["result"], "created")
+            self.assertNotEqual(second["record"]["id"], first["record"]["id"])
+            self.assertTrue(second["record"]["id"].startswith("queue-"))
+            hist = storage.load_data(results.HT_RESULTS_FILE, {})
+            self.assertEqual(len(hist), 2)
+        asyncio.run(main())
+
 
 class RecordResultTicketTests(unittest.TestCase):
     def setUp(self):
@@ -306,8 +323,54 @@ class RecordResultTicketTests(unittest.TestCase):
             self.assertEqual(logs[-1]["details"], "LT3 → HT3")
             self.assertEqual(logs[-1]["actorId"], "9")
 
-            # queue cooldown hráče taky
-            self.assertEqual(storage.load_data("cooldowns.json", {})["1"], NOW)
+            # queue cooldown hráče se NEzměnil – ticket výsledek ho nesmí psát
+            # (F1: 4denní queue cooldown patří čistě queue výsledkům; ticket má
+            # vlastní 7denní HT3+ cooldown v ht3_cooldowns.json).
+            self.assertEqual(storage.load_data("cooldowns.json", {}), {})
+        asyncio.run(main())
+
+    def test_ticket_result_does_not_write_queue_cooldown(self):
+        """F1 regression: ticket výsledek NESMÍ zapsat queue cooldown."""
+
+        async def main():
+            rec = await self._record()
+            self.assertEqual(rec["result"], "created")
+            self.assertEqual(storage.load_data("cooldowns.json", {}), {})
+
+        asyncio.run(main())
+
+    def test_queue_result_after_ticket_result_accepted(self):
+        """F1 regression: queue výsledek hned po ticket výsledku musí projít.
+
+        Před fixem ticket výsledek zapisoval 4denní queue cooldown hráče –
+        okamžitý queue výsledek (nebo /queue join) by byl falešně blokovaný.
+        """
+
+        async def main():
+            await self._record()  # HT3+ ticket výsledek (NOW)
+            rec = await self._record(
+                ticket_id=None,
+                new_tier="LT3",
+                display_tier="LT3",
+                score="4-3",
+                notes="queue retest",
+                now=NOW + 1,
+            )
+            self.assertEqual(rec["result"], "created")
+            # queue cooldown nastavil AŽ queue výsledek (až teď, ne ticket)
+            cds = storage.load_data("cooldowns.json", {})
+            self.assertEqual(cds["1"], NOW + 1)
+            # a čistá queue duplicita zůstává chráněná (další pokus ve 4 dnech)
+            dup = await self._record(
+                ticket_id=None,
+                new_tier="LT3",
+                display_tier="LT3",
+                score="4-3",
+                notes="dup",
+                now=NOW + 2,
+            )
+            self.assertEqual(dup["result"], "duplicate")
+
         asyncio.run(main())
 
     def test_ticket_result_idempotent(self):

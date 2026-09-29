@@ -762,7 +762,23 @@ class TestHT3Context:
         )
         assert not context.ok
         assert context.reason == REFUSE_NO_MINECRAFT
-        assert "/link" in context.message
+        assert "/linkign" in context.message
+
+    async def test_ign_linked_via_linkign_is_enough(self, session_factory, clean_db):
+        """/linkign (bez Minecraft pluginu) stačí na HT3+ ticket."""
+        from db.base import utcnow as _now
+
+        async with session_factory() as s:
+            async with s.begin():
+                kit = await _kit(s)
+                player = await _player(s, discord_id=1100, ign="Steve")
+                player.ign_linked_at = _now()
+                await _set_current_tier(s, player_id=player.id, kit_id=kit.id, code="HT3")
+        context = await resolve_ht3_context(
+            1100, "boxing", session_factory=session_factory
+        )
+        assert context.ok
+        assert context.ign == "Steve"
 
     async def test_no_tier_refuses(self, session_factory, clean_db):
         await self._linked_player(session_factory, tier=None)

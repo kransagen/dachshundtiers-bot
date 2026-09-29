@@ -40,6 +40,11 @@ class PlayerIdentityError(ValueError):
     """Identity claim/rename rejected (IGN belongs to another player)."""
 
 
+def shell_ign(discord_id: int) -> str:
+    """Zástupné IGN hráče, u kterého skutečné IGN zatím neznáme."""
+    return f"discord-{int(discord_id)}"
+
+
 def _norm(value: str) -> str:
     return (value or "").strip().lower()
 
@@ -123,6 +128,23 @@ class PlayerRepository:
         await session.flush()
         return player
 
+    async def get_or_create_shell(self, session: AsyncSession, *, discord_id: int) -> Player:
+        """Hráč podle Discord ID, jinak prázdný záznam s IGN ``discord-<id>``.
+
+        Pro testery a akce v ticketech, kde IGN neznáme. Přezdívka ze serveru
+        se jako IGN nepoužívá: kolidovala by s cizím IGN a hráč by si pak
+        vlastní IGN nemohl propojit. Prázdný záznam se při ``/linkign``
+        sloučí se záznamem skutečného IGN.
+        """
+        did = int(discord_id)
+        player = await self.get_by_discord_id(session, did)
+        if player is not None:
+            return player
+        player = Player(discord_id=did, ign=shell_ign(did), source=PLAYER_SOURCE_DISCORD)
+        session.add(player)
+        await session.flush()
+        return player
+
     async def get_or_create_by_ign(
         self,
         session: AsyncSession,
@@ -189,6 +211,10 @@ class PlayerRepository:
         by_did = await self.get_by_discord_id(session, did)
         if by_did is not None:
             if _norm(by_did.ign) == _norm(ign_clean):
+                return CLAIM_UNCHANGED, by_did
+            if by_did.ign_linked_at is not None:
+                # Hráč si IGN potvrdil sám (/linkign) – IGN napsané testerem
+                # nebo převzaté z přezdívky ho nikdy nepřejmenuje.
                 return CLAIM_UNCHANGED, by_did
             other = await self.get_by_ign(session, ign_clean)
             if other is not None and other.id != by_did.id:

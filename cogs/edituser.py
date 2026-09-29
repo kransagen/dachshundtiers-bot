@@ -1177,10 +1177,8 @@ class EditUser(commands.Cog):
         )
 
     # ------------------------------------------------------------------
-    # /linkdiscord – explicitní propojení IGN ↔ Discord ID (admin claim).
-    # PostgreSQL je PRIMÁRNÍ (Phase D cutover): claim → PostgreSQL; players.json
-    # je export (best effort, hlasitě), nikdy se neprovádí JSON-only claim a
-    # export nikdy nevrací DB claim (no silent fallback).
+    # /linkdiscord – admin propojí IGN ↔ Discord ID za hráče (stejná pravidla
+    # jako /linkign, viz services/player_link).
     # ------------------------------------------------------------------
     @app_commands.command(
         name="linkdiscord",
@@ -1222,59 +1220,42 @@ class EditUser(commands.Cog):
                 ephemeral=True,
             )
 
-        from db.repositories.players import (
-            CLAIM_ADOPTED as DB_ADOPTED,
-            CLAIM_CREATED as DB_CREATED,
-            CLAIM_RENAMED as DB_RENAMED,
-            PlayerIdentityError,
-            PlayerRepository,
+        from cogs.link import mirror_member
+        from services.player_link import (
+            LINK_ADOPTED,
+            LINK_CREATED,
+            LINK_MERGED,
+            LINK_RENAMED,
+            LinkRefused,
+            link_ign,
         )
-        from db.services.session import transaction
 
         try:
-            async with transaction(session_factory) as session:
-                status, _ = await PlayerRepository().claim_discord_id(
-                    session, discord_id=int(player.id), ign=ign_clean
-                )
-        except PlayerIdentityError as err:
+            outcome = await link_ign(
+                player.id,
+                ign_clean,
+                session_factory=session_factory,
+                actor_id=interaction.user.id,
+                actor_name=str(interaction.user),
+            )
+        except LinkRefused as err:
             return await interaction.followup.send(
-                f"❌ **{ign_clean}** – {err} (claim v PostgreSQL selhal).",
-                ephemeral=True,
+                f"**{ign_clean}** – {err}", ephemeral=True
             )
-        except Exception:  # noqa: BLE001 – DB primární; selhání = hlasité zastavení
-            log.exception(
-                "DB claim /linkdiscord pro %s selhal (žádný JSON fallback)", ign_clean
-            )
-            return await interaction.followup.send(
-                "❌ PostgreSQL selhalo – claim NEPROVEDEN. Opakujte po obnovení DB "
-                "(žádný silent JSON fallback).",
-                ephemeral=True,
-            )
+        member = interaction.guild.get_member(player.id)
+        if member is not None:
+            await mirror_member(session_factory, member, command="/linkdiscord")
 
         outcome_label = {
-            DB_CREATED: "🎉 Vytvořen nový hráč",
-            DB_RENAMED: "✏️ Hráč přejmenován",
-            DB_ADOPTED: "🔗 Propojeno k existujícímu záznamu",
-        }.get(status, "✅ Už propojeno – nic se nezměnilo")
-
-        json_note = ""
-        try:
-            from services.player_export import write_players_export
-
-            await write_players_export(session_factory)
-            json_note = "\n🪟 players.json export: aktualizováno (export-only)."
-        except Exception:  # noqa: BLE001 – export nikdy nevrací DB claim
-            log.exception(
-                "players.json export po /linkdiscord selhal (DB claim zůstává)"
-            )
-            json_note = "\n⚠️ players.json export selhal – DB claim zůstává (export-only)."
-
+            LINK_CREATED: "🎉 Vytvořen nový hráč",
+            LINK_RENAMED: "✏️ IGN změněno",
+            LINK_ADOPTED: "🔗 Propojeno k existujícímu záznamu",
+            LINK_MERGED: "🔗 Propojeno, dřívější záznam sloučen",
+        }.get(outcome.status, "✅ Už propojeno – nic se nezměnilo")
         embed = discord.Embed(
             title="🔗 Propojení identity",
             description=(
                 f"**`{ign_clean}`** ↔ <@{player.id}> ({outcome_label})"
-                f"\n📦 PostgreSQL: claim proveden."
-                f"{json_note}"
             ),
             color=0x10B981,
         )

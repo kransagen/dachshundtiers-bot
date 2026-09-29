@@ -19,6 +19,12 @@ KITS = (("anchorpvp", "AnchorPvP"), ("molepvp", "MolePVP"))
 TIERS = (("LT5", "ladder", "LT5", 1),)
 
 
+async def _link(uid, ign, session_factory):
+    from services.player_link import link_ign
+
+    await link_ign(int(uid), ign, session_factory=session_factory)
+
+
 async def _seed(session_factory, *, open_kits=()):
     async with transaction(session_factory) as session:
         await ensure_dimensions(session, KITS, TIERS)
@@ -145,11 +151,13 @@ async def test_list_entries_and_snapshot(session_factory, clean_db):
     await qsvc.open_queue(
         "anchorpvp", "AnchorPvP", "111", "Opener", session_factory=session_factory
     )
-    await qsvc.join_queue("1", "alice", "AliceMC", "AnchorPvP",
+    await _link("1", "AliceMC", session_factory)
+    await qsvc.join_queue("1", "alice", "AnchorPvP",
                           joined_at_ms=1_700_000_000_000,
                           cooldown_ms=4 * 24 * 60 * 60 * 1000,
                           session_factory=session_factory)
-    await qsvc.join_queue("2", "bob", "BobMC", "AnchorPvP",
+    await _link("2", "BobMC", session_factory)
+    await qsvc.join_queue("2", "bob", "AnchorPvP",
                           joined_at_ms=1_700_000_000_100,
                           cooldown_ms=4 * 24 * 60 * 60 * 1000,
                           session_factory=session_factory)
@@ -175,7 +183,8 @@ async def test_removeq_db(session_factory, clean_db):
     await qsvc.open_queue(
         "anchorpvp", "AnchorPvP", "111", "Opener", session_factory=session_factory
     )
-    await qsvc.join_queue("1", "alice", "AliceMC", "AnchorPvP",
+    await _link("1", "AliceMC", session_factory)
+    await qsvc.join_queue("1", "alice", "AnchorPvP",
                           joined_at_ms=1_700_000_000_000,
                           cooldown_ms=4 * 24 * 60 * 60 * 1000,
                           session_factory=session_factory)
@@ -198,7 +207,8 @@ async def _join_two(session_factory):
         "anchorpvp", "AnchorPvP", "111", "Opener", session_factory=session_factory
     )
     for uid, name, ign, ts in (("1", "alice", "AliceMC", 0), ("2", "bob", "BobMC", 100)):
-        await qsvc.join_queue(uid, name, ign, "AnchorPvP",
+        await _link(uid, ign, session_factory)
+        await qsvc.join_queue(uid, name, "AnchorPvP",
                               joined_at_ms=1_700_000_000_000 + ts,
                               cooldown_ms=4 * 24 * 60 * 60 * 1000,
                               session_factory=session_factory)

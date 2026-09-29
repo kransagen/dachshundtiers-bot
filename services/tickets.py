@@ -703,14 +703,9 @@ async def _db_claim_ticket(
                     ),
                     "claimer_name": t.claimer_name or "",
                 }
-        try:
-            actor = await PlayerRepository().get_or_create_by_discord_id(
-                session,
-                discord_id=int(actor_id),
-                ign=(actor_name or "").strip() or str(actor_id),
-            )
-        except PlayerIdentityError as err:
-            return {"result": "identity_conflict", "message": str(err)}
+        actor = await PlayerRepository().get_or_create_shell(
+            session, discord_id=int(actor_id)
+        )
         row = await TicketRepository().claim(
             session,
             ticket_id=t.id,
@@ -787,19 +782,9 @@ async def _db_add_member(
             session, int(member_id)
         )
         if member is None:
-            if not (member_name or "").strip():
-                return {
-                    "result": "player_not_found",
-                    "ticket": await _db_ticket_to_dict(session, t),
-                }
-            try:
-                member = await PlayerRepository().get_or_create_by_discord_id(
-                    session,
-                    discord_id=int(member_id),
-                    ign=(member_name or "").strip(),
-                )
-            except PlayerIdentityError as err:
-                return {"result": "identity_conflict", "message": str(err)}
+            member = await PlayerRepository().get_or_create_shell(
+                session, discord_id=int(member_id)
+            )
         if await TicketMemberRepository().has_member(
             session, ticket_id=t.id, player_id=member.id
         ):

@@ -47,11 +47,20 @@ async def _seed(session_factory, *, open_kits=("anchorpvp",)):
         await session.flush()
 
 
+async def _linked(session_factory, uid):
+    from services.player_link import linked_ign
+
+    return await linked_ign(int(uid), session_factory=session_factory)
+
+
 async def _join(session_factory, uid, name="alice", ign="AliceMC", kit="AnchorPvP", at=None):
+    from services.player_link import link_ign
+
+    if await _linked(session_factory, uid) is None:
+        await link_ign(int(uid), ign, session_factory=session_factory)
     return await qsvc.join_queue(
         uid,
         name,
-        ign,
         kit,
         joined_at_ms=at if at is not None else NOW_MS,
         cooldown_ms=COOLDOWN_MS,
@@ -163,6 +172,7 @@ async def test_join_duplicate_blocked(session_factory, clean_db):
 
 async def test_concurrent_joins_same_user_no_duplicate(session_factory, clean_db):
     await _seed(session_factory)
+    await _join(session_factory, "1", kit="MolePVP")  # propojení předem
     r1, r2 = await asyncio.gather(
         _join(session_factory, "1"), _join(session_factory, "1")
     )
@@ -173,8 +183,8 @@ async def test_concurrent_joins_same_user_no_duplicate(session_factory, clean_db
 async def test_concurrent_joins_two_users_both_land(session_factory, clean_db):
     await _seed(session_factory)
     r1, r2 = await asyncio.gather(
-        _join(session_factory, "1", name="a", ign="A"),
-        _join(session_factory, "2", name="b", ign="B"),
+        _join(session_factory, "1", name="a", ign="PlayerA"),
+        _join(session_factory, "2", name="b", ign="PlayerB"),
     )
     assert sorted([r1["result"], r2["result"]]) == ["joined", "joined"]
     entries = await _entries(session_factory)

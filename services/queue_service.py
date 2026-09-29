@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from db.models import Kit, Player, Queue, QueueEntry
 from db.repositories.cooldowns import CooldownRepository
 from db.repositories.kits import KitRepository, KitTesterRoomRepository
-from db.repositories.players import PlayerIdentityError, PlayerRepository
+from db.repositories.players import PlayerRepository
 from db.repositories.queues import (
     QUEUE_ENTRY_LEFT,
     QUEUE_ENTRY_PULLED,
@@ -65,12 +65,12 @@ async def _db_resolve_queue(
 
 
 async def _db_join_queue(
-    session_factory, *, uid: str, username: str, ign: str, kit: str, now: int
+    session_factory, *, uid: str, username: str, kit: str, now: int
 ) -> dict:
     for attempt in range(2):
         try:
             return await _db_join_queue_once(
-                session_factory, uid=uid, username=username, ign=ign, kit=kit, now=now
+                session_factory, uid=uid, username=username, kit=kit, now=now
             )
         except IntegrityError:
             if attempt == 0:
@@ -80,19 +80,19 @@ async def _db_join_queue(
 
 
 async def _db_join_queue_once(
-    session_factory, *, uid: str, username: str, ign: str, kit: str, now: int
+    session_factory, *, uid: str, username: str, kit: str, now: int
 ) -> dict:
     async with db_transaction(session_factory) as session:
         kit_row, queue = await _db_resolve_queue(session, kit)
         if kit_row is None or queue is None:
             return {"result": "closed"}
 
-        try:
-            _outcome, player = await PlayerRepository().claim_discord_id(
-                session, discord_id=int(uid), ign=ign
-            )
-        except PlayerIdentityError:
-            return {"result": "identity_conflict"}
+        # Do fronty jen s propojeným IGN (/linkign) – IGN z fronty se tak
+        # vždy shoduje s hráčem, kterému patří historie tierů.
+        player = await PlayerRepository().get_by_discord_id(session, int(uid))
+        if player is None or player.ign_linked_at is None:
+            return {"result": "not_linked"}
+        ign = player.ign
 
         active = await CooldownRepository().get_active_waitlist(
             session,
@@ -133,13 +133,12 @@ async def _db_join_queue_once(
             joined_at=_db_dt(now),
             username=username,
         )
-        return {"result": "joined"}
+        return {"result": "joined", "ign": ign}
 
 
 async def join_queue(
     user_id: str,
     username: str,
-    ign: str,
     kit: str,
     *,
     joined_at_ms: int,
@@ -150,7 +149,8 @@ async def join_queue(
     Vyžaduje PostgreSQL (``session_factory``).
 
     Vrací slovník s klíčem ``result``:
-      - ``"joined"``    → hráč byl přidán,
+      - ``"joined"``    → hráč byl přidán (s propojeným IGN, klíč ``ign``),
+      - ``"not_linked"``→ hráč nemá propojené IGN (/linkign),
       - ``"closed"``    → fronta už není aktivní,
       - ``"cooldown"``  → cooldown stále běží (klíč ``remaining`` = zbývající ms),
       - ``"duplicate"`` → hráč už ve frontě kitu je.
@@ -161,7 +161,6 @@ async def join_queue(
         session_factory,
         uid=uid,
         username=username,
-        ign=ign,
         kit=str(kit).lower(),
         now=now,
     )
@@ -619,12 +618,9 @@ async def _db_open_queue_once(
         queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
         if queue is not None:
             return ("exists", await _db_qdata(session, queue))
-        try:
-            _outcome, player = await PlayerRepository().claim_discord_id(
-                session, discord_id=int(opener_uid), ign=opener_ign
-            )
-        except PlayerIdentityError:
-            return ("identity_conflict", None)
+        player = await PlayerRepository().get_or_create_shell(
+            session, discord_id=int(opener_uid)
+        )
         queue = await QueueRepository().open(
             session, kit_id=kit_row.id, name=name
         )
@@ -645,7 +641,7 @@ async def open_queue(
     """Transakčně otevře frontu kitu (jen jednu aktivní na kit). PostgreSQL.
 
     Vrací ``(status, qdata)``: status in ``ok`` / ``exists`` /
-    ``unknown_kit`` / ``identity_conflict``; qdata = JSON tvar
+    ``unknown_kit``; qdata = JSON tvar
     ``active_queues[kit_key]`` (name, opener, testers, time).
     """
     kit_key = str(kit_key).lower()
@@ -849,17 +845,9 @@ async def _db_join_queue_tester(
         queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
         if queue is None:
             return ("closed", None)
-        player = await PlayerRepository().get_by_discord_id(session, int(uid))
-        if player is None:
-            other = await PlayerRepository().get_by_ign(session, ign)
-            if other is not None and other.discord_id is not None:
-                return ("closed", None)
-            try:
-                _outcome, player = await PlayerRepository().claim_discord_id(
-                    session, discord_id=int(uid), ign=ign
-                )
-            except PlayerIdentityError:
-                return ("closed", None)
+        player = await PlayerRepository().get_or_create_shell(
+            session, discord_id=int(uid)
+        )
         if await QueueTesterRepository().is_member(
             session, queue_id=queue.id, player_id=player.id
         ):
@@ -923,14 +911,9 @@ async def _db_register_global_tester(
     session_factory, *, uid: str, ign: str
 ) -> bool:
     async with db_transaction(session_factory) as session:
-        player = await PlayerRepository().get_by_discord_id(session, int(uid))
-        if player is None:
-            try:
-                _outcome, player = await PlayerRepository().claim_discord_id(
-                    session, discord_id=int(uid), ign=ign
-                )
-            except PlayerIdentityError:
-                return False
+        player = await PlayerRepository().get_or_create_shell(
+            session, discord_id=int(uid)
+        )
         if await TesterRepository().is_tester(session, player_id=player.id):
             return True
         return await TesterRepository().grant(

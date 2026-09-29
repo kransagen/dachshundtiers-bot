@@ -165,8 +165,9 @@ async def test_add_member(session_factory, clean_db):
     assert r2["result"] == "already_member"
     r3 = await svc.add_member(120, "100", session_factory=session_factory)
     assert r3["result"] == "is_owner"
+    # Neznámý hráč dostane prázdný záznam (discord-<id>), žádné hádání IGN.
     r4 = await svc.add_member(120, "777", session_factory=session_factory)
-    assert r4["result"] == "player_not_found"
+    assert r4["result"] == "added"
     await svc.close_ticket(120, "200", session_factory=session_factory)
     r5 = await svc.add_member(
         120, "201", member_name="Late", session_factory=session_factory

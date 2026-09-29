@@ -80,11 +80,13 @@ class HT3Context:
 
 
 _REFUSAL_MESSAGES = {
-    REFUSE_NO_PLAYER: "❌ Tebe v databázi nemám. Napiš testerovi.",
+    REFUSE_NO_PLAYER: (
+        "❌ Tebe v databázi nemám. Propoj si účet: `/linkign <tvoje Minecraft jméno>`."
+    ),
     REFUSE_NO_KIT: "❌ Kit neznám.",
     REFUSE_NO_MINECRAFT: (
-        "❌ Nemáš propojený Minecraft účet. Bez propojení účtu nejde otevřít "
-        "HT3+ ticket – spusť `/link` a prokazuj vlastnictví kódem."
+        "❌ Nejdřív si propoj účet: `/linkign <tvoje Minecraft jméno>`. "
+        "Bez propojení nejde otevřít HT3+ ticket."
     ),
     REFUSE_NO_TIER: (
         "❌ Pro tenhle kit nemám u tebe uložený žádný tier, takže nevím, na co "
@@ -157,13 +159,16 @@ async def resolve_ht3_context(
         if kit_row is None:
             return HT3Context(ok=False, reason=REFUSE_NO_KIT, discord_id=player.discord_id)
 
-        # 1) Identity: only a PROVED Minecraft account counts. `players.ign` is
-        #    NOT an acceptable substitute — it is free text, and falling back
-        #    to it is how a ticket ends up on somebody else's account.
+        # 1) Identity: an IGN the player confirmed themselves (/linkign) or a
+        #    proved Minecraft account. A plain `players.ign` copied from a
+        #    server nickname is NOT enough – that is how a ticket would end up
+        #    on somebody else's account.
         account = await PlayerIdentityRepository().get_account_for_player(
             session, player_id=player.id
         )
         ign = ((account.name or "").strip() or None) if account is not None else None
+        if not ign and player.ign_linked_at is not None:
+            ign = player.ign
         if not ign:
             return HT3Context(
                 ok=False, reason=REFUSE_NO_MINECRAFT, discord_id=player.discord_id

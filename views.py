@@ -32,9 +32,7 @@ from services.queue_service import (
     PULL_NO_ROOM,
     join_queue,
     leave_queue,
-    list_queue_entries,
     pull_for_kit,
-    queue_state,
     save_pulled_player,
 )
 from services.tickets import (
@@ -91,64 +89,50 @@ class SafeModal(discord.ui.Modal):
 
 
 # ---------------------------------------------------------------------------
-# Modál pro zadání IGN při připojení do fronty (joinbtn → joinmodal)
+# Připojení do fronty – sdíleno tlačítkem Join Queue i /queue join
 # ---------------------------------------------------------------------------
-class JoinModal(SafeModal):
-    def __init__(self, kit: str):
-        super().__init__(title=f"Join {kit} Queue")
-        self.kit = kit
-        self.ign_input = discord.ui.TextInput(
-            label="Zadej své Minecraft jméno (IGN):",
-            placeholder="Např. Adrison99",
-            min_length=2,
-            max_length=16,
-            required=True,
-        )
-        self.add_item(self.ign_input)
+NOT_LINKED_MESSAGE = (
+    "❌ Nejdřív si propoj účet: `/linkign <tvoje Minecraft jméno>`. "
+    "Pak se můžeš připojit do fronty."
+)
 
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        kit_key = self.kit.lower()
-        ign = (self.ign_input.value or "").strip()
 
-        # Join probíhá ATOMICky: kontrola aktivní fronty + cooldownu + duplicity
-        # i samotný zápis ve stejném kritickém úseku. Dvě souběžné interakce
-        # (nebo „obejití" přes modál, když cooldown mezitím naskočil) tak
-        # nemůžou hráče zapsat dvakrát ani obejít cooldown.
-        result = await join_queue(
-            str(interaction.user.id),
-            interaction.user.name,
-            ign,
-            self.kit,
-            joined_at_ms=time.time() * 1000,
-            cooldown_ms=PLAYER_COOLDOWN_MS,
-            session_factory=_session_factory(interaction),
-        )
-        status = result["result"]
+def queue_join_error(result: dict) -> Optional[str]:
+    """Hláška pro hráče, když join neprošel; ``None`` = hráč je ve frontě."""
+    status = result["result"]
+    if status == "not_linked":
+        return NOT_LINKED_MESSAGE
+    if status == "closed":
+        return "❌ Tato fronta je zavřená. Počkej, až ji tester otevře."
+    if status == "cooldown":
+        remaining = result["remaining"]
+        days = int(remaining // (24 * 60 * 60 * 1000))
+        hours = int((remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000))
+        return f"❌ Máš cooldown na testy! Zkus to znovu za **{days}d {hours}h**."
+    if status == "duplicate":
+        return "❌ V této frontě už jsi zapsaný."
+    return None
 
-        if status == "closed":
-            return await interaction.response.send_message(
-                "❌ Tato fronta už byla zavřena.", ephemeral=True
-            )
-        if status == "cooldown":
-            remaining = result["remaining"]
-            days = int(remaining // (24 * 60 * 60 * 1000))
-            hours = int((remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000))
-            return await interaction.response.send_message(
-                f"❌ Máš cooldown na testy! Zkus to znovu za **{days}d {hours}h**.",
-                ephemeral=True,
-            )
-        if status == "duplicate":
-            return await interaction.response.send_message(
-                "❌ V této frontě už jsi zapsaný.", ephemeral=True
-            )
 
-        await update_panel(
-            interaction.guild, kit_key, session_factory=_session_factory(interaction)
-        )
-        await interaction.response.send_message(
-            f"✅ Byl jsi úspěšně přidán do fronty **{self.kit}** s jménem `{ign}`.",
-            ephemeral=True,
-        )
+async def join_queue_interaction(interaction: discord.Interaction, kit: str) -> None:
+    """Atomický join (aktivní fronta + propojení + cooldown + duplicita)."""
+    session_factory = _session_factory(interaction)
+    result = await join_queue(
+        str(interaction.user.id),
+        interaction.user.name,
+        kit,
+        joined_at_ms=time.time() * 1000,
+        cooldown_ms=PLAYER_COOLDOWN_MS,
+        session_factory=session_factory,
+    )
+    error = queue_join_error(result)
+    if error is not None:
+        return await interaction.response.send_message(error, ephemeral=True)
+    await update_panel(interaction.guild, kit.lower(), session_factory=session_factory)
+    await interaction.response.send_message(
+        f"✅ Byl jsi přidán do fronty **{kit.strip()}** jako `{result['ign']}`.",
+        ephemeral=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -182,35 +166,9 @@ class QueueView(SafeView):
         if not disabled_join:
             self.add_item(pull)
 
-    # ---- Join (otevře modál pro IGN) ----
+    # ---- Join (propojené IGN, bez modálu) ----
     async def on_join(self, interaction: discord.Interaction) -> None:
-        kit_key = self.kit.lower()
-        session_factory = _session_factory(interaction)
-        if await queue_state(kit_key, session_factory=session_factory) is None:
-            return await interaction.response.send_message(
-                "❌ Tato fronta už byla zavřena.", ephemeral=True
-            )
-
-        user_id = str(interaction.user.id)
-        cooldowns = await get_cooldowns(
-            user_id,
-            session_factory=session_factory,
-            waitlist_cooldown_ms=PLAYER_COOLDOWN_MS,
-        )
-        if cooldowns["waitlist_ms"] is not None:
-            return await interaction.response.send_message("❌ Máš cooldown na testy!", ephemeral=True)
-
-        queue = await list_queue_entries(kit_key, session_factory=session_factory)
-        if any(
-            str(p.get("id")) == user_id and str(p.get("kit", "")).lower() == kit_key for p in queue
-        ):
-            return await interaction.response.send_message(
-                "❌ V této frontě už jsi zapsaný.", ephemeral=True
-            )
-
-        # Předběžná kontrola je jen UX „rychlá cesta" – finální (atomická)
-        # kontrola probíhá v JoinModal.on_submit.
-        await interaction.response.send_modal(JoinModal(self.kit))
+        await join_queue_interaction(interaction, self.kit)
 
     # ---- Leave ----
     async def on_leave(self, interaction: discord.Interaction) -> None:

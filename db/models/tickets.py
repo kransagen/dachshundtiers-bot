@@ -70,7 +70,7 @@ class Ticket(Base):
         Index("ix_tickets_claimer", "claimer_id"),
         CheckConstraint("status IN ('open', 'closed')", name="status"),
         CheckConstraint(
-            "ticket_type IN ('eval', 'fight')", name="ticket_type"
+            "ticket_type IN ('eval', 'fight', 'unretire')", name="ticket_type"
         ),
     )
 

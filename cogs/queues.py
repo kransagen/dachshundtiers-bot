@@ -16,7 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 from sqlalchemy.exc import IntegrityError
 
-from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID
+from config import TESTER_ROOM_CATEGORY_ID
 from panel import create_queue_embed, update_panel
 from services.config_store import get_queue_channel_id
 from services.queue_service import (
@@ -24,7 +24,6 @@ from services.queue_service import (
     PULL_NO_KIT,
     PULL_NO_ROOM,
     close_queue,
-    join_queue,
     join_queue_tester,
     leave_queue_tester,
     list_queue_entries,
@@ -41,7 +40,7 @@ from services.queue_service import (
     skip_player as skip_queue_player,
 )
 from utils import has_tester_role, kit_autocomplete
-from views import QueueView, TesterRoomView, grant_pull_access
+from views import QueueView, TesterRoomView, grant_pull_access, join_queue_interaction
 
 log = logging.getLogger("dachshundtiers")
 
@@ -87,11 +86,6 @@ class Queues(commands.Cog):
                 f"<@{existing['opener']}>. Pokud v ní chceš také testovat, "
                 f"použij `/queue joinasqueue kit:{kit}`.",
                 ephemeral=True,
-            )
-        if status == "identity_conflict":
-            return await interaction.response.send_message(
-                "❌ Tvoji přezdívku serveru už vlastní jiný hráč – zaregistruj "
-                "se přes `/linkdiscord`.", ephemeral=True
             )
         if status == "unknown_kit":
             return await interaction.response.send_message(
@@ -224,47 +218,11 @@ class Queues(commands.Cog):
     queue = app_commands.Group(name="queue", description="Manage the testing queue")
 
     @queue.command(name="join", description="Join the queue for a test")
-    @app_commands.describe(ign="Your Minecraft IGN", kit="Kit you want to test")
+    @app_commands.describe(kit="Kit you want to test")
     @app_commands.autocomplete(kit=kit_autocomplete)
-    async def queue_join(self, interaction: discord.Interaction, ign: str, kit: str) -> None:
-        kit_key = kit.lower()
-        user_id = str(interaction.user.id)
-        now = time.time() * 1000
-        sf = getattr(self.bot, "db_session_factory", None)
-
-        # Společná atomická cesta jako Join tlačítko (JoinModal): aktivní
-        # fronta + cooldown + duplicita + zápis v jednom kritickém úseku.
-        result = await join_queue(
-            user_id,
-            interaction.user.name,
-            ign,
-            kit,
-            joined_at_ms=now,
-            cooldown_ms=PLAYER_COOLDOWN_MS,
-            session_factory=sf,
-        )
-        status = result["result"]
-
-        if status == "closed":
-            return await interaction.response.send_message(
-                f"❌ Queue pro kit **{kit}** je momentálně zavřená! Počkej, až ji tester otevře.",
-                ephemeral=True,
-            )
-        if status == "cooldown":
-            remaining = result["remaining"]
-            days = int(remaining // (24 * 60 * 60 * 1000))
-            hours = int((remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000))
-            return await interaction.response.send_message(
-                f"❌ Máš cooldown na testy! Zkus to znovu za **{days}d {hours}h**.",
-                ephemeral=True,
-            )
-        if status == "duplicate":
-            return await interaction.response.send_message(
-                "❌ V této frontě už jsi zapsaný.", ephemeral=True
-            )
-
-        await update_panel(interaction.guild, kit_key, session_factory=sf)
-        await interaction.response.send_message(f"✅ Byl jsi přidán do fronty **{kit.strip()}**.")
+    async def queue_join(self, interaction: discord.Interaction, kit: str) -> None:
+        # Stejná atomická cesta jako tlačítko Join Queue.
+        await join_queue_interaction(interaction, kit)
 
     @queue.command(name="list", description="Zobrazí aktuální fronty a aktivní testery.")
     async def queue_list(self, interaction: discord.Interaction) -> None:

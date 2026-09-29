@@ -823,112 +823,34 @@ class TestLinkDiscordCog(unittest.TestCase):
         self.assertIn("no silent fallback", msg)
         self.assertEqual(self._players(), players_before)
 
-    def test_db_claim_creates_and_exports_json(self):
-        from db.repositories.players import CLAIM_CREATED as DB_CREATED
+    def _link(self, *, outcome=None, error=None):
+        from services.player_link import LinkOutcome
 
-        success, claim_patch, claim_mock = self._succeed(DB_CREATED)
-        export_mock = mock.AsyncMock(return_value=[])
-        with success, claim_patch, mock.patch(
-            "services.player_export.write_players_export", new=export_mock
-        ):
-            inter = self._claim(
-                _interaction(user=_admin_member()), NEW_ID, "CarlMC"
-            )
-        claim_mock.assert_awaited_once()
-        _, kwargs = claim_mock.await_args
-        self.assertEqual(kwargs["discord_id"], int(NEW_ID))
-        self.assertEqual(kwargs["ign"], "CarlMC")
-        export_mock.assert_awaited_once()
-        self.assertIsNotNone(export_mock.await_args.args[0])
+        self.cog.bot = SimpleNamespace(db_session_factory=object())
+        link = mock.AsyncMock(
+            return_value=outcome or LinkOutcome(status="created", ign="CarlMC", player_id=1),
+            side_effect=error,
+        )
+        admin = _admin_member()
+        admin.id = 5
+        inter = _interaction(user=admin)
+        inter.guild.get_member = mock.MagicMock(return_value=None)
+        with mock.patch("services.player_link.link_ign", new=link):
+            self._claim(inter, NEW_ID, "CarlMC")
+        return inter, link
+
+    def test_db_link_uses_link_service(self):
+        inter, link = self._link()
+        self.assertEqual(link.await_args.args, (NEW_ID, "CarlMC"))
+        self.assertIsNotNone(link.await_args.kwargs["actor_id"])
         embed = inter.followup.send.await_args.kwargs["embed"]
         self.assertIn("Vytvořen nový hráč", embed.description)
-        self.assertIn("PostgreSQL: claim proveden", embed.description)
-        self.assertIn("players.json export: aktualizováno", embed.description)
 
-    def test_db_conflict_is_loud_and_json_unchanged(self):
-        from db.repositories.players import PlayerIdentityError, PlayerRepository
+    def test_link_refusal_is_reported(self):
+        from services.player_link import REFUSE_IGN_TAKEN, LinkRefused
 
-        class FakeTransaction:
-            def __init__(self, factory):
-                pass
-
-            async def __aenter__(self):
-                return object()
-
-            async def __aexit__(self, *args):
-                return False
-
-        players_before = self._players()
-        self.cog.bot = SimpleNamespace(db_session_factory=object())
-        with mock.patch(
-            "db.services.session.transaction",
-            lambda sf: FakeTransaction(sf),
-        ), mock.patch.object(
-            PlayerRepository,
-            "claim_discord_id",
-            new=mock.AsyncMock(
-                side_effect=PlayerIdentityError("IGN patří jinému hráči")
-            ),
-        ):
-            inter = self._claim(
-                _interaction(user=_admin_member()), NEW_ID, "AliceMC"
-            )
-        msg = inter.followup.send.await_args.args[0]
-        self.assertIn("patří jinému hráči", msg)
-        self.assertEqual(self._players(), players_before)
-
-    def test_db_failure_is_loud_json_unchanged(self):
-        from db.repositories.players import PlayerRepository
-
-        class FakeTransaction:
-            def __init__(self, factory):
-                pass
-
-            async def __aenter__(self):
-                return object()
-
-            async def __aexit__(self, *args):
-                return False
-
-        players_before = self._players()
-        self.cog.bot = SimpleNamespace(db_session_factory=object())
-        with mock.patch(
-            "db.services.session.transaction",
-            lambda sf: FakeTransaction(sf),
-        ), mock.patch.object(
-            PlayerRepository,
-            "claim_discord_id",
-            new=mock.AsyncMock(side_effect=RuntimeError("db down")),
-        ):
-            inter = self._claim(
-                _interaction(user=_admin_member()), NEW_ID, "CarlMC"
-            )
-        msg = inter.followup.send.await_args.args[0]
-        self.assertIn("NEPROVEDEN", msg)
-        self.assertIn("silent JSON fallback", msg)
-        self.assertEqual(self._players(), players_before)
-
-    def test_json_export_failure_keeps_db_claim(self):
-        from db.repositories.players import CLAIM_CREATED as DB_CREATED
-
-        players = _players()
-        players.append({"username": "CarlMC", "discordId": OTHER_ID,
-                        "modes": {}, "history": {}})
-        _write("players.json", players)
-        success, claim_patch, _ = self._succeed(DB_CREATED)
-        export_mock = mock.AsyncMock(side_effect=RuntimeError("export fail"))
-        with success, claim_patch, mock.patch(
-            "services.player_export.write_players_export", new=export_mock
-        ):
-            inter = self._claim(
-                _interaction(user=_admin_member()), NEW_ID, "CarlMC"
-            )
-        embed = inter.followup.send.await_args.kwargs["embed"]
-        self.assertIn("export selhal", embed.description)
-        self.assertIn("DB claim zůstává", embed.description)
-        carl = next(p for p in self._players() if p["username"] == "CarlMC")
-        self.assertEqual(carl["discordId"], OTHER_ID)  # export se neprovedl
-
+        inter, _ = self._link(error=LinkRefused(REFUSE_IGN_TAKEN, ign="CarlMC"))
+        self.assertIn("už je propojené", inter.followup.send.await_args.args[0])
 
 if __name__ == "__main__":
     unittest.main()

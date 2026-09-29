@@ -163,8 +163,8 @@ async def credit_tester(
 ) -> None:
     """Ruční připsání historických testů (/addtest) do ledgeru tester_credits."""
     async with db_transaction(session_factory) as session:
-        player = await PlayerRepository().get_or_create_by_discord_id(
-            session, discord_id=int(tester_id), ign=""
+        player = await PlayerRepository().get_or_create_shell(
+            session, discord_id=int(tester_id)
         )
         await TesterCreditRepository().credit(
             session, tester_id=player.id, month=month, amount=amount

@@ -103,6 +103,33 @@ async def _remove_obsolete_guild_commands(
     return removed
 
 
+async def _remove_global_commands(tree) -> list:
+    """Smaže VŠECHNY globální příkazy TÉTO aplikace (jen v guild režimu).
+
+    Když bot dřív běžel bez ``GUILD_ID``, zaregistroval příkazy globálně. Ty
+    na Discordu zůstaly a klient pak ukazuje každý příkaz dvakrát (globální
+    + guild kopie). V guild režimu globální scope nepotřebujeme, takže se
+    vyčistí; API je scoped na aplikaci, cizích botů se to nedotkne.
+    """
+    app_id = getattr(getattr(tree, "client", None), "application_id", None)
+    http = getattr(tree, "_http", None)
+    try:
+        fetched = await tree.fetch_commands()
+    except (discord.Forbidden, discord.HTTPException) as err:
+        log.warning("Nelze načíst globální příkazy (úklid duplicit): %s", err)
+        return []
+    if app_id is None or http is None:
+        return []
+    removed: list = []
+    for cmd in fetched:
+        try:
+            await http.delete_global_command(app_id, cmd.id)
+            removed.append(cmd.name)
+        except (discord.Forbidden, discord.HTTPException) as err:
+            log.warning("Nelze smazat globální příkaz %s: %s", cmd.name, err)
+    return removed
+
+
 async def sync_commands(
     tree, *, guild_id: Optional[int] = None
 ) -> dict:
@@ -113,8 +140,9 @@ async def sync_commands(
     * ``guild_id`` nastaven – POUZE guild scope (produkce na jednom serveru):
       nejdřív se vyčistí obsolete guild příkazy téhle aplikace (viz
       ``_remove_obsolete_guild_commands``), pak se globální příkazy zkopírují
-      do guildy a nasyncují. Globální scope se NIKDY nedotýká → duplicity
-      global+guild nevznikají.
+      do guildy a nasyncují a nakonec se smažou globální registrace této
+      aplikace z dřívějších nasazení (``_remove_global_commands``) – jinak
+      Discord ukazuje každý příkaz dvakrát (globální + guild).
     * ``guild_id`` None – POUZE globální scope (default/dev): ``tree.sync()``.
       Guildy se NIKDY nedotýká.
 
@@ -134,11 +162,13 @@ async def sync_commands(
 
     tree.copy_global_to(guild=guild)
     synced = await tree.sync(guild=guild)
+    removed_global = await _remove_global_commands(tree)
     return {
         "scope": "guild",
         "guild_id": guild_id,
         "synced": len(synced),
         "removed_guild": removed,
+        "removed_global": removed_global,
     }
 
 
@@ -248,7 +278,8 @@ class DachshundTiersBot(commands.Bot):
                     removed = ", ".join(info["removed_guild"]) or "žádné"
                     extra = (
                         f" [guild {info['guild_id']}, "
-                        f"odstraněno {len(info['removed_guild'])} obsolete: {removed}]"
+                        f"odstraněno {len(info['removed_guild'])} obsolete: {removed}, "
+                        f"{len(info.get('removed_global', []))} globálních duplicit]"
                     )
                 log.info(
                     "Synchronizováno %d slash příkazů [scope=%s]%s",

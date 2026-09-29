@@ -37,7 +37,7 @@ async def test_session_factory_is_required(tmp_path, monkeypatch):
     monkeypatch.setattr("storage.DATA_DIR", str(tmp_path))
     cases = (
         lambda: queue_service.join_queue(
-            "1", "alice", "AliceMC", "AnchorPvP",
+            "1", "alice", "AnchorPvP",
             joined_at_ms=_ms(), cooldown_ms=COOLDOWN_MS,
         ),
         lambda: queue_service.leave_queue("1", "AnchorPvP"),
@@ -86,7 +86,7 @@ async def test_no_json_mode_anymore(tmp_path, monkeypatch):
 
     with pytest.raises(TypeError):
         await queue_service.join_queue(
-            "1", "alice", "AliceMC", "AnchorPvP",
+            "1", "alice", "AnchorPvP",
             joined_at_ms=_ms(), cooldown_ms=COOLDOWN_MS,
         )
 

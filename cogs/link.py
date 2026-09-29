@@ -35,6 +35,15 @@ from services.minecraft_link import (
     start_link,
     unlink,
 )
+from services.player_link import (
+    LINK_ADOPTED,
+    LINK_CREATED,
+    LINK_MERGED,
+    LINK_RENAMED,
+    LinkRefused,
+    link_ign,
+    linked_ign,
+)
 
 log = logging.getLogger("dachshundtiers")
 
@@ -47,6 +56,41 @@ class MinecraftLink(commands.Cog):
 
     def _sf(self):
         return getattr(self.bot, "db_session_factory", None)
+
+    @app_commands.command(
+        name="linkign",
+        description="Propojí tvůj Discord účet s tvým Minecraft jménem (nutné pro frontu a tickety)",
+    )
+    @app_commands.describe(ign="Tvoje Minecraft jméno (IGN)")
+    async def linkign(self, interaction: discord.Interaction, ign: str) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ Pouze na serveru.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True)
+        session_factory = self._sf()
+        try:
+            outcome = await link_ign(
+                interaction.user.id,
+                ign,
+                session_factory=session_factory,
+                actor_name=str(interaction.user),
+            )
+        except LinkRefused as err:
+            return await interaction.followup.send(str(err), ephemeral=True)
+
+        await mirror_member(session_factory, interaction.user, command="/linkign")
+        text = {
+            LINK_CREATED: "✅ Propojeno: tvůj Discord je teď **{ign}**.",
+            LINK_ADOPTED: "✅ Propojeno s existujícím záznamem **{ign}** i s historií tierů.",
+            LINK_MERGED: "✅ Propojeno s **{ign}** a tvoje dřívější data se k němu přesunula.",
+            LINK_RENAMED: "✅ IGN změněno na **{ign}**.",
+        }.get(outcome.status, "ℹ️ Už jsi propojený jako **{ign}** – nic se neměnilo.")
+        await interaction.followup.send(
+            text.format(ign=outcome.ign)
+            + "\nTeď se můžeš připojit do fronty i otevřít HT3+ ticket.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="link",
@@ -93,10 +137,16 @@ class MinecraftLink(commands.Cog):
                 "❌ Propojování je dostupné jen s PostgreSQL backendem.", ephemeral=True
             )
 
+        ign = await linked_ign(interaction.user.id, session_factory=session_factory)
         status = await link_status(interaction.user.id, session_factory=session_factory)
+        if ign and not status.linked:
+            return await interaction.response.send_message(
+                f"✅ Jsi propojený jako **{ign}**. Změna IGN: `/linkign <nové IGN>`.",
+                ephemeral=True,
+            )
         if not status.discord_id and not status.linked:
             return await interaction.response.send_message(
-                "Zatím nejsi propojený. Spusť `/link`.", ephemeral=True
+                "Zatím nejsi propojený. Spusť `/linkign <tvoje IGN>`.", ephemeral=True
             )
 
         if not status.linked:
@@ -140,6 +190,25 @@ class MinecraftLink(commands.Cog):
             await interaction.response.send_message(
                 "Zatím nemáš žádné propojení.", ephemeral=True
             )
+
+
+async def mirror_member(session_factory, member, *, command: str) -> None:
+    """Hned po propojení zapíše tier role hráče do DB (nečeká na hodinovou
+    reconciliation). Selhání jen zaloguje – propojení už je uložené."""
+    from db.services.mirror_sync import DiscordSyncService
+
+    if not hasattr(member, "roles"):
+        return
+    try:
+        await DiscordSyncService().sync_guild(
+            session_factory,
+            members=[member],
+            command=command,
+            triggered_by=member.id,
+            triggered_by_name=str(member),
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Zrcadlení rolí po %s selhalo", command)
 
 
 async def setup(bot: commands.Bot) -> None:

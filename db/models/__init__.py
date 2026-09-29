@@ -17,6 +17,7 @@ from db.models.players import (
     KitRole,
     Player,
     PlayerCurrentTier,
+    PlayerPeakTier,
     TierDefinition,
     TierHistory,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "Player",
     "PlayerCurrentTier",
     "PlayerLinkToken",
+    "PlayerPeakTier",
     "Queue",
     "QueueEntry",
     "QueueTester",

@@ -48,6 +48,10 @@ class Player(Base):
         nullable=False,
         server_default=text("'discord'"),
     )
+    # Kdy hráč sám potvrdil, že IGN je jeho (/linkign, admin /linkdiscord).
+    # NULL = záznam vznikl jen z přezdívky na serveru / importu – do fronty
+    # ani do HT3+ ticketu takový hráč nesmí, dokud se nepropojí.
+    ign_linked_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -172,7 +176,7 @@ class PlayerCurrentTier(Base):
         Index("ix_cur_tier_kit", "kit_id", "tier_id"),
         Index("ix_cur_tier_role", "discord_role_id"),
         CheckConstraint(
-            "source IN ('discord_sync', 'promotion', 'manual')",
+            "source IN ('discord_sync', 'promotion', 'manual', 'retire')",
             name="source",
         ),
     )
@@ -214,7 +218,49 @@ class TierHistory(Base):
         ),
         Index("ix_th_kit", "kit_id"),
         CheckConstraint(
-            "source IN ('promotion', 'discord_sync', 'migration', 'manual', 'rollback')",
+            "source IN ('promotion', 'discord_sync', 'migration', 'manual', 'rollback', 'retire')",
             name="source",
+        ),
+    )
+
+PEAK_REASONS = ("days", "wins", "retire", "manual")
+
+
+class PlayerPeakTier(Base):
+    """Nejvyšší trvale dosažený tier hráče v kitu (peak) – nikdy se nemaže.
+
+    Jeden řádek na (hráč, kit); při dosažení vyššího peaku se přepíše jen
+    směrem nahoru. ``reason`` říká, čím hráč podmínku splnil.
+    """
+
+    __tablename__ = "player_peak_tiers"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    player_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("players.id"), nullable=False
+    )
+    kit_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("kits.id"), nullable=False
+    )
+    tier_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("tier_definitions.id"), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    achieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=utcnow,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("player_id", "kit_id", name="uq_peak_player_kit"),
+        CheckConstraint(
+            "reason IN ('days', 'wins', 'retire', 'manual')",
+            name="reason",
         ),
     )

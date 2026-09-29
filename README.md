@@ -5,6 +5,311 @@ turnaje). Port původního JS bota
 ([`kransagen/DACHSHUNDTIERSQBOT`](https://github.com/kransagen/DACHSHUNDTIERSQBOT))
 na **discord.py**.
 
+## 📖 Pro koho je tahle dokumentace
+
+| Jestliže jsi… | Čti |
+|---|---|
+| **Admin na Discordu** (řešíš tickety, fronty, výsledky) | **[Handbook pro administrátory](#handbook-pro-administrátory)** – hned níže |
+| Vývojář / provozovatel hostingu | [Architektura](#architektura) níž a dál |
+
+---
+
+# 📖 Handbook pro administrátory
+
+Vše, co potřebuješ k běžnému provozu. Žádné `alembic`, žádné `.env` –
+pokud neřešíš pády bota, tohle nepotřebuješ.
+
+## Kdo co může
+
+Oprávnění se nekontroluje přes Discord „Manage Roles“, ale přes **roli**:
+
+| Kdo | Jak se pozná | Co může |
+|---|---|---|
+| **Hráč** | propojený účet | `/link`, `/linkign`, `/linked`, `/unlink`, `/join`, `/list`, `/leaveq` + tlačítka v panelech |
+| **Tester** | má tester roli | + `/claim`, `/unclaim`, `/add`, `/remove`, `/seteval`, `/uneval`, `/result`, `/topresult`, `/turnajresult`, `/joinastester`, `/joinasqueue`, `/pull`, `/mktesterroom` |
+| **Admin** | má Discord **Administrator**, nebo roli z `ADMIN_ROLE_IDS` | + `/edituser`, `/linkdiscord`, `/addtest`, `/removetest`, `/removeplayertiers`, `/setkitrole`, `/unsetkitrole`, `/addkit`, `/removekit`, `/createturnaj`, `/deleteturnaj`, celé `/sync *`, `/dbstatus` |
+
+Tester roli určuje `TESTER_ROLE_IDS` (přesná ID rolí) — je-li nastaven, funguje
+**jen** přes ID, ne podle názvu. Bez něj stačí, že název tester role obsahuje
+`TESTER_ROLE_FRAGMENT` (default `tester`, case-insensitive — „Head Tester“ se
+pozná).
+
+> Když ti příkaz odpoví „❌ Pouze pro administrátory“, chybí ti **Discord
+> Administrator** nebo role z `ADMIN_ROLE_IDS`. Tester role nestačí.
+
+### ⚠️ Příkazy, které NEjsou v kódu zabezpečené
+
+Tady buď opatrní. Tyto příkazy **nemají v kódu žádnou kontrolu oprávnění** –
+může je použít kdokoli, kdo vidí příkaz (pokud jde o ne-guild registraci):
+
+| Příkaz | Proč je to problém |
+|---|---|
+| `/openq kit` | **vyčistí kanál kitu** a pošle panel, v jehož textu je `@everyone` (`cogs/queues.py`). Bez `allowed_mentions` to Discord zpracuje jako skutečný ping → kdokoli může spamovat ping serveru |
+| `/closeq kit` | kdokoli může zavřít frontu testerům |
+| `/addqchannel kit` | mění konfiguraci bota (kam chodí panely) |
+| `/sendht3` | spam panelu do kanálu |
+| `/pull kit` | vytáhne hráče z fronty do roomky |
+| `/mktesterroom` | vytvoří tester roomku |
+
+Pokud to chceš omezit, je to chyba, kterou je potřeba opravit v kódu –
+`has_admin_role()` jako první věc v callbacku (viz `/addkit`). Do té doby
+předpokládej, že je může spustit kdokoli, a hlaste to jako známé omezení.
+
+## ⚠️ Tři pravidla, která nesmíš porušit
+
+### 1. Nikdy nesahej na tier role ručně v Discordu
+
+Toto je nejdůležitější pravidlo a porušení je těžké odhalit.
+
+Bot **každou hodinu** zrcadlí Discord → databázi (`bot.py`, hodinová
+reconciliation). Takže když role na Discordu upravíš ručně, **nejpozději do
+hodiny se to propíše do databáze jako pravda** – bez záznamu v historii a bez
+záznamu, kdo to udělal. Výsledek je hráč s tichou historií, u které se nedozvíš,
+že jsi ji změnil ty.
+
+Upravuj tiery **pouze** přes:
+
+- `/result` – běžný tier test
+- `/topresult` – HT Fight
+- `/edituser` – ruční zásah s historií
+- `/sync discord-rollback` – vrácení botem provedené změny
+
+### 2. Cooldowny se neobchází
+
+| Cooldown | Doba | Kde |
+|---|---|---|
+| Mezi tier testy (libovolný kit) | **4 dny** | `PLAYER_COOLDOWN_MS` |
+| Mezi HT3+ tickety | **7 dní na kit** | `HT3_COOLDOWN_MS` |
+
+Znovuotevření ticketu (`🔓 Reopen Ticket`) podléhá **stejné** kontrole jako nový
+ticket. Není to výjimka. Pokud hráč tvrdí, že cooldown neplatí, nepomlčkej to –
+`/cooldown hráč` ukáže přesný zbývající čas.
+
+### 3. Neprováděj opravy dat, dokud nevíš, co se děje
+
+Každá oprava má **preview**. Před `apply` vždy pust preview a přečti si výstup:
+
+```
+/sync check                -> read-only diagnostika, nic nemění
+/sync web mode:preview     -> co přesně se zapíše na web
+/sync importdiscord mode:preview  -> jaké jsou rozdíly Discord vs DB
+/sync discord-rollback     -> defaultně dry run
+```
+
+## Tier žebříček
+
+Od nejhoršího po nejlepší:
+
+```
+LT5 → HT5 → LT4 → HT4 → LT3 → HT3 → LT2 → HT2 → LT1 → HT1
+```
+
+| Tier | Poznámka |
+|---|---|
+| `LT3 + eval` | **virtuální status**, ne žebříčkový stupeň. Hráč má pořád roli `LT3`, ale smí otevírat HT3+ tickety. V kódu `LT3E`. |
+| `R` + kód (např. `RLT2`) | **retired** – vyměněný tier. Role se zásadně nemaže ani nepřepisuje, hráči se přesměruje. |
+
+Když hráč v žebříčku postoupí o stupeň, dostane roli podle mapování
+(`/setkitrole`). Bez namapované role mu tier propíše v databázi, ale roli na
+Discordu nedostane.
+
+## Co bot hlídá sám
+
+Tyhle kontroly nejdou obejít a **nemá je smysl obcházet** – když ti bot
+zapře, hráč nesplňuje podmínky:
+
+- **Cooldown** – 4 dny mezi testy, 7 dní na kit mezi HT3+ tickety.
+- **Limit tieru** – ticket na tier *vyšší* než hráčův aktuální se odmítne
+  (LT5 hráč si neotevře HT5 ticket). **Retest na aktuálním tieru projde** vždy.
+- **Brána „bez evalu“** – HT3+ ticket otevřou jen hráči se statusem
+  `LT3 + eval` nebo s tierem HT3 a vyšším.
+
+## Běžný den: tier test
+
+| Krok | Kdo | Jak |
+|---|---|---|
+| 1. Otevřít frontu | admin | `/openq kit` |
+| 2. Hráč se zapíše | hráč | `/join kit`, nebo tlačítko **Join Queue** v panelu |
+| 3. Vybrat hráče | tester | `/pull kit` → vytvoří tester roomku |
+| 4. Zapsat výsledek | tester | `/result hrác ign kit tier score outcome` |
+| 5. Aktualizovat web | admin | `/sync web mode:preview` → `mode:apply` |
+
+**`/result` udělá všechno najednou:** nastaví 4denní cooldown, vyhodí hráče
+z fronty i roomky, uloží tier a zápis do historie, přičte test testerovi a pošle
+zprávu do výsledkového kanálu (HT3+ → `RESULT_CHANNEL_UPPER`, LT3 a níž →
+`RESULT_CHANNEL_LOWER`).
+
+- `tier` – `LT5`, `HT5`, `LT4`, `HT4`, `LT3`, `LT3 + eval`
+- `outcome` – `Tester Won` / `Tester Lost`
+- roli hráč dostane **podle mapování** `/setkitrole`, ne vlastním parametrem
+
+> Web (`players.json`) se po `/result` **neaktualizuje**. To dělá výhradně
+> `/sync web`. Když to zapomeneš, web bude ukazovat starý stav — to je
+> zamýšlené, ne chyba.
+
+## Běžný den: HT3+ ticket
+
+| Krok | Kdo | Jak |
+|---|---|---|
+| 1. Panel | admin | `/sendht3` |
+| 2. Hráč si otevře ticket | hráč | tlačítko v panelu → výběr kitu → modál (IGN + cílový tier) |
+| 3. Převzít ticket | tester | `/claim` nebo tlačítko **✅ Claim HT** |
+| 4. Vydat ticket | tester | tlačítko **🔒 Close Ticket** |
+| 5. Cooldown | bot | nastaví se sám, 7 dní na daný kit |
+
+Bot v modálu automaticky ověří **eval bránu**, **limit tieru** a **cooldown**.
+Když nepustí, napiš hráči *proč* – zpráva to říká.
+
+Tlačítka v ticket roomce: **✅ Claim HT**, **↩️ Unclaim**, **🔒 Close Ticket**,
+**🔓 Reopen Ticket**.
+
+Přidat do ticketu dalšího hráče: `/add hráč` (přístup + sledování), odebrat:
+`/remove hráč`.
+
+Eval (brána k HT3+):
+
+| Příkaz | Kdo | Efekt |
+|---|---|---|
+| `/seteval ign kit` | tester | hráč smí otevírat HT3+ tickety na ten kit |
+| `/uneval ign kit` | tester | odebere |
+
+## HT Fight: `/topresult`
+
+Jen pro testery. **Ne** je to žebříček testů.
+
+| Pole | Význam |
+|---|---|
+| `fight_tier` | tier, o který se hraje (např. `HT3`) |
+| `outcome` | `vyhrál` / `prohrál` |
+| `score` | skóre, např. `0-4` |
+| `opponent` | soupeř / tester |
+| `tier_status` | textový stav, např. `Zůstává Low Tier 3` |
+| `bridge` | **jen při výhře** – přeskočení o více stupňů (např. z LT3 rovnou na LT2) |
+
+Uvnitř HT Fight ticketu se hráč, IGN i kit vezmou automaticky z ticketu, takže
+je tam zadávat nemusíš. Výhra hráče **povyšuje**, prohra **tier nemění**.
+Zpráva jde veřejně do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`.
+V ticketu příkaz zároveň ticket zavře a nastaví cooldown.
+
+> `bridge` je skutečné přeskočení žebříčku. Používej ho jen tam, kde to opravdu
+> platí – bez něj se hráč posune jen o jeden stupeň.
+
+## Turnaje
+
+| Příkaz | Kdo | Popis |
+|---|---|---|
+| `/createturnaj role skupiny hodiny kit tier` | admin | vytvoří turnaj, kategorii a přihlašovací kanál |
+| `/turnajresult kit hráč z_tieru na_tier` | tester | zapíše zápas do `TOURNAMENT_RESULT_CHANNEL_ID` |
+| `/deleteturnaj kit` | admin | **smaže turnaj i jeho kanály** |
+
+Po deadlinu se přihlašování uzavře, hráči se rozdělí do skupin (skupinové
+roomky) a vylosují se 1v1 zápasy.
+
+## Správa hráčů
+
+### `/edituser hráč` – hlavní nástroj
+
+Otevře editor s pěti akcemi:
+
+| Tlačítko | Kdy použít |
+|---|---|
+| 🎭 **Změnit Discord ID** | hráč si změnil Discord účet. **17–19 číslic.** Konflikt (stejný IGN, jiné ID) se nikdy neřeší automaticky – uvidíš ho v historii |
+| ⚔️ **Změnit IGN** | překlep nebo změna jména ve hře |
+| 🏆 **Změnit tier kitu** | oprava tieru. Zapíše se do historie |
+| ⏳ **Cooldowny** | zkrácení / prodloužení cooldownu (např. omluva) |
+| 📜 **Historie** | jen zobrazení, nemění nic |
+
+Bez historie se nepoužívá – použij `/sync data` nebo `/edituser`, ne přímé
+zásahy do role.
+
+### Propojení Discord ↔ Minecraft
+
+| Příkaz | Kdo | Popis |
+|---|---|---|
+| `/link` | hráč | vygeneruje jednorázový kód (platí **15 minut**) |
+| `/linkign ign` | hráč | propojí rovnou podle zadaného IGN. Vrátí, jestli propojení nově vytvořil, převzal cizí záznam, sloučil, nebo jen přejmenoval |
+| `/linked` | hráč | ukáže stav propojení a případný čekající kód |
+| `/unlink` | hráč | zruší propojení (záznam hráče v DB zůstává) |
+| `/linkdiscord hrác ign` | **admin** | nucené propojení, když hráč neprojde sám |
+
+Dokončení kódu z `/link` se ověřuje **na straně Minecraftu** – proto
+Discordový příkaz nikdy nepřijímá UUID od volajícího, jinak by si mohl
+propojit kdokoli cizí účet. Když hráč tvrdí, že propojení nefunguje,
+nech ho vygenerovat nový `/link` (starý kód vypršel) a ověř v `/linked`, že
+čeká kód.
+
+### Když `/linkign` odmítne
+
+`/linkign` samo sebe poctivě odmítne, a to je vždy dobře znamení – **nepomáhej
+hráci tím, že to obejdeš**. Každá zpráva říká, koho kontaktovat:
+
+| Odmítnutí | Co znamená | Kdo to spraví |
+|---|---|---|
+| „IGN už je propojené s jiným Discord účtem“ | cizí účet drží ten IGN. **Nikdy nepřepisuj** | admin přes `/edituser` → 🎭 Změnit Discord ID |
+| „Už jsi propojený jako X a IGN Y má vlastní historii“ | dva záznamy se nesmí spojit automaticky | admin – přesun historie ručně |
+| „Záznamy nejde sloučit (oba mají cooldown na stejný kit)“ | konflikt při sloučení | admin |
+| „Neplatné IGN“ | Minecraft jméno má 3–16 znaků (písmena, čísla, `_`) | hráč |
+
+## Když něco nefunguje
+
+Začni **read-only** příkazem. `/sync check` nic nemění, ale řekne, kde je
+problém.
+
+| Co pozoruješ | Co spustit | Co zjistíš |
+|---|---|---|
+| „Nefunguje to“ / „nesouhlasí to“ | `/sync check` | Discord × DB × web + integrita, agregováno OK/WARNING/CONFLICT/ERROR |
+| Chceš zúžit problém | `/sync check area:roles` | jen jedna oblast |
+| „Co bot právě běží?“ | `/verze` | commit + stav `/result` |
+| „Jak dlouho má hráč cooldown?“ | `/cooldown hráč` | přesné cooldowny, read-only |
+| Hráč má jiný Discord účet než IGN | `/edituser` → 🎭 Změnit Discord ID | 17–19 číslic, jde do historie |
+| Web ukazuje starý stav | `/sync web mode:preview` | co přesně chybí; pak `mode:apply` |
+| Zmizela role / rozdíl Discord vs DB | `/sync importdiscord mode:preview` | náhled rozdílů, **nic nezapisuje** |
+| „Udělal jsem chybu v rolích“ | `/sync discord-rollback` | **dry run defaultně** – nejdřív si přečti, až pak `mode:apply` |
+| Změna se nepropisuje | `/dbstatus` | dostupnost DB a počty (nikdy neukáže host/heslo) |
+
+`/sync check` umí filtrovat podle oblasti — hodnoty pro `area` jsou:
+`all` (výchozí), `identity`, `tiers`, `roles`, `web`, `data`, `db`.
+
+### `/sync discord-rollback` – tlačí po souvislosti
+
+Rollback vrátí Discord do stavu **před** posledním aplikovaným `/sync discord`
+a jde **výhradně** přes `memberId`/`roleId` z auditu. Před změnou kontroluje,
+jestli hráč nebyl mezitím znovu povýšen – když ano, rollback ho přeskočí a
+upozorní (aby ti to neshodil zpět).
+
+Vždy nejdřív defaultní `mode:preview`, výstup si přečti, a teprve pak
+potvrď. Cílový sync lze vybrat přes `target_ts`.
+
+## ⚠️ Co je obtížné vzít zpět
+
+| Operace | Co se stane | Bezpečnější varianta |
+|---|---|---|
+| `/sync discord-rollback mode:apply` | vrací role do stavu před syncem | nejdřív `mode:preview` |
+| `/removeplayertiers ign` | hráči zmizí **všechny** aktuální tiery. **Historie zůstává.** | `/edituser` a změň jen dotčený kit |
+| `/deleteturnaj kit` | **smaže kanály turnaje** | – |
+| `/sync data` (po potvrzení) | opraví neautoritativní nesrovnalosti | nejdřív `/sync check` |
+| ruční editace tier role | propíše se do DB do hodiny, bez historie | `/result` / `/edituser` |
+| `/sync web mode:apply` | přepíše web soubor | `mode:preview` |
+
+## Nový kit od nuly
+
+```
+/addkit kit        →  /addqchannel kit   →  /openq kit
+      ↓                                   ↑
+vytvoř role tierů na serveru                │
+      ↓                                   │
+/setkitrole kit tier role  (opakuj pro každý tier)
+```
+
+Bez `/setkitrole` hráč dostane tier v DB, ale žádnou roli na Discordu.
+
+---
+
+# 🛠️ Pro vývojáře a provozovatele
+
+Zbytek této dokumentace. Pokud jsi admin a došel jsi sem omylem, vrať se k
+[handbooku](#handbook-pro-administrátory).
+
 ## Architektura
 
 - **Discord je jediná autorita aktuálního tieru hráče.** Role na Discordu se
@@ -46,15 +351,15 @@ Podrobnosti a auditní důkaz viz `docs/PHASE_G0_FINAL_REPORT.md` a
 | `/openq kit` | Otevře frontu pro kit – vyčistí kanál kitu a pošle živý panel (embed + tlačítka) s `@everyone`. |
 | `/closeq kit` | Zavře frontu (jen bez čekajících testerů). |
 | `/addqchannel kit [kanal]` *(admin)* | Nastaví kanál panelu fronty pro kit. |
-| `/queue join ign kit` | Přidá se do fronty (kontrola 4denního cooldownu). |
-| `/queue joinastester` | Zaregistruje testera jako globálně aktivního. |
-| `/queue joinasqueue kit` | Tester se přidá do fronty jako další tester. |
-| `/queue leaveq kit` | Tester opustí frontu. |
-| `/queue list` | Přehled front a aktivních testerů. |
-| `/queue pull` | Vytáhne prvního hráče z fronty do vybrané roomky. |
+| `/join kit` | Přidá se do fronty (kontrola 4denního cooldownu). |
+| `/joinastester` | Zaregistruje testera jako globálně aktivního. |
+| `/joinasqueue kit` | Tester se přidá do fronty jako další tester. |
+| `/leaveq kit` | Tester opustí frontu. |
+| `/list` | Přehled front a aktivních testerů. |
+| `/pull kit` | Vytáhne prvního hráče z fronty do vybrané roomky. |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
 | `/skip hrac` | Skipne AFK hráče – vyhodí ho z roomky i z fronty. |
-| `/mktesterroom [hrac] [kategorie]` | Soukromá tester roomka pro pullnutí hráče. |
+| `/mktesterroom kit [hrac] [kategorie]` | Soukromá tester roomka pro pullnutí hráče. |
 
 Tlačítka panelu: **Join Queue** (modál s Minecraft IGN), **Leave Queue**,
 **Pull Player ⚔️** (výběr roomky). Panel se aktualizuje automaticky.
@@ -66,7 +371,7 @@ Tlačítka panelu: **Join Queue** (modál s Minecraft IGN), **Leave Queue**,
 ### 📝 Výsledky tier testů
 | Příkaz | Popis |
 |---|---|
-| `/result hrac ign kit tier score outcome [add_role] [remove_role]` | Zápis výsledku. Tier: `LT5/HT5/LT4/HT4/LT3/LT3+eval`. Nový kit se zaregistruje automaticky; role tieru se rozdá dle `/setkitrole`. |
+| `/result hrac ign kit tier score outcome [notes]` | Zápis výsledku. Tier: `LT5/HT5/LT4/HT4/LT3/LT3+eval`. Outcome: `Tester Won`/`Tester Lost`. Nový kit se zaregistruje automaticky; roli hráč dostane dle mapování `/setkitrole` (příkaz žádnou roli nenastavuje). |
 | `/testerstats tester` | Portfolio testera (počty testů, oblíbený kit, tier, čas). |
 | `/testersstats current\|all` | Žebříček testerů (měsíc / vše). |
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |
@@ -108,18 +413,25 @@ podpříkazy zatím zapisují audit ještě přes JSON dokumenty v tabulce
 |---|---|
 | `/sendht3` | Pošle panel „Žádost o TierTest“ s výběrem kitu. |
 | `/cooldown hrac` | Zobrazí HT3+ cooldowny hráče. |
+| `/claim` *(tester)* | Převzme aktuální HT ticket (také tlačítko **✅ Claim HT**). |
+| `/unclaim` *(tester)* | Vzdá se ticketu (také tlačítko **↩️ Unclaim**). |
 | `/add hrac` | Přidá hráče do aktuálního HT ticketu/roomky. |
+| `/remove hrac` | Odebere hráče z ticketu (zruší přístup). |
 | `/seteval ign kit` *(tester)* | Nastaví „LT3 + eval“ – hráč smí otevírat HT3+ tickety. |
 | `/uneval ign kit` *(tester)* | Odebere „LT3 + eval“. |
 
 Tok: výběr kitu → kontrola 7denního cooldownu → modál (IGN + cílový tier) →
 ticket roomka → tlačítko **🔒 Close Ticket** (nastaví cooldown, smaže roomku).
 
-- **Bez bypassu cooldownu:** znovuotevření ticketu se stejnou kontrolou
-  cooldownu jako nový ticket.
-- **Limit tieru:** ticket na tier vyšší než hráčův aktuální (žebříček
-  `LT5 < HT5 < LT4 < HT4 < LT3 < LT3+eval < HT3 < LT2 < HT2 < LT1 < HT1`) se
-  zablokuje s vysvětlením. Retest na aktuálním tieru projde.
+- **Bez bypassu cooldownu:** znovuotevření ticketu (**🔓 Reopen Ticket**) se
+  stejnou kontrolou cooldownu jako nový ticket.
+- **Limit tieru:** ticket na tier vyšší než hráčův aktuální se zablokuje s
+  vysvětlením. Žebříček pro limit je
+  `LT5 < HT5 < LT4 < HT4 < LT3 < LT3+eval < HT3 < LT2 < HT2 < LT1 < HT1` –
+  „LT3+eval“ (`LT3E`) je zde virtuální status: hráč má pořád roli `LT3`, ale
+  retest na `HT3` z něj projde. Retest na aktuálním tieru projde vždy.
+  (Kanonický katalogový žebříček v `db/tier_catalog.py` `LT3E` neobsahuje –
+  to je jen stav, ne stupeň.)
 - **Brána „Bez evalu“:** HT3+ ticket otevřou jen hráči se statusem
   „LT3 + eval“ nebo tierem HT3+.
 - Kategorie ticket roomky je nastavitelná per kit (`HT3_TICKET_CATEGORIES_JSON`).
@@ -213,7 +525,11 @@ sám, žádná instalace serveru není potřeba):
 ### Nastavení bota na Discord Developer Portalu
 - Intents: **Guilds**, **Guild Messages**, **Message Content**.
 - Oprávnění: *Manage Channels*, *Manage Roles*, *Send Messages*.
-- Role testera stačí, aby obsahovala „tester" v názvu (case-insensitive).
+- Tester roli stačí, aby obsahovala „tester" v názvu (case-insensitive) — **pokud
+  není nastaven `TESTER_ROLE_IDS`**. S allowlistem rolí musí být její ID v
+  `TESTER_ROLE_IDS`, jinak přihlášený tester nebude testerem.
+- Admin příkazy vyžadují Discord **Administrator**, nebo roli z
+  `ADMIN_ROLE_IDS`.
 
 ## Konfigurace
 
@@ -228,7 +544,9 @@ sám, žádná instalace serveru není potřeba):
 | `TESTER_ROOM_CATEGORY_ID` | Kategorie pro tester roomky (`0` = bez kategorie). |
 | `TOURNAMENT_RESULT_CHANNEL_ID` | Kanál pro `/turnajresult`. |
 | `GUILD_ID` | Scope registrace příkazů – nastaveno = jen tato guilda, prázdné = globálně. |
-| `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |
+| `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`, case-insensitive). Používá se **jen když není nastaven `TESTER_ROLE_IDS`**. |
+| `TESTER_ROLE_IDS` | Allowlist ID tester rolí (čárkami). Je-li nastaven, tester se pozná **výhradně** podle přesného ID role – název se už nehledá. |
+| `ADMIN_ROLE_IDS` | Allowlist ID admin rolí (čárkami). Když je nastaven, tyto role mají admin práva; bez něj (i s nimi) rozhoduje Discord oprávnění **Administrator**. |
 | `GITHUB_*` | Volitelný export `players.json` na GitHub. |
 | `DATABASE_URL` | **Povinné.** PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot nenastartuje. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL` (bot URL sestaví sám). |

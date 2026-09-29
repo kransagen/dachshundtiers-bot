@@ -5,8 +5,9 @@ Pokrývají zadání:
   ``sync_commands`` nic nepřidává),
 - globální a guild scope se nikdy neplní současně,
 - ``copy_global_to`` nevytváří duplicitní registrace (a je idempotentní),
-- migrace bezpečně odstraní JEN obsolete guild příkazy téhle aplikace
-  (globální scope se nedotýká, cizí aplikace se nedotýká),
+- migrace bezpečně odstraní obsolete guild příkazy téhle aplikace a v guild
+  režimu i její staré globální registrace (duplicity v klientovi); cizí
+  aplikace se nedotýká,
 - startovní sync je idempotentní a běží právě jednou za proces (guard),
 - selhání fetche při migraci bot neshodí.
 """
@@ -109,8 +110,7 @@ class SyncCommandsTests(unittest.TestCase):
                 guild=discord.Object(id=777)
             )
             tree.sync.assert_awaited_once_with(guild=discord.Object(id=777))
-            # žádné globální mazání/přepis
-            tree._http.delete_global_command.assert_not_awaited()
+            # žádný globální PUT – jen sync guildy
             for call in tree.sync.await_args_list:
                 self.assertIn("guild", call.kwargs)
 
@@ -175,7 +175,35 @@ class SyncCommandsTests(unittest.TestCase):
 
         asyncio.run(main())
 
-    def test_migration_never_touches_global_or_other_scopes(self):
+    def test_guild_mode_removes_stale_global_commands(self):
+        """Staré globální registrace = každý příkaz v klientovi 2×."""
+        async def main():
+            tree = _mock_tree(local=("result", "sync"))
+            tree.fetch_commands = mock.AsyncMock(
+                side_effect=lambda guild=None: (
+                    [SimpleNamespace(id=1, name="result"), SimpleNamespace(id=2, name="sync")]
+                    if guild is not None
+                    else [SimpleNamespace(id=50, name="result"), SimpleNamespace(id=51, name="sync")]
+                )
+            )
+            info = await bot_module.sync_commands(tree, guild_id=777)
+
+            self.assertEqual(sorted(info["removed_global"]), ["result", "sync"])
+            deleted = [c.args for c in tree._http.delete_global_command.await_args_list]
+            self.assertEqual(deleted, [(999, 50), (999, 51)])
+            tree._http.delete_guild_command.assert_not_awaited()
+
+        asyncio.run(main())
+
+    def test_global_mode_never_deletes_global_commands(self):
+        async def main():
+            tree = _mock_tree(local=("result",))
+            await bot_module.sync_commands(tree, guild_id=None)
+            tree._http.delete_global_command.assert_not_awaited()
+
+        asyncio.run(main())
+
+    def test_migration_never_touches_other_scopes(self):
         async def main():
             tree = _mock_tree(
                 local=("result",),
@@ -183,7 +211,6 @@ class SyncCommandsTests(unittest.TestCase):
             )
             await bot_module.sync_commands(tree, guild_id=777)
 
-            tree._http.delete_global_command.assert_not_awaited()
             self.assertEqual(
                 tree._http.delete_guild_command.await_args.args[1], 777
             )

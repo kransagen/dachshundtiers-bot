@@ -214,3 +214,53 @@ async def test_kv_table_wins_over_file(session_factory, clean_db, data_dir, tmp_
     finally:
         async with db_engine.begin() as conn:
             await conn.execute(text(f"DROP TABLE IF EXISTS {KV_TABLE}"))
+
+
+async def test_kit_roles_for_unknown_kit_create_active_kit(session_factory, clean_db, data_dir, tmp_path):
+    from db.services.config_validation import validate_kit_role_configuration
+
+    _write(data_dir, "kit_roles.json", {"NetheriteSword": {"LT2": "5001"}, "NewKit": {"LT5": "5003"}})
+    await _run(session_factory, data_dir, tmp_path, apply=True)
+    async with transaction(session_factory) as session:
+        new = (await session.execute(select(Kit).where(Kit.key == "newkit"))).scalar_one()
+        assert new.active is True
+        result = await validate_kit_role_configuration(session, guild_role_ids={5001, 5003})
+    assert result.mapping_count == 2
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, None), ("", None), ("preview", "preview"), ("APPLY", "apply"), ("yes", None)],
+)
+def test_startup_mode(monkeypatch, value, expected):
+    from tools.legacy_import import startup_mode
+
+    if value is None:
+        monkeypatch.delenv("LEGACY_IMPORT", raising=False)
+    else:
+        monkeypatch.setenv("LEGACY_IMPORT", value)
+    assert startup_mode() == expected
+
+
+@pytest.mark.parametrize("mode", ["preview", "apply"])
+async def test_bot_startup_runs_legacy_import_when_requested(monkeypatch, mode):
+    from unittest import mock
+
+    import bot
+
+    monkeypatch.setenv("LEGACY_IMPORT", mode)
+    monkeypatch.setenv("AUTO_MIGRATE", "0")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@h/db")
+    run = mock.AsyncMock(return_value={
+        "mode": mode, "backup_dir": "/x", "sources": {}, "conflicts_kv_over_file": [],
+        "unreadable": [], "counts": {}, "issues": [], "noop": True,
+    })
+    with (
+        mock.patch("db.validation.validate_configured_role_ids", return_value=[]),
+        mock.patch("db.validation.validate_database",
+                   mock.AsyncMock(return_value={"schema_revision": "x"})),
+        mock.patch("tools.legacy_import.run_legacy_import", run),
+    ):
+        engine, _sf = await bot._init_database()
+        await engine.dispose()
+    assert run.await_args.kwargs["apply"] is (mode == "apply")

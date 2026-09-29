@@ -545,6 +545,28 @@ async def _init_database():
             "připojení nebo spusť `alembic upgrade head`."
         )
     session_factory = make_session_factory(engine)
+
+    from tools.legacy_import import run_legacy_import, startup_mode
+    from tools.legacy_import import _print_summary as print_import_summary
+
+    mode = startup_mode()
+    if mode is not None:
+        log.warning("LEGACY_IMPORT=%s – spouštím import legacy JSON dat.", mode)
+        try:
+            summary = await run_legacy_import(session_factory, apply=mode == "apply")
+        except Exception:  # noqa: BLE001 – transakce je odvolaná, nic částečného
+            log.exception("Legacy import (%s) selhal – nic se nezapsalo.", mode)
+            await engine.dispose()
+            raise SystemExit("❌ Legacy import selhal. Viz log.")
+        print_import_summary(summary)
+        log.warning(
+            "Legacy import (%s) hotový, záloha: %s. %s",
+            mode,
+            summary["backup_dir"],
+            "Po kontrole nastav LEGACY_IMPORT=apply a restartuj."
+            if mode == "preview"
+            else "Odeber LEGACY_IMPORT z .env (opakování nic nezmění, jen dělá další zálohy).",
+        )
     return engine, session_factory
 
 

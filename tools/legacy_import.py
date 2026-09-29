@@ -339,7 +339,14 @@ class Importer:
             if not isinstance(tier_map, dict):
                 self.r.issue("kit_roles_malformed", str(kit_name), "Hodnota není objekt tier → role.")
                 continue
-            kit = await self.kit_for(kit_name)
+            kit = await self.kit_for(kit_name, create_inactive=False)
+            if kit is None:
+                # /setkitrole mapuje jen skutečné kity → založit jako aktivní.
+                kit = Kit(key=str(kit_name).strip().lower(), name=str(kit_name).strip(), active=True)
+                self.s.add(kit)
+                await self.s.flush()
+                self._kit_cache[kit.key] = kit
+                self.r.inc("kits_created")
             for code, role_id in tier_map.items():
                 rid = _as_int(role_id)
                 tier = await self.tier_for(code)
@@ -771,6 +778,14 @@ async def run_legacy_import(
         json.dumps(summary, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
     )
     return summary
+
+
+def startup_mode() -> Optional[str]:
+    """``LEGACY_IMPORT`` env for hostings without a shell: preview / apply / None."""
+    import os
+
+    value = os.getenv("LEGACY_IMPORT", "").strip().lower()
+    return value if value in ("preview", "apply") else None
 
 
 def _print_summary(summary: dict) -> None:

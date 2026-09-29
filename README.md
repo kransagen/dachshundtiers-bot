@@ -233,6 +233,7 @@ sám, žádná instalace serveru není potřeba):
 | `DATABASE_URL` | **Povinné.** PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot nenastartuje. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL` (bot URL sestaví sám). |
 | `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB (hodí se bez IPv6 trasy). |
+| `LEGACY_IMPORT` | `preview` / `apply`: jednorázový import starých JSON dat při startu (viz [Data](#data)). Po importu odeber. |
 | `AUTO_MIGRATE` | Default `1`: bot při startu sám spustí `alembic upgrade head` (hostingy bez konzole). `0` = migrace spouštíš ručně. |
 
 > Kanál panelu fronty jde nastavit i za běhu přes `/addqchannel`
@@ -281,6 +282,14 @@ dřívějšího režimu) převede do normalizovaných tabulek jeden příkaz:
 
 Příkaz načítá `.env`, takže stačí mít v něm `DATABASE_URL` (nebo
 `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD`).
+
+**Hosting bez konzole (Bot-Hosting/Pterodactyl):** import spustí bot sám
+při startu, hned po migraci schématu. Do `.env` přidej:
+
+1. `LEGACY_IMPORT=preview` → restart → v konzoli zkontroluj výpis (počty,
+   problémy, cestu k záloze). Nic se nezapíše.
+2. `LEGACY_IMPORT=apply` → restart → data se naimportují.
+3. Proměnnou odeber. Další běh by nic nezměnil, jen by dělal další zálohy.
 
 `data/` a `backups/` obsahují osobní údaje hráčů a jsou v `.gitignore` –
 nikdy je necommituj.

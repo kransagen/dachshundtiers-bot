@@ -86,7 +86,7 @@ class SyncRun(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "mode IN ('preview', 'apply', 'automatic', 'rollback')",
+            "mode IN ('preview', 'apply', 'automatic', 'rollback', 'observe')",
             name="mode",
         ),
         CheckConstraint(

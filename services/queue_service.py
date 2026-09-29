@@ -968,8 +968,9 @@ async def _db_removeq(session_factory, *, uid: str) -> Optional[dict]:
         await QueueEntryRepository().transition(
             session,
             entry_id=entry.id,
-            status=QUEUE_ENTRY_PULLED,
-            pulled_at=datetime.now(timezone.utc),
+            status=QUEUE_ENTRY_LEFT,
+            removed_at=datetime.now(timezone.utc),
+            removed_reason="removeq",
         )
         return out
 
@@ -987,9 +988,10 @@ async def removeq(
 async def _db_skip_player(session_factory, *, uid: str) -> dict:
     async with db_transaction(session_factory) as session:
         player = await PlayerRepository().get_by_discord_id(session, int(uid))
+        empty = {"channel_id": None, "kit_key": "", "was_pulled": False,
+                 "removed": False, "next": None}
         if player is None:
-            return {"channel_id": None, "kit_key": "", "was_pulled": False,
-                    "requeued": False, "moved": False, "next": None}
+            return empty
         pulled = await QueueEntryRepository().list_by_status(
             session, player_id=player.id, status=QUEUE_ENTRY_PULLED
         )
@@ -998,49 +1000,28 @@ async def _db_skip_player(session_factory, *, uid: str) -> dict:
         )
         entry = pulled[0] if pulled else (waiting[0] if waiting else None)
         if entry is None:
-            return {"channel_id": None, "kit_key": "", "was_pulled": False,
-                    "requeued": False, "moved": False, "next": None}
+            return empty
         channel_id = entry.room_channel_id
         kit = await session.get(Kit, entry.kit_id)
         kit_key = kit.key if kit is not None else ""
-        queue = await session.get(Queue, entry.queue_id)
-        was_pulled = bool(pulled)
-        in_queue = bool(waiting)
-        if pulled:
-            # E4 audit fix: requeue computes MAX(position)+1 — same shared
-            # state as enqueue, so serialize on the queue row before reading
-            # it (otherwise a concurrent join could insert the same position
-            # and the requeued player would silently invert queue order).
-            await session.execute(
-                text("SELECT id FROM queues WHERE id = :qid FOR UPDATE"),
-                {"qid": entry.queue_id},
-            )
-            await QueueEntryRepository().transition(
-                session,
-                entry_id=entry.id,
-                status="waiting",
-                pulled_at=None,
-                room_channel_id=None,
-            )
-            entry.position = await QueueEntryRepository().next_position(
-                session, queue_id=entry.queue_id
-            )
-            await session.flush()
-        requeued = was_pulled and not in_queue
-        moved = in_queue
+        await QueueEntryRepository().transition(
+            session,
+            entry_id=entry.id,
+            status=QUEUE_ENTRY_LEFT,
+            removed_at=datetime.now(timezone.utc),
+            removed_reason="skip",
+        )
         next_entry = None
-        if queue is not None:
-            listed = await QueueEntryRepository().list_waiting(
-                session, queue_id=queue.id
+        listed = await QueueEntryRepository().list_waiting(
+            session, queue_id=entry.queue_id
+        )
+        if listed:
+            n_player = await session.get(Player, listed[0].player_id)
+            next_entry = _db_entry_to_dict(
+                listed[0], n_player, kit.name if kit is not None else ""
             )
-            if listed:
-                n_player = await session.get(Player, listed[0].player_id)
-                next_entry = _db_entry_to_dict(
-                    listed[0], n_player, kit.name if kit is not None else ""
-                )
         return {"channel_id": channel_id, "kit_key": kit_key,
-                "was_pulled": was_pulled, "requeued": requeued,
-                "moved": moved, "next": next_entry}
+                "was_pulled": bool(pulled), "removed": True, "next": next_entry}
 
 
 async def skip_player(
@@ -1048,9 +1029,9 @@ async def skip_player(
     *,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
-    """Přeskočení AFK hráče: přesun na konec fronty (+ záznam roomky /skip).
+    """Skip hráče: vyhodí ho z roomky i z fronty (záznam → ``left``, důvod ``skip``).
 
-    Vrací {channel_id, kit_key, was_pulled, requeued, moved, next}.
+    Vrací {channel_id, kit_key, was_pulled, removed, next}.
     """
     uid = str(uid)
     return await _db_skip_player(session_factory, uid=uid)

@@ -148,25 +148,44 @@ async def test_sync_guild_multiple_tier_roles_never_writes_mirror(
     assert mirror is None
 
 
-async def test_sync_guild_missing_tier_is_report_only(session_factory, clean_db):
+async def test_sync_guild_member_without_tier_roles_is_silent(session_factory, clean_db):
+    await _seed(session_factory)
+    outcome = await DiscordSyncService().sync_guild(
+        session_factory, members=[MemberView(id=1111, role_ids=())]
+    )
+    assert outcome.observations_applied == 0
+    assert outcome.anomalies == 0
+    _run, actions = await _run_summary(session_factory, outcome.sync_run_id)
+    assert actions == []
+
+
+async def test_sync_guild_missing_on_discord_is_report_only(session_factory, clean_db):
     seeded = await _seed(session_factory)
-    members = [MemberView(id=1111, role_ids=())]
+    async with transaction(session_factory) as session:
+        await MirrorServiceRepository().apply_observation(
+            session,
+            player_id=seeded["player"].id,
+            kit_id=seeded["kit"].id,
+            tier_id=seeded["tier"].id,
+            observed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            source="promotion",
+        )
 
     outcome = await DiscordSyncService().sync_guild(
-        session_factory, members=members
+        session_factory, members=[MemberView(id=1111, role_ids=())]
     )
 
     assert outcome.observations_applied == 0
-    run, actions = await _run_summary(session_factory, outcome.sync_run_id)
-    assert any(
-        a.anomaly_category == "missing_tier" and a.status == SYNC_ACTION_ANOMALY
-        for a in actions
-    )
+    _run, actions = await _run_summary(session_factory, outcome.sync_run_id)
+    assert [(a.anomaly_category, a.status) for a in actions] == [
+        ("missing_on_discord", SYNC_ACTION_ANOMALY)
+    ]
+    assert outcome.changes[0].old_tier == "t2"
     async with transaction(session_factory) as session:
         mirror = await MirrorRepository().get_current(
             session, player_id=seeded["player"].id, kit_id=seeded["kit"].id
         )
-    assert mirror is None
+    assert mirror is not None and mirror.tier_id == seeded["tier"].id
 
 
 async def test_sync_guild_collects_unknown_roles(session_factory, clean_db):
@@ -179,11 +198,100 @@ async def test_sync_guild_collects_unknown_roles(session_factory, clean_db):
 
     assert outcome.observations_applied == 0
     assert outcome.unknown_roles == (99999,)
-    run, actions = await _run_summary(session_factory, outcome.sync_run_id)
-    assert any(
-        a.anomaly_category == "unknown_roles" and a.status == SYNC_ACTION_ANOMALY
-        for a in actions
+
+
+async def test_sync_guild_reads_roles_of_real_discord_members(session_factory, clean_db):
+    """discord.Member nemá ``role_ids`` – role se čtou z ``member.roles``."""
+    from types import SimpleNamespace
+
+    seeded = await _seed(session_factory)
+    member = SimpleNamespace(
+        id=1111, display_name="Mirror", roles=[SimpleNamespace(id=seeded["role_id"])]
     )
+    outcome = await DiscordSyncService().sync_guild(session_factory, members=[member])
+    assert outcome.failed_members == 0
+    assert outcome.tier_changes == 1
+
+
+async def test_sync_guild_unchanged_reobservation_writes_no_action(session_factory, clean_db):
+    seeded = await _seed(session_factory)
+    members = [MemberView(id=1111, role_ids=(seeded["role_id"],))]
+    await DiscordSyncService().sync_guild(session_factory, members=members)
+    second = await DiscordSyncService().sync_guild(session_factory, members=members)
+    assert second.tier_changes == 0
+    _run, actions = await _run_summary(session_factory, second.sync_run_id)
+    assert actions == []
+
+
+async def test_sync_guild_creates_missing_player_when_enabled(session_factory, clean_db):
+    from types import SimpleNamespace
+
+    seeded = await _seed(session_factory)
+    member = SimpleNamespace(
+        id=2222, display_name="NewGuy", roles=[SimpleNamespace(id=seeded["role_id"])]
+    )
+    outcome = await DiscordSyncService().sync_guild(
+        session_factory, members=[member], create_missing_players=True
+    )
+    assert outcome.created_players == 1
+    assert outcome.tier_changes == 1
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 2222)
+        assert player is not None and player.ign == "NewGuy"
+        mirror = await MirrorRepository().get_current(
+            session, player_id=player.id, kit_id=seeded["kit"].id
+        )
+    assert mirror.tier_id == seeded["tier"].id
+
+
+async def test_sync_guild_dry_run_writes_nothing(session_factory, clean_db):
+    from types import SimpleNamespace
+
+    from db.models import SyncRun
+
+    seeded = await _seed(session_factory)
+    member = SimpleNamespace(
+        id=2222, display_name="NewGuy", roles=[SimpleNamespace(id=seeded["role_id"])]
+    )
+    outcome = await DiscordSyncService().sync_guild(
+        session_factory, members=[member], create_missing_players=True, dry_run=True
+    )
+    assert outcome.dry_run is True and outcome.sync_run_id is None
+    assert [c.kind for c in outcome.changes] == ["player_created", "tier_added"]
+    async with transaction(session_factory) as session:
+        assert await PlayerRepository().get_by_discord_id(session, 2222) is None
+        assert (await session.execute(select(SyncRun))).scalars().all() == []
+
+
+async def test_sync_guild_db_error_in_one_member_does_not_abort_others(
+    session_factory, clean_db
+):
+    """Savepoint na člena: DB chyba u jednoho člena nerozbije transakci ostatních."""
+    from types import SimpleNamespace
+
+    seeded = await _seed(session_factory)
+    async with transaction(session_factory) as session:
+        await PlayerRepository().claim_discord_id(session, discord_id=3333, ign="Other")
+
+    service = DiscordSyncService()
+    original = service._mirror_service.apply_observations
+
+    async def flaky(session, *, player_id, **kwargs):
+        if player_id == seeded["player"].id:
+            from sqlalchemy import text
+
+            await session.execute(text("SELECT 1/0"))
+        return await original(session, player_id=player_id, **kwargs)
+
+    service._mirror_service.apply_observations = flaky
+    members = [
+        SimpleNamespace(id=1111, display_name="Mirror", roles=[SimpleNamespace(id=seeded["role_id"])]),
+        SimpleNamespace(id=3333, display_name="Other", roles=[SimpleNamespace(id=seeded["role_id"])]),
+    ]
+    outcome = await service.sync_guild(session_factory, members=members)
+    assert outcome.failed_members == 1
+    assert outcome.tier_changes == 1
+    assert outcome.status == SYNC_RUN_PARTIAL
 
 
 async def test_sync_guild_all_members_failed_marks_run_failed(

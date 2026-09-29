@@ -11,7 +11,7 @@ from sqlalchemy import select
 from db.models import QueueEntry, QueueTester
 from db.repositories.kits import KitRepository, ensure_dimensions
 from db.repositories.players import PlayerRepository
-from db.repositories.queues import QUEUE_ENTRY_PULLED, QueueRepository
+from db.repositories.queues import QUEUE_ENTRY_LEFT, QueueRepository
 from db.services.session import transaction
 from services import queue_service as qsvc
 
@@ -190,37 +190,68 @@ async def test_removeq_db(session_factory, clean_db):
                 select(QueueEntry.status).where(QueueEntry.player_id.is_not(None))
             )
         ).scalars().all()
-    assert status == [QUEUE_ENTRY_PULLED]
+    assert status == [QUEUE_ENTRY_LEFT]
 
 
-async def test_skip_pulled_player_db(session_factory, clean_db):
-    await _seed(session_factory)
+async def _join_two(session_factory):
     await qsvc.open_queue(
         "anchorpvp", "AnchorPvP", "111", "Opener", session_factory=session_factory
     )
-    await qsvc.join_queue("1", "alice", "AliceMC", "AnchorPvP",
-                          joined_at_ms=1_700_000_000_000,
-                          cooldown_ms=4 * 24 * 60 * 60 * 1000,
-                          session_factory=session_factory)
-    await qsvc.join_queue("2", "bob", "BobMC", "AnchorPvP",
-                          joined_at_ms=1_700_000_000_100,
-                          cooldown_ms=4 * 24 * 60 * 60 * 1000,
-                          session_factory=session_factory)
+    for uid, name, ign, ts in (("1", "alice", "AliceMC", 0), ("2", "bob", "BobMC", 100)):
+        await qsvc.join_queue(uid, name, ign, "AnchorPvP",
+                              joined_at_ms=1_700_000_000_000 + ts,
+                              cooldown_ms=4 * 24 * 60 * 60 * 1000,
+                              session_factory=session_factory)
 
-    pulled = await qsvc.removeq("1", session_factory=session_factory)
-    assert pulled["id"] == "1"
+
+async def _statuses(session_factory):
+    async with transaction(session_factory) as session:
+        rows = (
+            await session.execute(
+                select(QueueEntry.status, QueueEntry.removed_reason).order_by(QueueEntry.id)
+            )
+        ).all()
+    return [tuple(r) for r in rows]
+
+
+async def test_skip_pulled_player_removes_from_queue_db(session_factory, clean_db):
+    await _seed(session_factory)
+    await _join_two(session_factory)
+    async with transaction(session_factory) as session:
+        entry = (await session.execute(select(QueueEntry).order_by(QueueEntry.id))).scalars().first()
+        entry.status = "pulled"
+        entry.room_channel_id = 4242
 
     result = await qsvc.skip_player("1", session_factory=session_factory)
+    assert result["removed"] is True
     assert result["was_pulled"] is True
-    assert result["requeued"] is True
-    assert result["moved"] is False
+    assert result["channel_id"] == 4242
     assert result["kit_key"] == "anchorpvp"
     assert result["next"]["id"] == "2"
 
-    entries = await qsvc.list_queue_entries(
-        "anchorpvp", session_factory=session_factory
-    )
-    assert [e["id"] for e in entries] == ["2", "1"]
+    entries = await qsvc.list_queue_entries("anchorpvp", session_factory=session_factory)
+    assert [e["id"] for e in entries] == ["2"]
+    assert (await _statuses(session_factory))[0] == ("left", "skip")
+
+
+async def test_skip_waiting_player_removes_from_queue_db(session_factory, clean_db):
+    await _seed(session_factory)
+    await _join_two(session_factory)
+
+    result = await qsvc.skip_player("1", session_factory=session_factory)
+    assert result["removed"] is True
+    assert result["was_pulled"] is False
+    assert result["next"]["id"] == "2"
+    entries = await qsvc.list_queue_entries("anchorpvp", session_factory=session_factory)
+    assert [e["id"] for e in entries] == ["2"]
+
+
+async def test_skip_unknown_player_is_noop_db(session_factory, clean_db):
+    await _seed(session_factory)
+    await _join_two(session_factory)
+    result = await qsvc.skip_player("999", session_factory=session_factory)
+    assert result["removed"] is False
+    assert await _statuses(session_factory) == [("waiting", None), ("waiting", None)]
 
 
 async def test_set_queue_panel_and_message_id(session_factory, clean_db):

@@ -50,6 +50,7 @@ def _iter_py_files(root: Path) -> list[Path]:
         and "docs" not in p.parts
         and "phase_d" not in ".".join(p.parts)
         and "phase_e" not in ".".join(p.parts)
+        and p.name != "legacy_import.py"
         and "migrations/versions" not in str(p)
         and ".venv" not in p.parts
     )

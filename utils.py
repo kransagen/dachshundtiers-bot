@@ -1,11 +1,34 @@
 """Drobné pomocné funkce sdílené napříč cogami."""
 
+import asyncio
+import logging
 from datetime import datetime
 
 import discord
 from discord import app_commands
 
 from services.permissions import has_tester_role as _permissions_has_tester_role
+
+_log = logging.getLogger("dachshundtiers")
+
+# Silné reference na úlohy na pozadí – samotný ``asyncio.create_task`` drží
+# jen slabou referenci, takže by úlohu mohl uklidit GC a výjimka by zmizela.
+_background_tasks: "set[asyncio.Task]" = set()
+
+
+def _task_done(task: "asyncio.Task") -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        _log.error("Úloha na pozadí %s selhala", task.get_name(), exc_info=task.exception())
+
+
+def spawn(coro, *, name: str | None = None) -> "asyncio.Task":
+    """Spustí úlohu na pozadí, drží na ni referenci a zaloguje její pád."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_task_done)
+    return task
+
 
 # Výchozí sada kitů. Používá se, dokud není v ``kits`` žádný vlastní kit
 # (``services.kit_catalog.get_kits``) – už se nečte z data/kits.json.

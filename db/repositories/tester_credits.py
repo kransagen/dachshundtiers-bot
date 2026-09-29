@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import TesterCredit
@@ -12,20 +13,36 @@ class TesterCreditRepository:
     async def credit(
         self, session: AsyncSession, *, tester_id: int, month: str, amount: int
     ) -> TesterCredit:
-        """Accumulate ``amount`` for (tester, month) — one row per month."""
-        result = await session.execute(
-            select(TesterCredit).where(
-                TesterCredit.tester_id == tester_id,
-                TesterCredit.month == month,
+        """Accumulate ``amount`` for (tester, month) — one row per month.
+
+        A single ``INSERT … ON CONFLICT DO UPDATE`` so two concurrent credits
+        for the same month add up instead of one overwriting the other.
+        """
+        stmt = (
+            pg_insert(TesterCredit)
+            .values(tester_id=tester_id, month=month, amount=amount)
+            .on_conflict_do_update(
+                index_elements=[TesterCredit.tester_id, TesterCredit.month],
+                set_={"amount": TesterCredit.amount + amount},
             )
+            .returning(TesterCredit.id)
         )
-        row = result.scalar_one_or_none()
-        if row is not None:
-            row.amount += amount
-            return row
-        row = TesterCredit(tester_id=tester_id, month=month, amount=amount)
-        session.add(row)
+        row_id = (await session.execute(stmt)).scalar_one()
+        row = await session.get(TesterCredit, row_id, populate_existing=True)
         return row
+
+    async def lock_month(
+        self, session: AsyncSession, *, tester_id: int, month: str
+    ) -> TesterCredit:
+        """Ensure the (tester, month) row exists and lock it for update."""
+        await self.credit(session, tester_id=tester_id, month=month, amount=0)
+        result = await session.execute(
+            select(TesterCredit)
+            .where(TesterCredit.tester_id == tester_id, TesterCredit.month == month)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one()
 
     async def totals(self, session: AsyncSession, tester_id: int) -> dict[str, int]:
         """Total credits and per-month credits for a tester."""

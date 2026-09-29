@@ -190,6 +190,25 @@ class BotConfigRepository:
         )
         await session.flush()
 
+    async def merge(self, session: AsyncSession, key: str, patch: dict) -> None:
+        """Atomically merge ``patch`` into the stored JSONB object (``||``).
+
+        One statement, so two concurrent merges of different sub-keys both
+        survive (a read-modify-write in Python would lose one of them).
+        """
+        await session.execute(
+            pg_insert(BotConfig)
+            .values(key=key, value=patch)
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={
+                    "value": BotConfig.value.op("||")(pg_insert(BotConfig).excluded.value),
+                    "updated_at": datetime.now(timezone.utc),
+                },
+            )
+        )
+        await session.flush()
+
 
 class MigrationIssueRepository:
     """Unresolvable records found during JSON import (report, never guessed)."""

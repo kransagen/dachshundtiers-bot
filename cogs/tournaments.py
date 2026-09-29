@@ -27,7 +27,7 @@ from db.repositories.kits import KitRepository
 from db.repositories.tournaments import TournamentRepository
 from db.services.session import transaction
 from services.kit_catalog import get_kits
-from utils import has_tester_role, kit_autocomplete
+from utils import has_tester_role, kit_autocomplete, spawn
 from views import TournamentSignupView
 
 TOURNAMENT_TIERS = ["LT3", "HT3", "LT2", "HT2", "LT1", "HT1"]
@@ -162,7 +162,7 @@ class Tournaments(commands.Cog):
                     getattr(self.bot, "db_session_factory", None), guild, kit_key
                 )
 
-        asyncio.create_task(_task())
+        spawn(_task(), name="tournament-auto-end")
 
     # ------------------------------------------------------------------
     # /createturnaj

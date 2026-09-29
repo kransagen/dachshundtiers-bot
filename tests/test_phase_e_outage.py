@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
@@ -131,14 +130,20 @@ async def test_reconciliation_db_outage_loud_no_discord_mutation_no_json(
     await _seed_reconciliation(session_factory)
     member = SpyMember(id=1111, role_ids=(7777,))
 
-    @asynccontextmanager
-    async def boom_transaction(*args, **kwargs):
-        raise RuntimeError("DB outage")
-        yield  # unreachable — signalizuje, že session nikdy nevznikla
+    class _BoomSession:
+        async def __aenter__(self):
+            raise RuntimeError("DB outage")
 
-    monkeypatch.setattr("db.services.mirror_sync.transaction", boom_transaction)
+        async def __aexit__(self, *args):
+            return False
 
     service = ReconciliationService()
+    real_sync_guild = service._sync.sync_guild
+
+    async def sync_guild_with_outage(_sf, **kwargs):
+        return await real_sync_guild(lambda: _BoomSession(), **kwargs)
+
+    monkeypatch.setattr(service._sync, "sync_guild", sync_guild_with_outage)
     with mock.patch.object(
         storage, "load_data", side_effect=AssertionError("JSON fallback zakázán")
     ):

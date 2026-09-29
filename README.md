@@ -48,7 +48,7 @@ Podrobnosti a auditní důkaz viz `docs/PHASE_G0_FINAL_REPORT.md` a
 | `/queue list` | Přehled front a aktivních testerů. |
 | `/queue pull` | Vytáhne prvního hráče z fronty do vybrané roomky. |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
-| `/skip hrac` | Skipne AFK hráče, vrátí ho na konec fronty. |
+| `/skip hrac` | Skipne AFK hráče – vyhodí ho z roomky i z fronty. |
 | `/mktesterroom [hrac] [kategorie]` | Soukromá tester roomka pro pullnutí hráče. |
 
 Tlačítka panelu: **Join Queue** (modál s Minecraft IGN), **Leave Queue**,

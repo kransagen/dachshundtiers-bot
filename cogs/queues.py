@@ -588,13 +588,13 @@ class Queues(commands.Cog):
         await interaction.response.send_message(reply, ephemeral=True)
 
     # ------------------------------------------------------------------
-    # /skip – přeskočí AFK hráče vytáhnutého z fronty
+    # /skip – vyhodí AFK hráče z roomky i z fronty
     # ------------------------------------------------------------------
     @app_commands.command(
         name="skip",
-        description="Skipne AFK hráče (pullnutého z fronty) – vrátí ho na konec fronty",
+        description="Skipne AFK hráče – vyhodí ho z roomky i z fronty",
     )
-    @app_commands.describe(hrac="AFK hráč, kterého přeskočit")
+    @app_commands.describe(hrac="AFK hráč, kterého skipnout")
     async def skip(self, interaction: discord.Interaction, hrac: discord.Member) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message(
@@ -608,15 +608,17 @@ class Queues(commands.Cog):
         player_id = str(hrac.id)
         sf = getattr(self.bot, "db_session_factory", None)
 
-        # 1) Vše transakčně v DB: odebrání záznamu (queue entry pro
-        #    pulled hráče) + přesun hráče na konec fronty. Odebrání práv
-        #    z roomky proběhne níže podle vráceného channel_id.
+        # 1) Transakčně v DB: záznam ve frontě → ``left`` (důvod ``skip``).
+        #    Odebrání práv z roomky proběhne níže podle vráceného channel_id.
         result = await skip_queue_player(player_id, session_factory=sf)
 
+        if not result["removed"]:
+            return await interaction.response.send_message(
+                f"❌ Hráč **{hrac.display_name}** není pullnutý ani ve frontě.",
+                ephemeral=True,
+            )
+
         kit_key = result["kit_key"]
-        was_pulled = result["was_pulled"]
-        requeued = result["requeued"]
-        moved = result["moved"]
         next_player = result["next"]
         access_revoked = False
 
@@ -651,21 +653,14 @@ class Queues(commands.Cog):
                     err,
                 )
 
-        if requeued and kit_key:
+        if kit_key:
             await update_panel(interaction.guild, kit_key, session_factory=sf)
 
-        if not requeued and not moved and not was_pulled:
-            return await interaction.response.send_message(
-                f"❌ Hráč **{hrac.display_name}** není pullnutý ani ve frontě.",
-                ephemeral=True,
-            )
-
         # 3) Kdo bude další na řadě?
-        parts = [f"⏭️ **{hrac.display_name}** byl přeskočen (AFK)."]
+        parts = [f"⏭️ **{hrac.display_name}** byl skipnut (AFK)."]
         if access_revoked:
             parts.append("• Přístup do roomky mu byl odebrán.")
-        if requeued:
-            parts.append("• Vrácen na konec fronty – ostatní jdou před ním.")
+        parts.append("• Odebrán z fronty – pro nový test se musí znovu připojit.")
         if next_player:
             nick = next_player.get("ign") or next_player.get("username") or "?"
             parts.append(

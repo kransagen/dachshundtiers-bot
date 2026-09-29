@@ -47,7 +47,7 @@ from services.tickets import (
     set_panel_message,
     unclaim_ticket,
 )
-from utils import DEFAULT_KITS, has_tester_role
+from utils import DEFAULT_KITS, has_tester_role, spawn
 
 log = logging.getLogger("dachshundtiers")
 
@@ -321,8 +321,7 @@ async def grant_pull_access(
                 err,
             )
 
-    # Záznam vytaženého hráče (kvůli odebrání práv po /result a kvůli /skip) –
-    # nový formát uloží i info o hráči (kit/ign), aby šel vrátit na konec fronty.
+    # Záznam vytaženého hráče (kvůli odebrání práv po /result a kvůli /skip).
     await save_pulled_player(player, channel_id, session_factory=session_factory)
 
     if isinstance(channel, discord.TextChannel):
@@ -1014,4 +1013,4 @@ class TesterRoomView(SafeView):
             except (discord.NotFound, discord.HTTPException):
                 pass
 
-        asyncio.create_task(_delete_later())
+        spawn(_delete_later(), name="close-testerroom")

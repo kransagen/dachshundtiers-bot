@@ -44,10 +44,9 @@ async def set_queue_channel_id(
     """Uloží/změní kanál panelu fronty pro kit (používá /addqchannel)."""
     value = int(channel_id)
     async with db_transaction(session_factory) as session:
-        repo = BotConfigRepository()
-        extra = dict(await repo.get(session, QUEUE_CHANNELS_KEY, {}) or {})
-        extra[str(kit_key).lower()] = value
-        await repo.set(session, QUEUE_CHANNELS_KEY, extra)
+        await BotConfigRepository().merge(
+            session, QUEUE_CHANNELS_KEY, {str(kit_key).lower(): value}
+        )
 
 
 async def get_ht3_panel(*, session_factory) -> dict:

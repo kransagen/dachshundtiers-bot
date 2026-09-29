@@ -78,3 +78,17 @@ async def test_ht3_panel_replace(session_factory, clean_db):
         "message_id": "3",
         "channel_id": "4",
     }
+
+async def test_concurrent_queue_channel_updates_both_survive(session_factory, clean_db):
+    import asyncio
+
+    from services import config_store
+
+    await asyncio.gather(*[
+        config_store.set_queue_channel_id(f"kit{i}", 1000 + i, session_factory=session_factory)
+        for i in range(6)
+    ])
+    for i in range(6):
+        assert await config_store.get_queue_channel_id(
+            f"kit{i}", session_factory=session_factory
+        ) == 1000 + i

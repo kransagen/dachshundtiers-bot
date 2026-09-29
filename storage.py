@@ -5,7 +5,9 @@ import logging
 import os
 import socket
 from contextlib import contextmanager
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
+
+from db.config import _database_url_from_environment
 
 log = logging.getLogger("dachshundtiers")
 
@@ -16,27 +18,6 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 # původní JSON úložiště, takže lokální vývoj a existující instalace fungují
 # beze změny. Je-li ale URL nastavené, chyba databáze se NIKDY potichu
 # nepřepne na JSON – vznikly by dva rozdílné zdroje pravdy.
-def _database_url_from_environment() -> str:
-    """Vrátí DATABASE_URL nebo ji bezpečně sestaví z jednotlivých DB údajů."""
-    url = os.getenv("DATABASE_URL", "").strip()
-    if url:
-        return url
-
-    host = os.getenv("DB_HOST", "").strip()
-    name = os.getenv("DB_NAME", "").strip()
-    user = os.getenv("DB_USER", "").strip()
-    password = os.getenv("DB_PASSWORD", "")
-    port = os.getenv("DB_PORT", "5432").strip() or "5432"
-    if not all((host, name, user, password)):
-        return ""
-    # Heslo může obsahovat @, : nebo /; bez URL encodingu by se připojení
-    # rozbilo nebo by část hesla byla omylem vyhodnocena jako host.
-    return (
-        f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
-        f"@{host}:{quote(port, safe='')}/{quote(name, safe='')}"
-    )
-
-
 DATABASE_URL = _database_url_from_environment()
 _POSTGRES_SCHEMA_READY = False
 _POSTGRES_TABLE = "dachshundtiers_data"

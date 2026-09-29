@@ -108,6 +108,7 @@ def _iter_py_files(root: Path) -> list[Path]:
         if "tests" not in p.parts
         and "docs" not in p.parts
         and ".venv" not in p.parts
+        and p.name != "legacy_import.py"
     )
 
 

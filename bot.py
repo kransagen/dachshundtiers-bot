@@ -18,7 +18,14 @@ from config import DISCORD_TOKEN, GUILD_ID
 from services.config_store import get_ht3_panel
 from services.kit_catalog import get_kits
 from storage import backend_name, ensure_data_dir
-from views import HT3PanelView, HTTicketView, QueueView, TournamentSignupView
+from utils import spawn
+from views import (
+    HT3PanelView,
+    HTTicketView,
+    QueueView,
+    TesterRoomView,
+    TournamentSignupView,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,6 +174,10 @@ class DachshundTiersBot(commands.Bot):
         self._sync_lock = asyncio.Lock()
         # Startup validace kit-role mapování (design §7) – jednou za běh.
         self._kit_role_config_validated = False
+        # Obnova persistentních views a úloh na pozadí – jednou za běh.
+        # ``on_ready`` se volá znovu po každém reconnectu; bez příznaku by se
+        # hodinové smyčky i plánovače turnajů při každém výpadku zdvojily.
+        self._startup_done = False
 
         # PostgreSQL pool (Phase C): engine + session factory žijí po celý běh
         # procesu; cog příkazy (např. /sync discord) z nich berou transakce.
@@ -318,6 +329,16 @@ class DachshundTiersBot(commands.Bot):
         # Startup validace kit-role mapování (fail-fast, design §7) – 1× za běh.
         await self._validate_kit_role_configuration_once()
 
+        if self._startup_done:
+            return
+        self._startup_done = True
+        await self._restore_state()
+
+    async def _restore_state(self) -> None:
+        # Tlačítko 🔒 Zavřít místnost má statický custom_id – stačí jedna
+        # registrace a funguje pro všechny tester roomky i po restartu.
+        self.add_view(TesterRoomView())
+
         # Znovuzaregistrování persistentních view pro živé panely front a
         # otevřené HT tickety. Stav se čte z PostgreSQL (F10) – queue_messages.json
         # ani ht_tickets.json se už nečtou; bez DB se bloky přeskočí (žádný
@@ -426,10 +447,9 @@ class DachshundTiersBot(commands.Bot):
                                 self.db_session_factory, guild, key
                             )
 
-                    asyncio.create_task(
-                        _auto_end(
-                            int(tournament.guild_id), kit_key, remaining_s
-                        )
+                    spawn(
+                        _auto_end(int(tournament.guild_id), kit_key, remaining_s),
+                        name=f"tournament-auto-end-{kit_key}",
                     )
 
         # Fáze E: observe-only reconciliation (startup jednou + hodinový timer).
@@ -437,7 +457,7 @@ class DachshundTiersBot(commands.Bot):
         # aktuální Discord role do PostgreSQL. Bez DB se tiše přeskočí.
         if self.db_session_factory is not None:
             await self._run_reconciliation_once()
-            asyncio.create_task(self._reconciliation_loop())
+            spawn(self._reconciliation_loop(), name="reconciliation-loop")
 
     async def _run_reconciliation_once(self) -> None:
         from cogs._shared import guild_members

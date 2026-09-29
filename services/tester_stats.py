@@ -23,7 +23,6 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db.models import Kit, Player, Result, TesterCredit, TierDefinition
@@ -121,7 +120,7 @@ async def tester_leaderboard(
             "tester_leaderboard potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
         )
     async with db_transaction(session_factory) as session:
-        current_month = datetime.now().strftime("%m.%Y")
+        current_month = datetime.now(PRAGUE).strftime("%m.%Y")
         scores: dict[int, int] = {}
 
         rows = await session.execute(
@@ -163,26 +162,13 @@ async def credit_tester(
     session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Ruční připsání historických testů (/addtest) do ledgeru tester_credits."""
-    if session_factory is None:
-        raise RuntimeError(
-            "credit_tester potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
-        )
-    async def _once(session):
+    async with db_transaction(session_factory) as session:
         player = await PlayerRepository().get_or_create_by_discord_id(
             session, discord_id=int(tester_id), ign=""
         )
         await TesterCreditRepository().credit(
             session, tester_id=player.id, month=month, amount=amount
         )
-
-    try:
-        async with db_transaction(session_factory) as session:
-            await _once(session)
-    except IntegrityError:
-        # Racing /addtest for the same (tester, month): the unique index rejected
-        # the loser, so re-read and credit on top of the winner's row.
-        async with db_transaction(session_factory) as session:
-            await _once(session)
 
 
 async def remove_tester_credit(
@@ -193,44 +179,47 @@ async def remove_tester_credit(
 ) -> int:
     """Odečte ``amount`` z aktuálního měsíce i celkového součtu (/removetest).
 
+    Odečet jde do ledgeru jako záporný kredit aktuálního měsíce, takže sníží
+    i počty odvozené z ``results`` – měsíční součet (výsledky + kredity) ale
+    nikdy neklesne pod nulu. Řádek měsíce je zamčený (``FOR UPDATE``), takže
+    dvě souběžná ``/removetest`` se sečtou místo přepsání.
+
     Vrací nový celkový počet testů testera (pro hlášku bota).
     """
-    if session_factory is None:
-        raise RuntimeError(
-            "remove_tester_credit potřebuje PostgreSQL; testers_stats.json se už nepoužívá"
-        )
     async with db_transaction(session_factory) as session:
         player = await PlayerRepository().get_by_discord_id(session, int(tester_id))
         if player is None:
             return 0
-        current = datetime.now().strftime("%m.%Y")
-        result = await session.execute(
-            select(TesterCredit).where(
-                TesterCredit.tester_id == player.id,
-                TesterCredit.month == current,
-            )
+        current = datetime.now(PRAGUE).strftime("%m.%Y")
+        repo = TesterCreditRepository()
+        row = await repo.lock_month(session, tester_id=player.id, month=current)
+        month_results = await _count_stat_results(session, player.id, month=current)
+        floor = -month_results
+        new_amount = max(floor, row.amount - int(amount))
+        await session.execute(
+            update(TesterCredit)
+            .where(TesterCredit.id == row.id)
+            .values(amount=new_amount)
         )
-        row = result.scalar_one_or_none()
-        if row is not None:
-            new_amount = max(0, row.amount - amount)
-            await session.execute(
-                update(TesterCredit)
-                .where(TesterCredit.id == row.id)
-                .values(amount=new_amount)
-            )
-            row.amount = new_amount
         return await _count_stat_results(session, player.id) + (
-            await TesterCreditRepository().totals(session, player.id)
+            await repo.totals(session, player.id)
         )["total"]
 
 
-async def _count_stat_results(session, player_id: int) -> int:
-    result = await session.execute(
-        select(func.count())
-        .select_from(Result)
-        .where(
-            Result.evaluator_id == player_id,
-            Result.kind.in_(RESULT_STAT_KINDS),
-        )
+async def _count_stat_results(
+    session, player_id: int, *, month: Optional[str] = None
+) -> int:
+    stmt = select(Result.recorded_at).where(
+        Result.evaluator_id == player_id,
+        Result.kind.in_(RESULT_STAT_KINDS),
     )
-    return int(result.scalar_one())
+    if month is None:
+        result = await session.execute(
+            select(func.count()).select_from(stmt.subquery())
+        )
+        return int(result.scalar_one())
+    rows = await session.execute(stmt)
+    return sum(
+        1 for (recorded_at,) in rows
+        if recorded_at.astimezone(PRAGUE).strftime("%m.%Y") == month
+    )

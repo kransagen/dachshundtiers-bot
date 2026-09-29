@@ -216,3 +216,46 @@ class KitRoleValidationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 1)
         bot.close.assert_awaited_once()
         self.assertFalse(bot._kit_role_config_validated)
+
+
+class StartupOnceTests(unittest.TestCase):
+    """``on_ready`` se volá po každém reconnectu – obnova stavu jen jednou."""
+
+    def test_restore_state_runs_once_across_reconnects(self):
+        async def main():
+            b = bot_module.DachshundTiersBot()
+            restore = mock.AsyncMock()
+            with (
+                mock.patch.object(b, "_sync_commands_once", mock.AsyncMock()),
+                mock.patch.object(
+                    b, "_validate_kit_role_configuration_once", mock.AsyncMock()
+                ),
+                mock.patch.object(b, "_restore_state", restore),
+                mock.patch.object(
+                    type(b), "user", new_callable=mock.PropertyMock,
+                    return_value=mock.Mock(id=1),
+                ),
+            ):
+                await b.on_ready()
+                await b.on_ready()
+                await b.on_ready()
+            return restore
+
+        restore = asyncio.run(main())
+        self.assertEqual(restore.await_count, 1)
+
+    def test_restore_state_registers_tester_room_view(self):
+        async def main():
+            b = bot_module.DachshundTiersBot()
+            added = []
+            with (
+                mock.patch.object(b, "add_view", side_effect=lambda v, **kw: added.append(v)),
+                mock.patch("bot.get_ht3_panel", mock.AsyncMock(return_value={})),
+            ):
+                await b._restore_state()
+            return added
+
+        added = asyncio.run(main())
+        self.assertTrue(
+            any(isinstance(v, bot_module.TesterRoomView) for v in added)
+        )

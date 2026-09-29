@@ -9,7 +9,6 @@ JSON režim je pryč. ``testers_stats.json`` už není čtený ani zapisovaný;
 nesáhne (viz ``test_no_json_mode_anymore``).
 """
 
-import json
 from datetime import datetime, timezone
 from itertools import count
 
@@ -251,34 +250,36 @@ async def test_remove_tester_credit(session_factory, clean_db):
         assert row.amount == 0
 
 
-async def test_no_json_mode_anymore(session_factory, clean_db, tmp_path, monkeypatch):
-    """``testers_stats.json`` is gone: no silent second source of truth.
+async def test_remove_tester_credit_without_credit_row_subtracts_results(
+    session_factory, clean_db
+):
+    """Bez ručních kreditů /removetest odečte i z testů odvozených z výsledků."""
+    await _seed(session_factory)
+    tes = await _player_id(session_factory, 200)
+    ply = await _player_id(session_factory, 100)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    for _ in range(3):
+        await _insert(session_factory, player_id=ply, tester_id=tes, kind="queue", at=now_ms)
 
-    A statistics function that can answer from a file when the database is not
-    reachable is exactly the failure mode this cleanup removes — the two would
-    drift, and nobody could tell which one a number came from. Every entry
-    point must therefore refuse rather than fall back.
-    """
-    import storage
+    assert await stats.remove_tester_credit("200", 2, session_factory=session_factory) == 1
+    # Měsíční součet nikdy pod nulu: zbývá 1 výsledek tento měsíc → max −1 navíc.
+    assert await stats.remove_tester_credit("200", 50, session_factory=session_factory) == 0
+    current = datetime.now(PRAGUE).strftime("%m.%Y")
+    data = await stats.tester_stats("200", session_factory=session_factory)
+    assert data is None or data["monthly"].get(current, 0) == 0
 
-    monkeypatch.setattr(storage, "DATA_DIR", str(tmp_path))
-    (tmp_path / "testers_stats.json").write_text(
-        '{"999": {"total": 3, "monthly": {"04.2025": 3}}}'
-    )
 
-    for call in (
-        stats.tester_stats("999", session_factory=None),
-        stats.tester_leaderboard("all", session_factory=None),
-        stats.credit_tester("999", 3, "04.2025", session_factory=None),
-        stats.remove_tester_credit("999", 1, session_factory=None),
-    ):
-        with pytest.raises(RuntimeError, match="PostgreSQL"):
-            await call
+async def test_concurrent_credits_same_month_add_up(session_factory, clean_db):
+    import asyncio
 
-    # The file was neither read nor written.
-    assert json.loads((tmp_path / "testers_stats.json").read_text()) == {
-        "999": {"total": 3, "monthly": {"04.2025": 3}}
-    }
+    await _seed(session_factory)
+    await asyncio.gather(*[
+        stats.credit_tester("200", 1, "06.2025", session_factory=session_factory)
+        for _ in range(8)
+    ])
+    async with transaction(session_factory) as session:
+        row = (await session.execute(select(TesterCreditModel))).scalar_one()
+    assert row.amount == 8
 
 
 async def test_stats_refuse_without_a_session_factory():

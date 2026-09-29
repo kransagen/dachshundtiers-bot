@@ -1,8 +1,8 @@
 """PostgreSQL connection configuration (Phase A).
 
-The URL is resolved from the environment exactly like the legacy JSONB
-backend (``storage._database_url_from_environment`` — one source of truth,
-already covered by ``tests/test_storage.py``). This module deliberately:
+The URL is resolved from ``DATABASE_URL`` or assembled from ``DB_HOST`` /
+``DB_NAME`` / ``DB_USER`` / ``DB_PASSWORD`` / ``DB_PORT``. This module
+deliberately:
 
 * never logs, prints, or embeds the connection string or password,
 * raises :class:`DatabaseConfigError` with a *generic* message when the
@@ -15,12 +15,31 @@ from __future__ import annotations
 
 import os
 from typing import Optional
-
-from storage import _database_url_from_environment
+from urllib.parse import quote
 
 
 class DatabaseConfigError(RuntimeError):
     """Clear, secret-free configuration/startup error (fail-fast)."""
+
+
+def _database_url_from_environment() -> str:
+    """DATABASE_URL, or one safely assembled from the individual DB_* values."""
+    url = os.getenv("DATABASE_URL", "").strip()
+    if url:
+        return url
+    host = os.getenv("DB_HOST", "").strip()
+    name = os.getenv("DB_NAME", "").strip()
+    user = os.getenv("DB_USER", "").strip()
+    password = os.getenv("DB_PASSWORD", "")
+    port = os.getenv("DB_PORT", "5432").strip() or "5432"
+    if not all((host, name, user, password)):
+        return ""
+    # Passwords may contain @, : or / — without URL encoding part of the
+    # password would be parsed as the host.
+    return (
+        f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+        f"@{host}:{quote(port, safe='')}/{quote(name, safe='')}"
+    )
 
 
 def database_url() -> str:

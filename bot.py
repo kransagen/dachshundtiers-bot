@@ -504,7 +504,12 @@ async def _init_database():
     """
     import db.config as dbconfig
     from db.engine import create_async_engine_from_url, make_session_factory
-    from db.validation import validate_configured_role_ids, validate_database
+    from db.validation import (
+        auto_migrate_enabled,
+        upgrade_to_head,
+        validate_configured_role_ids,
+        validate_database,
+    )
 
     validate_configured_role_ids()
 
@@ -514,6 +519,20 @@ async def _init_database():
             "❌ Chybí DATABASE_URL (nebo DB_HOST/DB_NAME/DB_USER/DB_PASSWORD). "
             "PostgreSQL je povinný – nastav připojovací údaje (viz .env.example)."
         )
+
+    if auto_migrate_enabled():
+        try:
+            before, after = await asyncio.to_thread(
+                upgrade_to_head, dbconfig.build_sync_database_url(url)
+            )
+        except Exception:  # noqa: BLE001 – detail jen do logu
+            log.exception("Automatická migrace schématu (alembic upgrade head) selhala.")
+            raise SystemExit(
+                "❌ Migrace PostgreSQL schématu selhala. Viz log; oprav připojení "
+                "nebo spusť `alembic upgrade head` ručně (AUTO_MIGRATE=0 ji vypne)."
+            )
+        if before != after:
+            log.info("PostgreSQL schéma migrováno: %s → %s.", before or "prázdné", after)
 
     engine = create_async_engine_from_url(dbconfig.build_async_database_url(url))
     try:

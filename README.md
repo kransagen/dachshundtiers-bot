@@ -187,7 +187,7 @@ python3 -m venv .venv
 # 2. Konfigurace
 cp .env.example .env   # doplň DISCORD_TOKEN a DATABASE_URL
 
-# 3. Schéma databáze
+# 3. Schéma databáze (bot to při startu udělá sám, pokud AUTO_MIGRATE≠0)
 .venv/bin/alembic upgrade head
 
 # 4. Spuštění lokálně
@@ -233,6 +233,7 @@ sám, žádná instalace serveru není potřeba):
 | `DATABASE_URL` | **Povinné.** PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot nenastartuje. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL` (bot URL sestaví sám). |
 | `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB (hodí se bez IPv6 trasy). |
+| `AUTO_MIGRATE` | Default `1`: bot při startu sám spustí `alembic upgrade head` (hostingy bez konzole). `0` = migrace spouštíš ručně. |
 
 > Kanál panelu fronty jde nastavit i za běhu přes `/addqchannel`
 > (ukládá se do tabulky `bot_config`, má přednost před env i defaulty).
@@ -243,7 +244,9 @@ sám, žádná instalace serveru není potřeba):
 režim, žádný tichý fallback). Discord je autorita aktuálního tieru,
 PostgreSQL drží zrcadlo aktuálních tierů, historii, výsledky, fronty,
 tickety, cooldowny, statistiky a audit. Schéma spravuje Alembic
-(`alembic upgrade head`).
+(`alembic upgrade head`); bot migrace při startu spouští sám, takže nové
+nasazení na hostingu bez konzole (Bot-Hosting/Pterodactyl) nepotřebuje nic
+ručně. Vypnout to jde přes `AUTO_MIGRATE=0`.
 
 `players.json` vzniká jen jako **generovaný export** z PostgreSQL pro
 GitHub/web (`/sync web`); nikdy se nečte zpět.

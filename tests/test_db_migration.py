@@ -166,3 +166,82 @@ def test_minecraft_identity_constraints(migration_db_url):
         assert inspector.get_pk_constraint("kit_tester_rooms")["constrained_columns"] == [
             "kit_id"
         ]
+
+def test_upgrade_to_head_from_older_revision(embedded_pg):
+    """Startup auto-migrace: databáze na starší revizi se dostane na head."""
+    from alembic import command
+
+    from db.validation import migration_head, upgrade_to_head
+
+    _create_fresh_database(embedded_pg, "pytest_auto_migrate")
+    url = _sync_url(embedded_pg, "pytest_auto_migrate")
+    try:
+        command.upgrade(_alembic_config(url), "e6f7a8b9c0d1")
+        before, after = upgrade_to_head(url)
+        assert (before, after) == ("e6f7a8b9c0d1", migration_head())
+        assert upgrade_to_head(url) == (migration_head(), migration_head())
+    finally:
+        with create_engine(url).connect() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            conn.commit()
+
+
+def test_upgrade_to_head_on_empty_database(embedded_pg):
+    from db.validation import migration_head, upgrade_to_head
+
+    _create_fresh_database(embedded_pg, "pytest_auto_migrate_empty")
+    url = _sync_url(embedded_pg, "pytest_auto_migrate_empty")
+    assert upgrade_to_head(url) == (None, migration_head())
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, True), ("1", True), ("", True), ("0", False), ("false", False), ("OFF", False)],
+)
+def test_auto_migrate_enabled(monkeypatch, value, expected):
+    from db.validation import auto_migrate_enabled
+
+    if value is None:
+        monkeypatch.delenv("AUTO_MIGRATE", raising=False)
+    else:
+        monkeypatch.setenv("AUTO_MIGRATE", value)
+    assert auto_migrate_enabled() is expected
+
+
+def test_upgrade_to_head_escapes_percent_in_url(monkeypatch):
+    """URL-encodované heslo (``%40``) nesmí rozbít ConfigParser interpolaci."""
+    from alembic import command
+
+    from db import validation
+
+    seen = {}
+
+    def fake_upgrade(cfg, rev):
+        seen["url"] = cfg.get_main_option("sqlalchemy.url")
+
+    monkeypatch.setattr(command, "upgrade", fake_upgrade)
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *_a, **_k):
+            class _R:
+                def scalar(self):
+                    return None
+
+            return _R()
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr("sqlalchemy.create_engine", lambda url: _Engine())
+    validation.upgrade_to_head("postgresql://u:p%40ss@h/db")
+    assert seen["url"] == "postgresql://u:p%40ss@h/db"

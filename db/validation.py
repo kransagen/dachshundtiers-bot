@@ -36,6 +36,47 @@ def migration_head() -> str:
     return ScriptDirectory.from_config(cfg).get_current_head()
 
 
+def auto_migrate_enabled() -> bool:
+    """Run ``alembic upgrade head`` on startup? (env ``AUTO_MIGRATE``, default on).
+
+    Hostings like Bot-Hosting/Pterodactyl only run ``main.py`` and offer no
+    shell, so a deploy with a new migration would otherwise never start.
+    ``AUTO_MIGRATE=0`` turns it off for setups that migrate separately.
+    """
+    return os.getenv("AUTO_MIGRATE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def upgrade_to_head(sync_url: str) -> tuple[str | None, str]:
+    """``alembic upgrade head`` against ``sync_url``; returns (before, after).
+
+    Uses a file-less Alembic config, so ``migrations/env.py`` does not
+    re-apply ``alembic.ini`` logging over the bot's own logging setup.
+    """
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+    from sqlalchemy import create_engine
+
+    def _current() -> str | None:
+        engine = create_engine(sync_url)
+        try:
+            with engine.connect() as conn:
+                exists = conn.execute(text("SELECT to_regclass('alembic_version')")).scalar()
+                if exists is None:
+                    return None
+                row = conn.execute(text("SELECT version_num FROM alembic_version")).first()
+                return row[0] if row else None
+        finally:
+            engine.dispose()
+
+    cfg = AlembicConfig()
+    cfg.set_main_option("script_location", str(MIGRATIONS_DIR))
+    # ConfigParser interpolation: a URL-encoded password contains '%'.
+    cfg.set_main_option("sqlalchemy.url", sync_url.replace("%", "%%"))
+    before = _current()
+    command.upgrade(cfg, "head")
+    return before, _current()
+
+
 async def validate_database(engine: AsyncEngine) -> dict:
     """Verify connectivity + migrated schema against the current Alembic head.
 

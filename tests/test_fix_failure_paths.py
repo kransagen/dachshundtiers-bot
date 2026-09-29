@@ -20,6 +20,7 @@ import discord
 import storage
 import views
 from services import queue_service, tickets
+from tests import json_backend_only
 
 
 def _player_entry(uid="1", kit="AnchorPvP"):
@@ -49,6 +50,7 @@ def _interaction(guild=None):
     return inter
 
 
+@json_backend_only("fixture queue.json v tempdiru přes DATA_DIR")
 class GrantPullAccessFailureTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

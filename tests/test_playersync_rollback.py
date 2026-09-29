@@ -27,6 +27,7 @@ from services.playersync import (
     log_playersync_rollback_event,
     verify_rollback_plan,
 )
+from tests import json_backend_only
 
 
 def _applied(records):
@@ -298,6 +299,7 @@ class RollbackTargetSelectionTests(unittest.TestCase):
         self.assertTrue(warnings)
 
 
+@json_backend_only("audit log jako append-only JSON soubor v tempdiru")
 class RollbackAuditLogTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

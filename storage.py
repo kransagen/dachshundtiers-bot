@@ -302,6 +302,87 @@ def load_data(file: str, default=None, *, strict: bool = False):
         return default
 
 
+def _staged_path(path: str) -> str:
+    """Cesta dočasného souboru, který později nahradí ``path``."""
+    return f"{path}.{os.getpid()}.tmp"
+
+
+def stage_data(file: str, data) -> str:
+    """Připraví zápis do dočasného souboru; cílový soubor se NEMĚNÍ.
+
+    Vrátí cestu k dočasnému souboru, který se buď přesune na místo přes
+    :func:`commit_staged`, nebo se zahodí přes :func:`discard_staged`.
+
+    Jde o tentýž zápis jako v :func:`save_data` (stejné kódování UTF-8,
+    ``ensure_ascii=False``, dvouměrové odsazení), jen oddělený od
+    ``os.replace``. Oddělení umožňuje vícesouborové transakci připravit
+    všechny soubory dřív, než se částečně dotkne cílů (viz
+    ``services.store.transaction``).
+
+    Je určen pouze pro JSON backend; u PostgreSQL data zajišťuje transakce
+    databáze.
+
+    POZNÁMKA k právům: dočasný soubor vzniká s právy podle umask, stejně
+    dřív, a ``os.replace`` je na cíl přenese. PRÁVA PŘEEXISTUJÍCÍHO souboru
+    se tedy stejně jako před F11 neuchovávají – chování je záměrně
+    nezměněné, ne zlepšené (F11 nemění nic mimo pořadí fází). Nechat by se
+    to dalo přes ``os.chmod`` až po ``os.replace``, ale to by zavedlo vlastní
+    okno, kde je soubor už nový a ještě bez původních práv. Viz
+    ``tests/test_store_json_atomicity.py``, které pevně dokumentuje
+    současné chování.
+
+    Pokud serializace selhne napůl (``json.dump`` píše postupně, takže se
+    dočasný soubor stihne částečně naplnit), dočasný soubor se tady smaže.
+    Caller ho totiž do seznamu ``staged`` přidá až po úspěšném návratu, takže
+    by ho jeho vlastní úklid už nezachytil.
+    """
+    ensure_data_dir()
+    path = data_path(file)
+    tmp_path = _staged_path(path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    return tmp_path
+
+
+def commit_staged(staged) -> None:
+    """Přesune připravené dočasné soubory na jejich cíle (``os.replace``).
+
+    ``staged`` je posloupnost dvojic ``(tmp_path, cílová_cesta)``.
+
+    POZOR – tady je přesně ta hranice, za kterou už JSON backend není
+    vícesouborově atomický. Každý ``os.replace`` je atomický *sám o sobě*,
+    více přesunů za sebou ale POSIX neumí udělat v jednom kroku. Selhne-li
+    ``os.replace`` uprostřed, soubory nahrazené před tím zůstanou nové.
+    Proto se všechno náročné (serializace do JSONu, zápis na disk) dělá už
+    v :func:`stage_data` a sem se dostane jen series triviálních přesunů.
+    """
+    for tmp_path, path in staged:
+        os.replace(tmp_path, path)
+
+
+def discard_staged(staged) -> None:
+    """Smaže dočasné soubory, které se nestaly cílem (úspěch i neúspěch).
+
+    Po úspěšném :func:`commit_staged` je bez účinku – soubory už byly
+    přesunuty. Nepodařené smazání se zaloguje a nezruší běh, protože zaplněný
+    disk je horší než zapomenutý dočasný soubor.
+    """
+    for tmp_path, _path in staged:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            log.warning("Dočasný soubor %s se nepodařilo smazat.", tmp_path)
+
+
 def save_data(file: str, data) -> None:
     """Uloží data do aktivního úložiště atomicky.
 
@@ -323,16 +404,11 @@ def save_data(file: str, data) -> None:
 
     ensure_data_dir()
     path = data_path(file)
-    tmp_path = f"{path}.{os.getpid()}.tmp"
+    staged = []
     try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, path)
+        staged.append((stage_data(file, data), path))
+        commit_staged(staged)
     except Exception:
         log.exception("Zápis souboru %s selhal; původní soubor zůstal nedotčen.", path)
-        try:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except OSError:
-            pass
+        discard_staged(staged)
         raise

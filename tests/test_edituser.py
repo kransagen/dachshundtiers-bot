@@ -37,6 +37,7 @@ from services import edituser as eu
 from services import permissions
 from services.player_identity import CLAIM_UNCHANGED, PlayerIdentityConflict
 from services.playersync import make_member
+from tests import json_backend_only
 
 PLAYER_ID = "111111111111111111"
 OTHER_ID = "222222222222222222"
@@ -352,6 +353,7 @@ class EditUserServiceTests(unittest.TestCase):
         self.assertIsNone(eu.ht3_cooldown_remaining(ht3, PLAYER_ID, "randompot", NOW + 5000))
 
 
+@json_backend_only("fixture players.json v tempdiru + audit log jako soubor")
 class ApplyEditTests(unittest.TestCase):
     """apply_player_edit: transakce + audit, migrace, cooldowny, korupce."""
 
@@ -612,6 +614,7 @@ class ApplyEditTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
 
 
+@json_backend_only("fixture players.json v tempdiru + audit log jako soubor")
 class ExecuteEditTests(unittest.TestCase):
     """execute_player_edit: DB → Discord role → web, reporty a best effort."""
 

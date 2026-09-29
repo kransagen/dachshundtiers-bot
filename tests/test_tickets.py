@@ -18,6 +18,7 @@ from unittest import mock
 
 import storage
 from services import tickets
+from tests import json_backend_only
 
 NOW = 1_700_000_000_000
 COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000  # 7 dní, jako HT3_COOLDOWN_MS
@@ -41,6 +42,7 @@ def _ticket(**overrides):
     return base
 
 
+@json_backend_only("fixture players.json/evals.json v tempdiru přes DATA_DIR")
 class TicketServiceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -50,6 +52,43 @@ class TicketServiceTests(unittest.TestCase):
         storage.save_data(tickets.HT_TICKETS_FILE, {})
         storage.save_data(tickets.HT_TICKET_LOGS_FILE, {})
         storage.save_data(tickets.HT3_COOLDOWNS_FILE, {})
+        self._seed_gate("1", ("A", "AliceMC"), ("AnchorPvP", "anchorpvp", "MolePVP"))
+        self._seed_gate("2", ("BobMC",), ("AnchorPvP",))
+
+    def _seed_gate(self, owner_id, igns, kits):
+        """Zajistí, že hráč má tier LT3 a eval → brána propustí.
+
+        Od F10 ``create_ticket`` bránu REVALIDUJE uvnitř transakce, takže
+        už nestačí jen poslat ``current_tier``/``eval_ok`` – v players.json
+        a evals.json musí být skutečně odpovídající záznam, jinak správně
+        vrátí ``tier_changed`` a test by padal.
+
+        ``igns`` může obsahovat víc přepisů téhož hráče: tier se hledá podle
+        Discord ID, ale eval výhradně podle IGN, takže testy, které jednou
+        volají ``ign="A"`` a jindy ``ign="AliceMC"`` (tentýž ``owner_id``),
+        potřebují eval pod oběma.
+
+        ``anchorpvp`` je záměrně vedle ``AnchorPvP``: část testů volá
+        create_ticket s lowercase kitem (test duplicit je case-insensitive)
+        a hledání v ``modes`` je case-sensitive i ve skutečných datech – tam
+        se key ukládá v display-case podle canonical_kit_name. Není to chyba
+        fixture, je to současná sémantika.
+        """
+        players = storage.load_data(tickets.PLAYERS_FILE, []) or []
+        players.append(
+            {
+                "username": igns[0],
+                "discordId": owner_id,
+                "modes": {k: "LT3" for k in kits},
+            }
+        )
+        storage.save_data(tickets.PLAYERS_FILE, players)
+
+        evals = storage.load_data(tickets.EVALS_FILE, {}) or {}
+        for kit in kits:
+            for ign in igns:
+                evals.setdefault(kit.lower(), {})[ign.lower()] = NOW
+        storage.save_data(tickets.EVALS_FILE, evals)
 
     # ------------------------------------------------------------------
     # Vytvoření + prevence duplicit

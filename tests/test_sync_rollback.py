@@ -28,6 +28,7 @@ from services.playersync import (
     PLAYERSYNC_ROLLBACK_LOG_FILE,
     build_rollback_plan,
 )
+from tests import json_backend_only
 
 # ---------------------------------------------------------------------------
 # Pomocné (stejný vzor jako test_sync.py, self-contained)
@@ -268,6 +269,7 @@ class ApplyRollbackActionsTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Příkaz /sync discord-rollback (cogs/sync)
 # ---------------------------------------------------------------------------
+@json_backend_only("fixture players.json v tempdiru + audit log jako soubor")
 class SyncDiscordRollbackCommandTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

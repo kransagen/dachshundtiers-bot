@@ -34,6 +34,7 @@ from services.datacheck import (
     check_retired_tiers_in_modes,
     check_ticket_identities,
 )
+from tests import json_backend_only
 
 
 def _player(username, modes=None, history=None, discord_id=None):
@@ -397,6 +398,7 @@ class DuplicateKitChecksTests(unittest.TestCase):
         self.assertEqual(findings, [])
 
 
+@json_backend_only("e2e čtení JSON souborů z temp DATA_DIR")
 class RunDataCheckTests(unittest.TestCase):
     """End-to-end kontrola ze souborů v temp DATA_DIR + audit log."""
 
@@ -506,6 +508,7 @@ class RunDataCheckTests(unittest.TestCase):
         asyncio.run(main())
 
 
+@json_backend_only("opravy nad JSON soubory v temp DATA_DIR")
 class PerformRepairsTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -616,6 +619,7 @@ class PerformRepairsTests(unittest.TestCase):
         self.assertEqual(entries[0]["ts"], 3)
 
 
+@json_backend_only("datacheck log jako JSON soubor v tempdiru")
 class AuditLogSurvivalTests(unittest.TestCase):
     def test_log_survives_restart_across_loops(self):
         tmp = tempfile.mkdtemp()

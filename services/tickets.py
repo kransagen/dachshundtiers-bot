@@ -35,10 +35,12 @@ Tvar ticketu::
 
 from services import store
 from storage import load_data
+from utils import EVALS_FILE, eval_in
 
 HT_TICKETS_FILE = "ht_tickets.json"
 HT_TICKET_LOGS_FILE = "ht_ticket_logs.json"
 HT3_COOLDOWNS_FILE = "ht3_cooldowns.json"
+PLAYERS_FILE = "players.json"
 
 STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
@@ -117,16 +119,14 @@ def effective_ticket_tier(current_tier: str | None, eval_ok: bool) -> str | None
     return cur if HT3_TIER_LADDER.index(cur) >= eval_idx else "LT3E"
 
 
-def find_player_tier(ign: str, kit: str, discord_id=None) -> str | None:
-    """Aktuální tier hráče pro daný kit; Discord ID má přednost před IGN.
+def player_tier_from(players, ign: str, kit: str, discord_id=None) -> str | None:
+    """Tier hráče pro daný kit z už načteného ``players.json`` – bez I/O.
 
-    ``discord_id`` je primární identita (services/player_identity.py) – když
-    hráče podle Discord ID najdeme, IGN se ignoruje. Bez Discord ID klasická
-    case-insensitive shoda podle IGN (legacy chování).
+    Stejná logika a stejná normalizace jako :func:`find_player_tier`, ale
+    nečte soubor, takže se dá zavolat uvnitř transakce ``services.store``
+    nad daty, která transakce už drží pod zámkem.
     """
-    try:
-        players = load_data("players.json", []) or []
-    except Exception:
+    if not isinstance(players, list):
         return None
     player = None
     if discord_id:
@@ -155,6 +155,20 @@ def find_player_tier(ign: str, kit: str, discord_id=None) -> str | None:
     modes = player.get("modes") or {}
     tier = modes.get(kit)
     return str(tier).strip().upper() if tier else None
+
+
+def find_player_tier(ign: str, kit: str, discord_id=None) -> str | None:
+    """Aktuální tier hráče pro daný kit; Discord ID má přednost před IGN.
+
+    ``discord_id`` je primární identita (services/player_identity.py) – když
+    hráče podle Discord ID najdeme, IGN se ignoruje. Bez Discord ID klasická
+    case-insensitive shoda podle IGN (legacy chování).
+    """
+    try:
+        players = load_data(PLAYERS_FILE, []) or []
+    except Exception:
+        return None
+    return player_tier_from(players, ign, kit, discord_id)
 
 
 # ---------------------------------------------------------------------------
@@ -253,10 +267,47 @@ async def create_ticket(
     běží UVNITŘ transakce, takže souběžný ``close_ticket`` (který cooldown
     nastavuje) nemůže vytvoření obejít. Výchozí 0 zachovává chování bez
     cooldown kontroly.
+
+    Revalidace tier/eval brány (F10)
+    --------------------------------
+    ``current_tier`` a ``eval_ok`` jsou jen *nápověda* – snapshot, ze kterého
+    volající (views.HT3Modal) před tuto funkcí spočítal bránu. Mezi tím
+    výpočtem a sem se stalo několik awaitů na Discord API (vyhledání člena,
+    nalezení kategorie, ``create_text_channel``), takže mezitím mohl
+    /result změnit tier nebo /seteval + /uneval eval. Kdybychom vzali
+    nápovědu za pravdu, vznikl by ticket s neplatným oprávněním.
+
+    Proto se uvnitř transakce znovu přečte ``players.json`` a ``evals.json``
+    (pod týmiž zámky, pod kterými později write proběhne) a rozhodne se podle
+    nich. ``current_tier`` / ``eval_ok`` se uloží **autoritativní** hodnoty,
+    ne nápověda – viz ``make_ticket(current_tier=..., eval_ok=...)`` níže.
+
+    Při jakékoli změně (tier, eval, i povýšení, které by hráči jen pomohlo)
+    se vrátí ``{"result": "tier_changed", "current_tier", "eval_ok", ...}`` a
+    ticket se nevytvoří. Je to záměrně konzervativní:
+
+    * volající nad snapshotem spočítal i limit ``target_tier``; limit je
+      čistá funkce (current_tier, eval_ok), takže se při nezměněněných
+      vstupech nemůže změnit, ale při ZMĚNĚ by už jeho kontrola neplatila –
+      bez tohoto pravidla by šlo těsně pod limit a limit by byl vyšší;
+    * hráč prostě zopakuje pokus a brána se přepočítá z čerstvých dat.
+
+    Ne-strict čtení tady záměrně není: ``tx.get`` čte strict, takže
+    poškozený players.json/evals.json skončí výjimkou před jakýmkoli zápisem
+    (a ne jako „nemá tier" → tichý kradený ticket). Stejně jako duplicate
+    a cooldown se tato kontrola řadí až za ně – obojí je taky zamítnutí, takže
+    pořadí nemá vliv na bezpečnost, ale zachovává původní prioritu hlášek.
+
+    Zámky se drží jen tady, nikdy přes Discord await (ty jsou v views.py
+    PŘED voláním této funkce).
     """
     owner_id = str(owner_id)
     kit_key = str(kit).strip().lower()
     channel_id = str(channel_id)
+    # Nápověda volajícího, se kterou porovnáme stav uvnitř transakce.
+    # Normalizace musí sedět s player_tier_from (stejná funkce).
+    expected_tier = current_tier
+    expected_eval = bool(eval_ok)
 
     async def _run(tx):
         tickets = tx.get(HT_TICKETS_FILE, {})
@@ -287,6 +338,21 @@ async def create_ticket(
                     "owner_id": owner_id,
                 }
 
+        # Autoritativní stav hráče – stejná identita a stejný kit, jaké
+        # použil volající (Discord ID má přednost před IGN).
+        actual_tier = player_tier_from(
+            tx.get(PLAYERS_FILE, []), ign, kit, owner_id
+        )
+        actual_eval = eval_in(tx.get(EVALS_FILE, {}), ign, kit)
+        if actual_tier != expected_tier or actual_eval != expected_eval:
+            return {
+                "result": "tier_changed",
+                "current_tier": actual_tier,
+                "eval_ok": actual_eval,
+                "kit": kit,
+                "owner_id": owner_id,
+            }
+
         ticket = make_ticket(
             channel_id=channel_id,
             owner_id=owner_id,
@@ -294,8 +360,8 @@ async def create_ticket(
             ign=ign,
             kit=kit,
             target_tier=target_tier,
-            current_tier=current_tier,
-            eval_ok=eval_ok,
+            current_tier=actual_tier,
+            eval_ok=actual_eval,
             category_id=category_id,
             panel_message_id=panel_message_id,
             ticket_type=ticket_type,
@@ -305,11 +371,13 @@ async def create_ticket(
         tx.set(HT_TICKETS_FILE, tickets)
         return {"result": "created", "ticket": ticket}
 
-    files = (
-        (HT_TICKETS_FILE, HT3_COOLDOWNS_FILE)
-        if cooldown_ms > 0
-        else (HT_TICKETS_FILE,)
-    )
+    files = [
+        HT_TICKETS_FILE,
+        PLAYERS_FILE,
+        EVALS_FILE,
+    ]
+    if cooldown_ms > 0:
+        files.append(HT3_COOLDOWNS_FILE)
     return await store.transaction(files, _run)
 
 

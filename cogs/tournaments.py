@@ -18,7 +18,8 @@ from discord.ext import commands
 
 from config import TOP_RESULT_ROLE_ID, TOURNAMENT_RESULT_CHANNEL_ID
 from cogs._shared import admin_gate_error
-from storage import load_data, save_data
+from services.store import transaction
+from storage import load_data
 from utils import get_kits, has_tester_role, kit_autocomplete
 from views import TournamentSignupView
 
@@ -26,14 +27,28 @@ TOURNAMENT_TIERS = ["LT3", "HT3", "LT2", "HT2", "LT1", "HT1"]
 
 
 async def end_tournament_signup(guild: discord.Guild, kit_key: str) -> None:
-    """Ukončí přihlašování turnaje, zamíchá hráče a vytvoří skupinové roomky."""
-    tournaments = load_data("tournaments.json", {})
-    tdata = tournaments.get(kit_key)
-    if not tdata or tdata.get("ended"):
-        return
+    """Ukončí přihlašování turnaje, zamíchá hráče a vytvoří skupinové roomky.
 
-    tdata["ended"] = True
-    save_data("tournaments.json", tournaments)
+    Označení ``ended`` jde přes transakci (strict čtení): při nečitelném
+    tournaments.json se spadne výjimkou PŘED zápisem. Ne-strict load by
+    vrátil ``{}``, turnaj by vypadal neexistující a funkce by skončila
+    tichým návratem – nebo by při dílčím stavu přepsala cizí turnaje.
+    """
+
+    async def _mark_ended(tx):
+        tournaments = tx.get("tournaments.json", {})
+        tdata = tournaments.get(kit_key)
+        if not tdata or tdata.get("ended"):
+            return None
+        tdata["ended"] = True
+        tx.set("tournaments.json", tournaments)
+        return tournaments
+
+    # Chyba čtení musí spadnout tady, ne až někde mezi Discord awaity.
+    tournaments = await transaction(("tournaments.json",), _mark_ended)
+    if tournaments is None:
+        return
+    tdata = tournaments[kit_key]
 
     signup_channel = guild.get_channel(int(tdata["signupChannelId"]))
     if signup_channel is None:
@@ -229,7 +244,7 @@ class Tournaments(commands.Cog):
             content=f"{role.mention}", embed=embed, view=view
         )
 
-        tournaments[kit_key] = {
+        record = {
             "kit": kit,
             "tier": tier,
             "groupsCount": skupiny,
@@ -242,7 +257,18 @@ class Tournaments(commands.Cog):
             "ended": False,
             "deadline": int(deadline_ms),
         }
-        save_data("tournaments.json", tournaments)
+
+        # Zápis přes transakci: čte se znovu a strict. `tournaments` z řádku
+        # výše je mezitím stará (za těch dob proběhly Discord awaity), takže
+        # jeho zápis by mohl přepsat cizí turnaj vytvořený mezitím – a při
+        # nečitelném souboru by navíc uložil default odvozený z {}.
+        async def _create(tx):
+            current = tx.get("tournaments.json", {})
+            current[kit_key] = record
+            tx.set("tournaments.json", current)
+            return None
+
+        await transaction(("tournaments.json",), _create)
 
         self.bot.add_view(view, message_id=message.id)
         self._schedule_end(interaction.guild.id, kit_key, hodiny * 3600)
@@ -366,8 +392,16 @@ class Tournaments(commands.Cog):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 pass
 
-        del tournaments[kit_key]
-        save_data("tournaments.json", tournaments)
+        # Mazání přes transakci: strict čtení. Bez ní by nečitelný soubor
+        # vedl k tichému návratu "turnaj neexistuje", případně by se uložil
+        # default {} a ostatní běžící turnaje by zmizely.
+        async def _delete(tx):
+            current = tx.get("tournaments.json", {})
+            current.pop(kit_key, None)
+            tx.set("tournaments.json", current)
+            return None
+
+        await transaction(("tournaments.json",), _delete)
 
         await interaction.followup.send(
             f"Turnaj pro kit **{kit}** a všechny jeho kanály byly kompletně smazány.",

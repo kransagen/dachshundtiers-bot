@@ -19,7 +19,7 @@ from config import PLAYER_COOLDOWN_MS, TESTER_ROOM_CATEGORY_ID, get_queue_channe
 from panel import create_queue_embed, update_panel
 from services.queue_service import join_queue, save_pulled_player
 from services.store import transaction
-from storage import load_data, save_data
+from storage import load_data
 from utils import has_tester_role, kit_autocomplete
 from views import PullChannelSelectView, QueueView, TesterRoomView
 
@@ -138,9 +138,16 @@ class Queues(commands.Cog):
         view = QueueView(kit)
         message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
 
-        queue_messages = load_data("queue_messages.json", {})
-        queue_messages[kit_key] = {"message_id": str(message.id), "kit": kit}
-        save_data("queue_messages.json", queue_messages)
+        # Zápis panelu přes transakci: při nečitelném queue_messages.json
+        # se výjimka vyhodí PŘED zápisem, takže se neztratí ID panelů ostatních
+        # kitů (ne-strict load by vrátil {} a uložil by jen tento jeden panel).
+        async def _remember_panel(tx):
+            panels = tx.get("queue_messages.json", {})
+            panels[kit_key] = {"message_id": str(message.id), "kit": kit}
+            tx.set("queue_messages.json", panels)
+            return None
+
+        await transaction(("queue_messages.json",), _remember_panel)
 
         # Zaregistrování persistentní view pro restart bota
         self.bot.add_view(view, message_id=message.id)
@@ -332,11 +339,19 @@ class Queues(commands.Cog):
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message("❌ Nemáš roli Tester.", ephemeral=True)
 
-        testers = load_data("testers.json")
         user_id = str(interaction.user.id)
-        if user_id not in testers:
-            testers.append(user_id)
-        save_data("testers.json", testers)
+
+        # Přes transakci: ne-strict load by poškozený testers.json převedl na
+        # [] a zápis by pak uložil jen tohoto testera, čímž by ostatní
+        # zahodil. tx.get() čte strict, takže chyba čtení spadne před zápisem.
+        async def _join(tx):
+            testers = tx.get("testers.json")
+            if user_id not in testers:
+                testers.append(user_id)
+            tx.set("testers.json", testers)
+            return None
+
+        await transaction(("testers.json",), _join)
 
         await interaction.response.send_message(
             f"⚔️ <@{user_id}> je nyní globálně aktivní tester."

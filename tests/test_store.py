@@ -8,8 +8,10 @@ from unittest import mock
 
 import storage
 from services import store
+from tests import json_backend_only
 
 
+@json_backend_only("store.transakce nad JSON soubory v tempdiru")
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

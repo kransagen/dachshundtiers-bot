@@ -36,7 +36,8 @@ from services.tickets import (
     tier_allows_tickets,
     unclaim_ticket,
 )
-from storage import load_data, save_data
+from services.store import transaction
+from storage import load_data
 from utils import DEFAULT_KITS, get_kits, has_eval, has_tester_role
 
 log = logging.getLogger("dachshundtiers")
@@ -648,6 +649,29 @@ class HT3Modal(SafeModal):
                 ephemeral=True,
             )
 
+        if result["result"] == "tier_changed":
+            # RACE: /result nebo /seteval + /uneval změnil tier/eval v době,
+            # když jsme čekali na Discord API. Brána se ověřuje znovu uvnitř
+            # create_ticket (F10), takže tady s jistotou nejde o neplatné
+            # oprávnění – kanál se smaže a hráč to zkusí znovu.
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+            actual = result.get("current_tier")
+            actual_note = (
+                f"\nTvůj aktuální tier v kitu **{kit}** je teď `{actual}`."
+                if actual
+                else f"\nV kitu **{kit}** ti teď žádný tier není evidován."
+            )
+            return await interaction.followup.send(
+                "❌ **Během zakládání ticketu se změnil tvůj tier nebo eval!**\n"
+                "Proto se ticket nevytvořil – stav se ověřuje až u samotného zápisu, "
+                "aby se neuložil ticket s neplatným oprávněním."
+                f"{actual_note}\nZkus to prosím znovu, brána se přepočítá.",
+                ephemeral=True,
+            )
+
         ticket = result["ticket"]
 
         embed = ticket_embed(ticket)
@@ -698,11 +722,18 @@ class HT3Modal(SafeModal):
         except Exception:
             log.exception("Nelze zalogovat vytvoření ticketu %s", channel.id)
 
+        # Poznámka se počítá z AUTORITATIVNÍCH hodnot uložených v ticketu,
+        # ne ze snapshotu z předchozí brány. Po F10 by ty byly za normálních
+        # okolností stejné, ale „normálních okolností" není garantované a
+        # ukazovat hráči něco jiného, než je v jeho ticketu, by mátilo.
+        auth_tier = ticket.get("currentTier")
+        auth_eval = bool(ticket.get("eval"))
+        auth_limit = next_ticket_tier(effective_ticket_tier(auth_tier, auth_eval))
         note = ""
-        if current_tier and limit_tier and target_tier != limit_tier:
+        if auth_limit and target_tier != auth_limit:
             note = (
-                f"\n💡 Tvůj aktuální tier je `{current_tier}` – "
-                f"garantovaný další tier je `{limit_tier}`."
+                f"\n💡 Tvůj aktuální tier je `{auth_tier}` – "
+                f"garantovaný další tier je `{auth_limit}`."
             )
         await interaction.followup.send(
             f"Ticket byl vytvořen: <#{channel.id}>{note}", ephemeral=True
@@ -972,22 +1003,32 @@ class TournamentSignupView(SafeView):
         self.add_item(btn)
 
     async def on_signup(self, interaction: discord.Interaction) -> None:
-        tournaments = load_data("tournaments.json", {})
-        tdata = tournaments.get(self.kit_key)
-        if not tdata or tdata.get("ended"):
+        # Přihlášení přes transakci: tx.get() čte strict, takže nečitelný
+        # tournaments.json spadne výjimkou PŘED jakýmkoli zápisem. Bez toho by
+        # ne-strict load vrátil {} → turnaj by vypadal neexistující, hráč by
+        # dostal "přihlašování skončilo" a ostatní turnaje by se smazaly.
+        async def _signup(tx):
+            tournaments = tx.get("tournaments.json", {})
+            tdata = tournaments.get(self.kit_key)
+            if not tdata or tdata.get("ended"):
+                return "ended"
+            user_id = str(interaction.user.id)
+            participants = tdata.setdefault("participants", [])
+            if user_id in participants:
+                return "already"
+            participants.append(user_id)
+            tx.set("tournaments.json", tournaments)
+            return "joined"
+
+        outcome = await transaction(("tournaments.json",), _signup)
+        if outcome == "ended":
             return await interaction.response.send_message(
                 "Přihlašování do tohoto turnaje již skončilo.", ephemeral=True
             )
-
-        user_id = str(interaction.user.id)
-        participants = tdata.setdefault("participants", [])
-        if user_id in participants:
+        if outcome == "already":
             return await interaction.response.send_message(
                 "Už jsi v tomto turnaji přihlášen.", ephemeral=True
             )
-
-        participants.append(user_id)
-        save_data("tournaments.json", tournaments)
         await interaction.response.send_message(
             "Byl jsi úspěšně přihlášen do turnaje! ✅", ephemeral=True
         )

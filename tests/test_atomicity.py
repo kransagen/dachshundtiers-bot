@@ -25,6 +25,7 @@ import storage
 import utils
 from services import queue_service, results, store
 from services import tickets
+from tests import json_backend_only
 
 NOW = 1_700_000_000_000
 QUEUE_COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
@@ -77,6 +78,7 @@ class TempDataDirMixin(unittest.TestCase):
 
 
 # ---------------------------------------------------------------- F8
+@json_backend_only("fixture pulled_players.json v tempdiru přes DATA_DIR")
 class AddPulledPlayerAtomicityTests(TempDataDirMixin):
     """F8 – /add v legacy tester roomce nesmí přepsat cizí záznam."""
 

@@ -23,12 +23,16 @@ import asyncio
 import logging
 
 from storage import (
+    commit_staged,
+    data_path,
+    discard_staged,
     load_data,
     postgres_connection,
     postgres_lock_keys,
     postgres_load,
     postgres_save,
     save_data,
+    stage_data,
     using_postgres,
 )
 
@@ -111,6 +115,69 @@ async def _acquire(names):
     return locks
 
 
+def _commit_json(dirty, data) -> None:
+    """Zapíše všechny změněné soubory JSON backendu dvoufázově.
+
+    Fáze 1 – ``stage_data`` připraví KAŽDÝ změněný soubor jako dočasný
+    soubor vedle cíle. Sem patří všechno, co může selhat kvůli datům nebo
+    nedostatku místa (serializace do JSONu, zápis na disk, zakódování).
+
+    Fázze 2 – teprve když jsou připravené všechny, ``commit_staged`` je
+    přesune na místa přes ``os.replace``.
+
+    Proč dvě fáze
+    -------------
+    Předchozí implementace volala ``save_data`` soubor po souboru, takže
+    selhání až u třetího souboru nechalo první dva uložené navždy. Backend
+    pak vypadal stejně jako PostgreSQL, ale choval se jinak – což je ta
+    materialně odlišná sémantika, kterou F11 odstraňuje. Teď selhání při
+    přípravě nemůže změnit ani jeden cílový soubor.
+
+    Co atomické NENÍ (a být upřímný, tak to i je)
+    --------------------------------------------
+    Fáze 2 je stále N sdílených ``os.replace`` volání. POSIX nemá primitiv
+    „přejmenuj N souborů najednou", takže plná vícesouborová atomicita je na
+    běžném filesystemu nedosažitelná. Zbývá tedy úzké okno mezi jednotlivými
+    přesuny: když selže až ``os.replace`` uprostřed (nebo když proces
+    mezitím zabije SIGKILL), soubory nahrazené před tím zůstanou nové a
+    zbývající staré.
+
+    Oproti dřívějšímu stavu je to okno výrazně užší a mnohem méně
+    pravděpodobné: zbývá jen série triviálních přesunů v řadě místo celého
+    zápisu dat. Zaručeno je, že chyba *přípravy* dat už žádný cílový soubor
+    nezmění. Vypnutí tohoto okna úplně by vyžadovalo přepsat JSON backend na
+    databázový-style store, což je mimo rozsah F11.
+    """
+    staged = []
+    # ``dirty`` je set, takže bez řazení by pořadí zápisů házelo s během
+    # (hash seed) a selhání by bylo špatně reprodukovatelné. Zámečky se
+    # berou ve stejném seřazeném pořadí, takže je to konzistentní i s nimi.
+    ordered = sorted(dirty)
+    try:
+        for name in ordered:
+            staged.append((stage_data(name, data[name]), data_path(name)))
+    except Exception:
+        # Nic nebylo přesunuto, takže cíle jsou nedotčené. Zbytky uklidíme.
+        log.exception(
+            "Příprava %d z %d souborů selhala; cílové soubory zůstaly beze změny.",
+            len(staged),
+            len(ordered),
+        )
+        discard_staged(staged)
+        raise
+    try:
+        commit_staged(staged)
+    except Exception:
+        # Fáze 2 – viz omezení v dokumentaci. Zbývající dočasné soubory
+        # uklidíme, ať nezůstanou v data/ jako směs.
+        log.exception(
+            "Nahrazení cílových souborů selhalo; transakce není atomická "
+            "(část souborů už byla přepsána)."
+        )
+        discard_staged(staged)
+        raise
+
+
 async def transaction(names, fn):
     """Spustí ``fn(tx)`` atomicky přes dané soubory.
 
@@ -120,6 +187,12 @@ async def transaction(names, fn):
     - chyba uvnitř ``fn`` → nic se neuloží, zámky se uvolní, výjimka letí dál.
 
     ``fn`` může být korutina i obyčejná funkce.
+
+    Uložení změn je dvoufázové v obou backendech: nejprve se připraví všechna
+    data, teprve potom se cokoli dotkne trvalého stavu. U PostgreSQL tou
+    druhou fází je ``conn.commit()``; u JSON backendu je to série
+    ``os.replace`` (viz :func:`_commit_json` pro přesné hranice toho, co
+    atomicita zaručuje a co ne).
     """
     names = tuple(sorted(set(names)))
     locks = await _acquire(names)
@@ -139,13 +212,12 @@ async def transaction(names, fn):
         result = fn(tx)
         if asyncio.iscoroutine(result):
             result = await result
-        for name in tx._dirty:
-            if conn is not None:
-                postgres_save(conn, name, tx._data[name])
-            else:
-                save_data(name, tx._data[name])
         if conn is not None:
+            for name in tx._dirty:
+                postgres_save(conn, name, tx._data[name])
             conn.commit()
+        else:
+            _commit_json(tx._dirty, tx._data)
         return result
     except Exception:
         if conn is not None:

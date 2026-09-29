@@ -12,6 +12,7 @@ from unittest import mock
 
 import storage
 from services import queue_service
+from tests import json_backend_only
 
 COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000  # 4 dny, stejně jako v config
 
@@ -20,6 +21,7 @@ def _ms():
     return time.time() * 1000
 
 
+@json_backend_only("fixture queue.json/active_queues.json v tempdiru")
 class QueueServiceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

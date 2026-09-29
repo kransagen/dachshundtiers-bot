@@ -141,7 +141,12 @@ QUEUE_CHANNELS_FILE = "queue_channels.json"
 
 
 def get_queue_channel_id(kit_key: str):
-    """ID kanálu panelu fronty pro kit: runtime JSON > env/defaulty (nebo None)."""
+    """ID kanálu panelu fronty pro kit: runtime JSON > env/defaulty (nebo None).
+
+    Čistý čtenář – poškozený soubor zde spadá na env/default, což je správné:
+    nikdo nepotřebuje přesnou hodnotu, aby se nezdrželo. ZAPISUJÍCí cesta
+    :func:`set_queue_channel_id` čte strict.
+    """
     from storage import load_data
 
     extra = load_data(QUEUE_CHANNELS_FILE, {})
@@ -156,10 +161,16 @@ def get_queue_channel_id(kit_key: str):
 
 
 def set_queue_channel_id(kit_key: str, channel_id: int) -> None:
-    """Uloží/změní kanál panelu fronty pro kit (používá /addqchannel)."""
+    """Uloží/změní kanál panelu fronty pro kit (používá /addqchannel).
+
+    Čte ``strict=True``: při poškozeném queue_channels.json se vyhodí
+    ``DataCorruptionError`` a zápis se neprovede. Bez toho by ``load_data``
+    vrátila ``{}`` a uložil by se jen jeden kit, čímž by se ztratilo
+    ostatní přiřazení kanálů.
+    """
     from storage import load_data, save_data
 
-    extra = load_data(QUEUE_CHANNELS_FILE, {})
+    extra = load_data(QUEUE_CHANNELS_FILE, {}, strict=True)
     extra[str(kit_key).lower()] = int(channel_id)
     save_data(QUEUE_CHANNELS_FILE, extra)
 

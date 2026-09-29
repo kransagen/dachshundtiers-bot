@@ -6,8 +6,10 @@ import unittest
 from unittest import mock
 
 import storage
+from tests import json_backend_only
 
 
+@json_backend_only("testuje čtení/zápis/corrupt na JSON souborech v tempdiru")
 class StorageTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

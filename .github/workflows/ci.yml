@@ -49,6 +49,10 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql://bot:bot@127.0.0.1:5432/dachshundtiers
+      # Požadavkový příznak pro tests/test_store_postgres.py: když je nastaven,
+      # testy se NESMÍ přeskočit. Bez DATABASE_URL by job tiše prošel a PG backend
+      # by v CI zůstal netestovaný.
+      REQUIRE_POSTGRES_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
 

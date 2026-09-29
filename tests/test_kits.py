@@ -13,9 +13,11 @@ import unittest
 from unittest import mock
 
 import storage
+from tests import json_backend_only
 from utils import DEFAULT_KITS, canonical_kit_name, get_kits, migrate_mode_keys
 
 
+@json_backend_only("sleduje kits.json v tempdiru včetně stavu 'soubor chybí'")
 class GetKitsTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

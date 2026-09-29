@@ -53,6 +53,7 @@ from cogs.sync import (
     _send_embed_pack,
     build_embed_pack,
 )
+from tests import json_backend_only
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +170,7 @@ def _sent(inter):
 # ---------------------------------------------------------------------------
 # /sync check – read-only diagnostika
 # ---------------------------------------------------------------------------
+@json_backend_only("fixture players.json v tempdiru + audit logy jako soubory")
 class SyncCheckTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -349,6 +351,7 @@ class SyncCheckTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # /sync discord – DB → Discord role (RoleSyncService)
 # ---------------------------------------------------------------------------
+@json_backend_only("fixture players.json v tempdiru + audit logy jako soubory")
 class SyncDiscordTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -720,6 +723,7 @@ class SyncWebTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # /sync data – kontrola integrity + bezpečné opravy
 # ---------------------------------------------------------------------------
+@json_backend_only("fixture players.json v tempdiru + audit logy jako soubory")
 class SyncDataTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
@@ -854,6 +858,7 @@ class SyncDataTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Deprecated aliasy – FUNKČNÍ, delegují na sdílené orchestrace + upozorní
 # ---------------------------------------------------------------------------
+@json_backend_only("fixture players.json v tempdiru + audit logy jako soubory")
 class DeprecatedAliasTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.mkdtemp()

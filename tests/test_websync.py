@@ -20,6 +20,7 @@ from unittest import mock
 import github_sync
 import storage
 from services import websync
+from tests import json_backend_only
 
 
 def _player(username, modes=None, history=None):
@@ -480,6 +481,7 @@ class WebSyncServiceTests(unittest.TestCase):
         asyncio.run(main())
 
 
+@json_backend_only("websync_log.json jako append-only soubor v tempdiru")
 class WebSyncAuditLogTests(unittest.TestCase):
     """Auditní log data/websync_log.json (append-only, restart-safe)."""
 

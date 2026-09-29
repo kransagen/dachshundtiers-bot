@@ -15,7 +15,16 @@ from pathlib import Path
 
 from alembic import context
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    from dotenv import load_dotenv
+
+    # Same .env as the bot (config.py); real environment variables still win.
+    load_dotenv(REPO_ROOT / ".env")
+except ImportError:
+    pass
 
 from db import models  # noqa: E402,F401  (register all tables)
 from db.base import Base  # noqa: E402

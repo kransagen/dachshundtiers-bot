@@ -264,3 +264,23 @@ async def test_bot_startup_runs_legacy_import_when_requested(monkeypatch, mode):
         engine, _sf = await bot._init_database()
         await engine.dispose()
     assert run.await_args.kwargs["apply"] is (mode == "apply")
+
+
+async def test_runtime_config_filled_into_bot_config(session_factory, clean_db, data_dir, tmp_path):
+    from services import config_store
+
+    _write(data_dir, "queue_channels.json", {"NetheriteSword": "7001", "AnchorPvP": "7002"})
+    _write(data_dir, "ht3_panel_message.json", {"message_id": "8001", "channel_id": "8002"})
+    await config_store.set_queue_channel_id("anchorpvp", 9999, session_factory=session_factory)
+
+    summary = await _run(session_factory, data_dir, tmp_path, apply=True)
+    assert summary["counts"]["queue_channels_created"] == 1
+    assert summary["counts"]["queue_channels_existing"] == 1
+    assert await config_store.get_queue_channel_id("netheritesword", session_factory=session_factory) == 7001
+    # /addqchannel nastavený v DB má přednost – nepřepisuje se.
+    assert await config_store.get_queue_channel_id("anchorpvp", session_factory=session_factory) == 9999
+    assert await config_store.get_ht3_panel(session_factory=session_factory) == {
+        "message_id": "8001", "channel_id": "8002",
+    }
+    again = await _run(session_factory, data_dir, tmp_path, apply=True)
+    assert again["noop"] is True

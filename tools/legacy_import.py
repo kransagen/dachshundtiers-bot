@@ -669,6 +669,38 @@ class Importer:
             out[recorded_at.astimezone(PRAGUE).strftime("%m.%Y")] += 1
         return dict(out)
 
+    async def config_step(self) -> None:
+        """queue_channels.json / ht3_panel_message.json → bot_config (fill gaps)."""
+        from services.config_store import HT3_PANEL_KEY, QUEUE_CHANNELS_KEY
+
+        cfg = BotConfigRepository()
+        raw = self.src.get("queue_channels.json", {}) or {}
+        if isinstance(raw, dict) and raw:
+            current = dict(await cfg.get(self.s, QUEUE_CHANNELS_KEY, {}) or {})
+            missing = {}
+            for kit_key, channel_id in raw.items():
+                key, cid = str(kit_key).strip().lower(), _as_int(channel_id)
+                if not key or cid is None:
+                    self.r.issue("queue_channel_invalid", str(kit_key), f"Neplatný kanál `{channel_id}`.")
+                elif key in current:
+                    self.r.inc("queue_channels_existing")
+                else:
+                    missing[key] = cid
+            if missing:
+                await cfg.merge(self.s, QUEUE_CHANNELS_KEY, missing)
+                self.r.inc("queue_channels_created", len(missing))
+
+        panel = self.src.get("ht3_panel_message.json", {}) or {}
+        if isinstance(panel, dict) and panel.get("message_id"):
+            if await cfg.get(self.s, HT3_PANEL_KEY, None):
+                self.r.inc("ht3_panel_existing")
+            else:
+                await cfg.set(self.s, HT3_PANEL_KEY, {
+                    "message_id": str(panel["message_id"]),
+                    "channel_id": str(panel.get("channel_id") or ""),
+                })
+                self.r.inc("ht3_panel_created")
+
     async def archive_step(self) -> None:
         audit = AuditRepository()
         for doc in list(self.src.docs.values()) + self.src.shadowed:
@@ -700,10 +732,12 @@ class Importer:
         await self.testers_step()
         await self.cooldowns_step(now)
         await self.tester_stats_step()
+        await self.config_step()
         await self.archive_step()
         handled = {
             "kits.json", "kit_roles.json", "players.json", "ht_results.json", "evals.json",
             "testers.json", "cooldowns.json", "ht3_cooldowns.json", "testers_stats.json",
+            "queue_channels.json", "ht3_panel_message.json",
         }
         self.r.counts["archived_only_keys"] = len(set(self.src.docs) - handled)
 

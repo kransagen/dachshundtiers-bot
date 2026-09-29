@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import glob
 import subprocess
 from pathlib import Path
 
@@ -47,7 +46,7 @@ from db.models import (
 # the 3.13 interpreter no longer existed on this machine).
 from embedded_postgres._commands import POSTGRES_BIN_PATH as PG_BIN
 
-from services.phase_d.backup import load_manifest, restore_backup
+from services.phase_d.backup import backup_data_dir, load_manifest, restore_backup
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -296,19 +295,28 @@ async def test_pg_dump_restore_roundtrip_preserves_rows(e10_db):
         dump_path.unlink(missing_ok=True)
 
 
-def _latest_phase_d_backup() -> Path:
-    candidates = sorted(
-        Path(p)
-        for p in glob.glob(str(REPO_ROOT / "backups" / "phase_d" / "*" / ""))
-        if (Path(p) / "manifest.json").exists()
-    )
-    assert candidates, "Backup adresář phase_d s manifest.json existuje"
-    return candidates[-1]
+@pytest.fixture
+def phase_d_backup(tmp_path) -> Path:
+    """Záloha ze syntetické data/ složky (skutečná data hráčů v gitu nejsou)."""
+    data = tmp_path / "data"
+    data.mkdir()
+    fixtures = {
+        "players.json": [{"username": "Alice", "modes": {}, "history": {}}],
+        "kits.json": ["NetheriteSword"],
+        "testers.json": ["111"],
+        "cooldowns.json": {"111": 1_780_000_000_000},
+        "ht3_cooldowns.json": {"111": {"NetheriteSword": 1_780_000_000_000}},
+        "testers_stats.json": {"111": {"total": 1, "monthly": {"09.2026": 1}}},
+    }
+    for name, payload in fixtures.items():
+        (data / name).write_text(json.dumps(payload), encoding="utf-8")
+    backup_dir, _manifest = backup_data_dir(data, dest_root=tmp_path / "backups")
+    return backup_dir
 
 
 @pytest.mark.asyncio
-async def test_phase_d_json_backup_intact_and_verify_only(e10_db):
-    backup_dir = _latest_phase_d_backup()
+async def test_phase_d_json_backup_intact_and_verify_only(e10_db, phase_d_backup):
+    backup_dir = phase_d_backup
     manifest = load_manifest(backup_dir)
     assert manifest["summary"]["files"] >= 5
 
@@ -322,9 +330,9 @@ async def test_phase_d_json_backup_intact_and_verify_only(e10_db):
 
 
 @pytest.mark.asyncio
-async def test_restore_never_reaches_discord(e10_db, tmp_path):
+async def test_restore_never_reaches_discord(e10_db, tmp_path, phase_d_backup):
     _socket_dir, _factory, _upgrade = e10_db
-    backup_dir = _latest_phase_d_backup()
+    backup_dir = phase_d_backup
 
     data = tmp_path / "restore_target"
     report = restore_backup(backup_dir, data)

@@ -17,17 +17,22 @@ na **discord.py**.
   (kopie pro GitHub/web) – nikdy se nečte zpět jako zdroj aktuálního tieru.
   Pokud export z PostgreSQL selže, `/sync web` to nahlásí nahlas jako
   „LEGACY JSON FALLBACK“, nikdy potichu.
-- **Normální synchronizace je read-only.** `/sync discord` jen čte Discord a
-  zapisuje do PostgreSQL zrcadla; nikdy neopačně. Jediné příkazy, které smí
-  měnit Discord role, jsou vypsané výše.
+- **Normální synchronizace je read-only.** `/sync discord` i automatická
+  reconciliation (při startu a každou hodinu) jen čtou role z Discordu a
+  zapisují je do PostgreSQL zrcadla; nikdy neopačně. Jediné příkazy, které
+  smí měnit Discord role, jsou vypsané výše.
+- **Žádné JSON úložiště za běhu.** Stará data z `data/*.json` a z tabulky
+  `dachshundtiers_data` se jednorázově převádějí do normalizovaných tabulek
+  příkazem `python -m tools.legacy_import` (viz sekce [Data](#data)).
 
 Podrobnosti a auditní důkaz viz `docs/PHASE_G0_FINAL_REPORT.md` a
 `docs/PHASE_H_FINAL_REPORT.md`.
 
 ### Pravidla identity a historie
 
-- **Retired tier** – prefix `R` v `players.json` (např. `RLT2`) je archivovaná
-  historie: nikdy se nemaže ani nepřepisuje, synchronizace ho jen reportuje.
+- **Retired tier** – prefix `R` (např. `RLT2`) je v `tier_definitions`
+  samostatný tier typu `retired`, který odkazuje na svůj základní tier
+  (`RLT2` → `LT2`). Nikdy se nemaže ani nepřepisuje.
 - **`discordId`** je permanentní identita hráče (páruje se přes změnu IGN).
   Konflikt (stejný IGN, jiné `discordId`) se nikdy neřeší automaticky.
 - **`/removeplayertiers`** odebírá jen aktuální tiery (`modes`); historie
@@ -87,15 +92,16 @@ ve službách (`services/checkweb`, `services/role_sync`, `services/websync`,
 | Příkaz | Co dělá | Mění Discord/DB? |
 |---|---|---|
 | `/sync check [area]` *(admin)* | Read-only diagnostika: Discord role × DB × web + integrita dat. Agreguje OK/WARNING/CONFLICT/ERROR, filtr `area`. | Nic – jen report. |
-| `/sync discord mode:preview\|apply` *(admin)* | Discord tier role vs. kanonická DB. `apply` po potvrzení aplikuje rozdíly (role add/remove). | Jen Discord role (nikdy DB z Discordu nepřepisuje opačně – to už tak nefunguje, DB se aktualizuje ze čtení Discordu). |
+| `/sync discord` *(admin)* | Přečte tier role všech členů a zapíše je do PostgreSQL zrcadla (Discord → DB). Hlásí anomálie: více tier rolí pro jeden kit, neznámé hráče, tier v DB bez role na Discordu. | Jen DB zrcadlo; Discord role se nemění. |
 | `/sync discord-rollback [mode] [target_ts]` *(admin)* | Bezpečná inverze posledního `/sync discord apply` – vrátí Discord do stavu před syncem, výhradně přes `memberId`/`roleId` z auditu. Kontroluje, jestli hráč nebyl mezitím znovu povýšen. Výchozí `mode:preview` (dry run). | Jen Discord role, po explicitním potvrzení. |
 | `/sync importdiscord mode:preview\|apply` *(admin)* | Náhled jednoznačných rozdílů Discord × DB – **nic nezapisuje** (ani DB, ani web); nasměruje k `/sync discord` a `/sync web`. | Nic. |
 | `/sync web mode:preview\|apply` *(admin)* | Export kanonických dat na GitHub/web. `apply` po potvrzení nahradí web. Selhání GitHubu se nikdy nehlásí jako úspěch. | Jen GitHub soubor. |
 | `/sync data` *(admin)* | Kontrola integrity: duplicity, neplatné tiery, konfliktní role, osamocené tickety. Opravy jen po potvrzení tlačítkem. | Jen po potvrzení, jen neautoritativní opravy. |
 
-Audit: `data/playersync_log.json` (discord), `data/playersync_rollback_log.json`
-(rollback), `data/websync_log.json` (web), `data/checkweb_log.json` +
-`data/datacheck_log.json` (check/data).
+Audit: `/sync discord` a automatická reconciliation zapisují do tabulek
+`sync_runs` / `sync_actions` (jen skutečné změny a anomálie). Ostatní
+podpříkazy zatím zapisují audit ještě přes JSON dokumenty v tabulce
+`dachshundtiers_data` – jejich přesun do `audit_logs` je rozpracovaný.
 
 ### 💸 HT3+ tickety
 | Příkaz | Popis |
@@ -147,8 +153,12 @@ roomky) a vylosují se 1v1 zápasy.
 bot.py                # jádro bota (vstup: python bot.py)
 main.py               # vstupní bod pro hosting (startup file = main.py)
 config.py             # konfigurace (.env) + runtime kanály front
-storage.py            # legacy JSON I/O + non-tier operační JSONB tabulka
-db/                    # PostgreSQL: modely, repozitáře, služby, migrace
+storage.py            # legacy JSON I/O (dožívá; nahrazuje ho db/)
+db/                    # PostgreSQL: modely, repozitáře, služby
+  tier_catalog.py       # žebříček tierů, pořadí (rank), retired varianty
+migrations/            # Alembic migrace schématu
+tools/
+  legacy_import.py      # jednorázový import starých JSON dat do PostgreSQL
 panel.py               # živý waitlist panel
 views.py               # tlačítka, select menu, modály
 utils.py               # pomocné funkce
@@ -164,23 +174,38 @@ cogs/
   ht3.py                # HT3+ tickety
   tournaments.py        # turnaje
   kits.py               # správa kitů
-data/                   # JSON databáze (vytvoří se za běhu; export/legacy v PG režimu)
+data/, backups/         # lokální JSON data a zálohy – NIKDY v gitu (.gitignore)
 ```
 
 ## Instalace a spuštění
 
 ```bash
-# 1. Závislosti
-pip install -r requirements.txt
+# 1. Virtuální prostředí + závislosti
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 
-# 2. Konfigurace (token a volitelně další hodnoty)
-cp .env.example .env   # doplň DISCORD_TOKEN
-# nebo: export DISCORD_TOKEN=...
+# 2. Konfigurace
+cp .env.example .env   # doplň DISCORD_TOKEN a DATABASE_URL
 
-# 3. Spuštění lokálně
-python bot.py
+# 3. Schéma databáze
+.venv/bin/alembic upgrade head
+
+# 4. Spuštění lokálně
+.venv/bin/python bot.py
 # nebo (hosting obvykle spouští main.py)
-python main.py
+.venv/bin/python main.py
+```
+
+> Když `.venv` přestane fungovat po aktualizaci systémového Pythonu
+> (odkazuje na verzi, která už neexistuje), obnov ho přes
+> `python3 -m venv --clear .venv` a znovu nainstaluj závislosti.
+
+Testy běží nad skutečnou PostgreSQL (`embedded-postgres` si stáhne binárky
+sám, žádná instalace serveru není potřeba):
+
+```bash
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
 ```
 
 > `.env` je automaticky načten přes `python-dotenv` (viz `config.py`).
@@ -205,44 +230,54 @@ python main.py
 | `GUILD_ID` | Scope registrace příkazů – nastaveno = jen tato guilda, prázdné = globálně. |
 | `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`). |
 | `GITHUB_*` | Volitelný export `players.json` na GitHub. |
-| `DATABASE_URL` | PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj běží legacy JSON-only režim. |
+| `DATABASE_URL` | **Povinné.** PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot nenastartuje. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL` (bot URL sestaví sám). |
 | `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB (hodí se bez IPv6 trasy). |
 
 > Kanál panelu fronty jde nastavit i za běhu přes `/addqchannel`
-> (`data/queue_channels.json`, má přednost před env i defaulty).
+> (ukládá se do tabulky `bot_config`, má přednost před env i defaulty).
 
 ## Data
 
 `DATABASE_URL` je **povinné** – bez něj bot start odmítne (žádný JSON-only
-deployment mode, žádný tichý fallback). Discord je autorita aktuálního
-tieru, PostgreSQL je perzistentní zrcadlo/historie/audit. `players.json`
-(a ostatní JSON soubory) zatím zůstávají jako export/kompatibilita a jako
-podpůrné úložiště pro některé nekritické subsystémy (cooldowny, tickety,
-fronta) – jejich postupný přesun na relační PostgreSQL tabulky probíhá.
-Nedostupné/nemigrované PostgreSQL při startu = tvrdá chyba.
+režim, žádný tichý fallback). Discord je autorita aktuálního tieru,
+PostgreSQL drží zrcadlo aktuálních tierů, historii, výsledky, fronty,
+tickety, cooldowny, statistiky a audit. Schéma spravuje Alembic
+(`alembic upgrade head`).
 
-Migrace existujících JSON dat do PostgreSQL (nemaže originály):
+`players.json` vzniká jen jako **generovaný export** z PostgreSQL pro
+GitHub/web (`/sync web`); nikdy se nečte zpět.
+
+### Převod starých JSON dat (jednorázově)
+
+Data z `data/*.json` a z tabulky `dachshundtiers_data` (JSON dokumenty z
+dřívějšího režimu) převede do normalizovaných tabulek jeden příkaz:
 
 ```bash
-DATABASE_URL='postgresql://user:heslo@host:5432/dachshundtiers' \
-  python migrate_json_to_postgres.py
+.venv/bin/python -m tools.legacy_import --preview   # záloha + import naprázdno
+.venv/bin/python -m tools.legacy_import --apply     # záloha + import
+.venv/bin/python -m tools.legacy_import --apply     # kontrola: „Beze změn“
 ```
 
-Skript načítá i `.env` – místo `DATABASE_URL` jde použít samostatné
-`DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD`. Po migraci nastav
-stejnou proměnnou v hostingu, restartuj bota a ověř `/dbstatus`.
+- **Záloha vždy jako první** do `backups/legacy_import/<UTC čas>/`: zdrojové
+  dokumenty, dump všech tabulek a `manifest.json` se SHA-256. Vedle se uloží
+  `preview_report.json` / `apply_report.json`.
+- **Preview** projde celý import v jedné transakci a vrátí ji zpět – nic
+  se nezapíše. **Apply** stejnou transakci potvrdí.
+- **Idempotentní** – opakované spuštění nic nezmění (přirozené klíče,
+  výsledky se stejnými klíči jako za běhu bota: `result:{id}`,
+  `ht_fight:{id}`).
+- **Doplňuje, nepřepisuje.** Existující stav v DB má vždy přednost: delší
+  cooldown se nezkrátí, odebraný eval se nevrátí, testeři se doplní jen do
+  prázdné tabulky, existující hráč se nepřejmenuje. Aktuální tiery se
+  neimportují – ty patří Discordu (`/sync discord`).
+- **Tabulka má přednost před souborem**, pokud existuje stejný klíč v obou
+  (rozdíl se vypíše jako konflikt).
+- **Nic se neztratí** – každý zdrojový dokument se archivuje beze změny do
+  `audit_logs` (`action = 'legacy_archive'`), i když nemá relační cíl.
 
-Datové soubory (JSON-only režim / export): `players.json` (`modes`, `history`,
-volitelně `discordId`), `queue.json`, `active_queues.json`,
-`queue_messages.json`, `queue_channels.json`, `testers.json`, `cooldowns.json`,
-`testers_stats.json`, `ht3_cooldowns.json`, `tournaments.json`,
-`pulled_players.json`, `kits.json`. Kanonická historie výsledků
-(`/result` i `/topresult`) je v `ht_results.json` (append-only). Auditní logy
-synchronizací: viz sekce `/sync` výše. Server-specific `data/kit_roles.json`
-(role dle `/setkitrole`) se necommituje.
+Příkaz načítá `.env`, takže stačí mít v něm `DATABASE_URL` (nebo
+`DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD`).
 
-**Odolnost proti poškozeným souborům:** čtení vrací default a zaloguje
-chybu; zápisy (transakce) čtou ve strict režimu – poškozený JSON soubor se
-**nikdy nepřepíše** defaultními daty, operace se bezpečně přeruší. Zápis je
-atomický (dočasný soubor + `os.replace`).
+`data/` a `backups/` obsahují osobní údaje hráčů a jsou v `.gitignore` –
+nikdy je necommituj.

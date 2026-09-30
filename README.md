@@ -25,7 +25,7 @@ Oprávnění se nekontroluje přes Discord „Manage Roles“, ale přes **roli*
 
 | Kdo | Jak se pozná | Co může |
 |---|---|---|
-| **Hráč** | propojený účet | `/link`, `/linkign`, `/linked`, `/unlink`, `/join`, `/list`, `/leaveq` + tlačítka v panelech |
+| **Hráč** | propojený účet | `/link`, `/linkign`, `/linked`, `/unlink`, `/retire`, `/peaktier`, `/join`, `/list`, `/leaveq` + tlačítka v panelech |
 | **Tester** | má tester roli | + `/claim`, `/unclaim`, `/add`, `/remove`, `/seteval`, `/uneval`, `/result`, `/topresult`, `/turnajresult`, `/joinastester`, `/joinasqueue`, `/pull`, `/mktesterroom` |
 | **Admin** | má Discord **Administrator**, nebo roli z `ADMIN_ROLE_IDS` | + `/edituser`, `/linkdiscord`, `/addtest`, `/removetest`, `/removeplayertiers`, `/setkitrole`, `/unsetkitrole`, `/addkit`, `/removekit`, `/createturnaj`, `/deleteturnaj`, celé `/sync *`, `/dbstatus` |
 
@@ -344,6 +344,18 @@ Podrobnosti a auditní důkaz viz `docs/PHASE_G0_FINAL_REPORT.md` a
   zůstává.
 
 ## Funkce
+
+### 🧓 Retire a peak tier
+| Příkaz | Kdo | Popis |
+|---|---|---|
+| `/retire kit` | hráč | odchod do retire z LT2/HT2/LT1/HT1 v daném kitu. Bot ověří nárok, po potvrzení sundá roli tieru (a přidá roli retired tieru, je-li namapovaná), zapíše `R…` tier a uloží peak |
+| `/peaktier` | hráč | ukáže zapsané peaky a kolik dní / výher zbývá do dalších (nic nezapisuje) |
+
+Prahy: **LT2/HT2** 60 dní na tieru *nebo* 2 výhry, **LT1/HT1** 90 dní *nebo* 3 výhry
+(počítají se jen HT výsledky – `/topresult`: výhra nad testovaným o rank níže či
+stejným od doby, co máš současný tier). **HT3** dává peak po 60 dnech.
+Peak zapisuje bot sám (kontrola každou hodinu), nikdy se nemaže ani nesnižuje.
+Unretire zatím v botovi není.
 
 ### 🎯 Fronty na tier testy
 | Příkaz | Popis |

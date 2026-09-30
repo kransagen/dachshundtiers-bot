@@ -230,6 +230,7 @@ class DachshundTiersBot(commands.Bot):
             "cogs.info",
             "cogs.edituser",
             "cogs.link",
+            "cogs.retire",
         ]
         for extension in extensions:
             try:

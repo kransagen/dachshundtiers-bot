@@ -194,6 +194,7 @@ AUTHORIZED_MUTATION_SITES: set[tuple[str, str, str]] = {
     ("cogs.sync", "SyncDiscordRollbackView.confirm", "await apply_rollback_actions("),
     ("cogs.edituser", "EditUser._apply_roles", "await apply_role_actions("),
     ("cogs.edituser", "EditUser._apply_roles", "return await apply_role_actions("),
+    ("cogs.retire", "Retire.execute_retire", "await apply_role_actions("),
 }
 
 

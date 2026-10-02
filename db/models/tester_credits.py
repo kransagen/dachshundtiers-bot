@@ -28,6 +28,10 @@ from db.base import Base
 class TesterCredit(Base):
     __tablename__ = "tester_credits"
 
+    # Název třídy začíná na ``Test``, takže by ho pytestbral jako testovací
+    # třídu (PytestCollectionWarning) a nešlo by ho vůbec spustit.
+    __test__ = False
+
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     tester_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("players.id"), nullable=False

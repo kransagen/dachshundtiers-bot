@@ -111,17 +111,35 @@ class Queues(commands.Cog):
             )
 
         # Purge všech zpráv v kanálu kitu před novým panelem (jako v originále)
+        purged = 0
         try:
             async for message in kit_channel.history(limit=100):
                 await message.delete()
-        except (discord.Forbidden, discord.HTTPException):
-            pass
+                purged += 1
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as err:
+            log.warning(
+                "Purge kanálu %s (kit %s) skončil po %d zprávách: %s",
+                channel_id,
+                kit_key,
+                purged,
+                err,
+            )
 
         entries = await list_queue_entries(kit_key, session_factory=sf)
         embed = create_queue_embed(kit, entries, qdata["testers"])
 
         view = QueueView(kit)
-        message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
+        try:
+            message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as err:
+            log.exception("Panel fronty %s se nepodařilo odeslat do %s", kit_key, channel_id)
+            return await interaction.response.send_message(
+                f"❌ Fronta pro **{kit}** je uložená jako otevřená, ale panel se "
+                f"nepodařilo poslat do <#{channel_id}> ({type(err).__name__}). "
+                f"Staré zprávy jsou částečně smazané. Zavři ji `/closeq {kit_key}` "
+                "a zkus to znovu.",
+                ephemeral=True,
+            )
 
         # Záznam panelu (DB řádek fronty – queue_messages.json se nepoužívá)
         await set_queue_panel(kit_key, channel_id, message.id, session_factory=sf)

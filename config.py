@@ -4,6 +4,7 @@ Hodnoty se čtou z proměnných prostředí (podporován soubor ``.env``).
 """
 
 import json
+import logging
 import os
 from typing import Optional
 
@@ -14,12 +15,23 @@ try:
 except ImportError:
     pass
 
+log = logging.getLogger("dachshundtiers.config")
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
+    if not raw:
+        return default
     try:
-        return int(raw) if raw else default
+        return int(raw)
     except (TypeError, ValueError):
+        log.error(
+            "Neplatná proměnná %s=%r – používám výchozí %r. Bot bude čelit jiné "
+            "chování, než jsi nastavil/a (např. scope příkazů, cílové kanály).",
+            name,
+            raw,
+            default,
+        )
         return default
 
 
@@ -36,7 +48,9 @@ def _int_list_env(name: str) -> list:
         try:
             out.append(int(part))
         except (TypeError, ValueError):
-            continue
+            log.error(
+                "Proměnná %s: %r není platné ID – přeskočeno.", name, part
+            )
     return out
 
 
@@ -47,16 +61,33 @@ def _dict_env(name: str, default: dict) -> dict:
         return dict(default)
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as err:
+        log.error(
+            "Proměnná %s není platný JSON (%s) – používám výchozí mapu %r.",
+            name,
+            err,
+            default,
+        )
         return dict(default)
     if not isinstance(parsed, dict):
+        log.error(
+            "Proměnná %s musí být JSON objekt, ne %s – používám výchozí mapu %r.",
+            name,
+            type(parsed).__name__,
+            default,
+        )
         return dict(default)
     merged = dict(default)
     for key, value in parsed.items():
         try:
             merged[str(key).strip()] = int(value)
         except (TypeError, ValueError):
-            continue
+            log.error(
+                "Proměnná %s: hodnota %r pro klíč %r není platné ID – přeskočeno.",
+                name,
+                value,
+                key,
+            )
     return merged
 
 

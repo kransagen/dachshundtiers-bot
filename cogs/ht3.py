@@ -37,6 +37,7 @@ from services.tickets import (
     remove_member,
     unclaim_ticket,
 )
+from services.permissions import has_admin_role
 from utils import has_tester_role, kit_autocomplete
 from views import (
     HT3PanelView,
@@ -106,6 +107,11 @@ class HT3(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(name="sendht3", description="Pošle panel pro HT3+ tickety")
     async def sendht3(self, interaction: discord.Interaction) -> None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Na tohle musíš být Admin!", ephemeral=True
+            )
+
         target_channel = self.bot.get_channel(HT3_PANEL_CHANNEL_ID)
         if target_channel is None:
             try:

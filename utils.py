@@ -60,7 +60,13 @@ async def kit_autocomplete(
     )
     try:
         kits = await _get_kits_db(session_factory=session_factory)
-    except Exception:  # pragma: no cover - DB nedostupná, jen nabídka
+    except Exception as err:  # pragma: no cover - DB nedostupná, jen nabídka
+        _log.warning(
+            "Autocomplete kitů: katalog z DB selhal (%s: %s) – nabízím "
+            "výchozí sadu, ne registrované kity.",
+            type(err).__name__,
+            err,
+        )
         kits = list(DEFAULT_KITS)
     if current:
         kits = [k for k in kits if current.lower() in k.lower()]

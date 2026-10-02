@@ -75,21 +75,21 @@ def test_progress_thresholds():
 async def test_retire_refused_before_threshold(session_factory, clean_db):
     await _seed(session_factory, tier="HT2", days=10)
     with pytest.raises(RetireRefused) as err:
-        await plan_retire(session_factory, 1, "NethPot")
+        await plan_retire(session_factory, 1, "NethPot", now=NOW)
     assert "50 dní" in str(err.value) and "2 výher" in str(err.value)
 
 
 async def test_retire_refused_for_low_tier_and_unlinked(session_factory, clean_db):
     await _seed(session_factory, tier="HT3", days=200)
     with pytest.raises(RetireRefused):
-        await plan_retire(session_factory, 1, "NethPot")
+        await plan_retire(session_factory, 1, "NethPot", now=NOW)
     with pytest.raises(RetireRefused):
-        await plan_retire(session_factory, 999, "NethPot")
+        await plan_retire(session_factory, 999, "NethPot", now=NOW)
 
 
 async def test_retire_by_days_writes_retired_tier_and_peak(session_factory, clean_db):
     player_id, kit_id = await _seed(session_factory, tier="LT2", days=61)
-    plan = await plan_retire(session_factory, 1, "nethpot")
+    plan = await plan_retire(session_factory, 1, "nethpot", now=NOW)
     assert plan.retired_tier_code == "RLT2"
     await commit_retire(session_factory, plan, actor_name="Alice")
     async with transaction(session_factory) as session:
@@ -99,13 +99,13 @@ async def test_retire_by_days_writes_retired_tier_and_peak(session_factory, clea
         assert await player_peaks(session, await session.get(Player, player_id)) == [
             ("NethPot", "LT2")]
     with pytest.raises(RetireRefused):
-        await plan_retire(session_factory, 1, "NethPot")
+        await plan_retire(session_factory, 1, "NethPot", now=NOW)
 
 
 async def test_lt1_needs_90_days(session_factory, clean_db):
     await _seed(session_factory, tier="LT1", days=80)
     with pytest.raises(RetireRefused):
-        await plan_retire(session_factory, 1, "NethPot")
+        await plan_retire(session_factory, 1, "NethPot", now=NOW)
 
 
 async def test_wins_only_count_same_or_one_rank_below(session_factory, clean_db):
@@ -117,7 +117,7 @@ async def test_wins_only_count_same_or_one_rank_below(session_factory, clean_db)
         (prog,) = await player_progress(session, await session.get(Player, player_id), now=NOW)
     assert prog.wins == 1 and not prog.eligible
     await _win(session_factory, player_id, kit_id, "HT2", "w2")
-    plan = await plan_retire(session_factory, 1, "NethPot")
+    plan = await plan_retire(session_factory, 1, "NethPot", now=NOW)
     assert plan.progress.reason == "wins"
 
 

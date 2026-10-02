@@ -310,9 +310,11 @@ async def _kit_by_ref(session: AsyncSession, ref: str) -> Optional[Kit]:
     )
 
 
-async def plan_retire(session_factory, discord_id: int, kit_ref: str) -> RetirePlan:
+async def plan_retire(
+    session_factory, discord_id: int, kit_ref: str, *, now: Optional[datetime] = None
+) -> RetirePlan:
     """Ověří nárok na retire; ``RetireRefused`` s hláškou, pokud nejde."""
-    now = _utcnow()
+    now = now or _utcnow()
     async with transaction(session_factory) as session:
         player = await PlayerRepository().get_by_discord_id(session, int(discord_id))
         if player is None or player.ign_linked_at is None:

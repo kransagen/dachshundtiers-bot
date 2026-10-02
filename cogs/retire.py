@@ -42,6 +42,13 @@ def _progress_line(p: Progress) -> str:
     return f"**{p.kit_name}** · {p.tier_code} – " + " ".join(parts)
 
 
+def _missing_retired_role(plan: RetirePlan) -> str:
+    return (
+        f"❌ Pro **{plan.retired_tier_code}** v kitu **{plan.kit_name}** není "
+        "namapovaná Discord role – retire zatím nelze provést, napiš adminovi."
+    )
+
+
 class RetireConfirmView(discord.ui.View):
     def __init__(self, cog: "Retire", user_id: int, plan: RetirePlan):
         super().__init__(timeout=120)
@@ -94,6 +101,14 @@ class Retire(commands.Cog):
 
     async def execute_retire(self, interaction: discord.Interaction, plan: RetirePlan) -> str:
         member = interaction.user
+        try:
+            fresh = await plan_retire(self._sf(), member.id, plan.kit_name)
+        except RetireRefused as err:
+            return str(err)
+        if fresh.tier_id != plan.tier_id:
+            return "❌ Tvůj tier se mezitím změnil – zopakuj `/retire`."
+        if not plan.grant_discord_role:
+            return _missing_retired_role(plan)
         actions = []
         if plan.revoke_discord_role and any(r.id == plan.revoke_discord_role for r in member.roles):
             actions.append({"op": "remove", "role_id": plan.revoke_discord_role})
@@ -107,6 +122,9 @@ class Retire(commands.Cog):
             return "❌ Nepodařilo se změnit role na Discordu, retire se neprovedl."
         try:
             await commit_retire(self._sf(), plan, actor_name=str(member))
+        except RetireRefused as err:
+            log.error("/retire: plán už neplatí po změně rolí (user %s): %s", member.id, err)
+            return f"{err}\n⚠️ Role na Discordu už jsou změněné – napiš adminovi."
         except Exception:  # noqa: BLE001
             log.exception("/retire: zápis do DB selhal po změně rolí (user %s)", member.id)
             return (
@@ -133,6 +151,10 @@ class Retire(commands.Cog):
             plan = await plan_retire(self._sf(), interaction.user.id, kit)
         except RetireRefused as err:
             return await interaction.followup.send(str(err), ephemeral=True)
+        if not plan.grant_discord_role:
+            return await interaction.followup.send(
+                _missing_retired_role(plan), ephemeral=True
+            )
         await interaction.followup.send(
             f"Opravdu chceš v kitu **{plan.kit_name}** odejít z **{plan.tier_code}** "
             f"do **{plan.retired_tier_code}**? Zpět to jde jen unretire testem.",

@@ -1,6 +1,6 @@
 """Phase D production regression: /sync discord je observe-only.
 
-Důkaz, že běh skutečného cogu ``_run_discord``:
+Důkaz, že náhled + potvrzení skutečného cogu (``_run_discord`` + tlačítko):
   - nikdy nezavolá rolovou mutaci (add_roles/remove_roles/edit_role/set_roles),
   - zrcadlí Discord → PostgreSQL (nikdy DB → Discord),
   - nikdy nepoužije players.json ke zjištění žádaných rolí.
@@ -12,6 +12,7 @@ from unittest import mock
 
 from sqlalchemy import select
 
+import storage
 from cogs import sync as sync_cog
 from db.models import Kit, TierDefinition
 from db.repositories.kits import KitRoleRepository, ensure_dimensions
@@ -78,11 +79,21 @@ async def _run_cog(session_factory, members):
     ), mock.patch.object(
         cm, "guild_members", new=mock.AsyncMock(return_value=members)
     ), mock.patch.object(
-        cm, "load_data", new=mock.MagicMock(
+        storage, "load_data", new=mock.MagicMock(
             side_effect=AssertionError("players.json nesmí být zdrojem rolí")
         )
     ) as load_mock:
         await cog._run_discord(inter)
+        view = inter.followup.send.await_args.kwargs.get("view")
+        assert view is not None, "změny k zápisu musí nabídnout potvrzení"
+        click = mock.MagicMock()
+        click.client.db_session_factory = session_factory
+        click.guild = inter.guild
+        click.user.id = 1
+        click.response.defer = mock.AsyncMock()
+        click.followup.send = mock.AsyncMock()
+        click.message.edit = mock.AsyncMock()
+        await view.confirm.callback(click)
     return inter, load_mock
 
 

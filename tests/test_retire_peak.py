@@ -39,7 +39,7 @@ async def _seed(session_factory, tier="HT2", days=61, discord_id=1, ign="Alice")
             select(TierDefinition.id).where(TierDefinition.code == tier))).scalar_one()
         await MirrorServiceRepository().apply_observation(
             session, player_id=player.id, kit_id=kit.id, tier_id=tid,
-            observed_at=NOW - timedelta(days=days), source="discord_sync",
+            observed_at=datetime.now(timezone.utc) - timedelta(days=days), source="discord_sync",
         )
         return player.id, kit.id
 
@@ -59,7 +59,7 @@ async def _win(session_factory, player_id, kit_id, testee_tier, key, kind="ht_fi
             evaluator_id=player_id if kind == "ticket" else None,
             opponent_id=1 if kind == "ht_fight" else None,
             previous_tier_id=await _tier_id(session, testee_tier),
-            outcome="Won" if kind == "ticket" else "Lost", recorded_at=NOW - timedelta(days=1),
+            outcome="Won" if kind == "ticket" else "Lost", recorded_at=datetime.now(timezone.utc) - timedelta(days=1),
         )
 
 
@@ -138,3 +138,20 @@ async def test_sweep_grants_ht3_peak_and_never_lowers(session_factory, clean_db)
     async with transaction(session_factory) as session:
         peak = (await session.execute(select(PlayerPeakTier))).scalar_one()
         assert (await session.get(TierDefinition, peak.tier_id)).code == "HT3"
+
+
+async def test_commit_retire_refused_when_tier_changed_since_plan(session_factory, clean_db):
+    player_id, kit_id = await _seed(session_factory, tier="LT2", days=61)
+    plan = await plan_retire(session_factory, 1, "nethpot")
+    async with transaction(session_factory) as session:
+        await MirrorServiceRepository().apply_observation(
+            session, player_id=player_id, kit_id=kit_id,
+            tier_id=await _tier_id(session, "HT2"),
+            observed_at=datetime.now(timezone.utc), source="promotion",
+        )
+    with pytest.raises(RetireRefused):
+        await commit_retire(session_factory, plan, actor_name="Alice")
+    async with transaction(session_factory) as session:
+        mirror = (await session.execute(select(PlayerCurrentTier))).scalar_one()
+        assert (await session.get(TierDefinition, mirror.tier_id)).code == "HT2"
+        assert await player_peaks(session, await session.get(Player, player_id)) == []

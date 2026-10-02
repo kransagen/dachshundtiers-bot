@@ -6,6 +6,11 @@ Použití:
 Skript pouze přidává/aktualizuje záznamy z ``data/*.json``. Původní JSON
 soubory nemaže; po migraci je proto možné nejdřív ověřit data a teprve pak
 spustit bota s ``DATABASE_URL``.
+
+POZOR: skript zapisuje jen do starého JSONB mostu (``storage.py``, tabulka
+``dachshundtiers_data``), ze kterého už bot nečte aktuální stav. Data do
+relačního schématu (hráči, kity, výsledky, cooldowny…) importuje
+``tools.legacy_import`` (``LEGACY_IMPORT=preview|apply`` při startu bota).
 """
 
 import json

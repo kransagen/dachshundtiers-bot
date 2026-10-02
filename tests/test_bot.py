@@ -27,7 +27,15 @@ class IntentTests(unittest.TestCase):
         intents = _build_intents()
         self.assertTrue(intents.guilds)
         self.assertTrue(intents.guild_messages)
-        self.assertTrue(intents.message_content)
+
+    def test_message_content_intent_disabled(self):
+        self.assertFalse(_build_intents().message_content)
+
+    def test_default_allowed_mentions_do_not_ping_everyone_or_roles(self):
+        allowed = bot_module.DachshundTiersBot().allowed_mentions
+        self.assertFalse(allowed.everyone)
+        self.assertFalse(allowed.roles)
+        self.assertTrue(allowed.users)
 
 
 class SyncOnceTests(unittest.TestCase):
@@ -88,6 +96,11 @@ if __name__ == "__main__":
 class KitRoleValidationTests(unittest.TestCase):
     """Startup validace kit-role mapování (design §7, fail-fast)."""
 
+    def setUp(self):
+        patch = mock.patch.object(bot_module, "GUILD_ID", 1)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def _make_bot(self):
         bot = bot_module.DachshundTiersBot()
         bot._kit_role_config_validated = False
@@ -125,6 +138,21 @@ class KitRoleValidationTests(unittest.TestCase):
             p.start()
         try:
             asyncio.run(self._run(bot))
+        finally:
+            for p in patches:
+                p.stop()
+        validate.assert_not_awaited()
+        self.assertTrue(bot._kit_role_config_validated)
+
+    def test_skipped_without_guild_id(self):
+        bot = self._make_bot()
+        bot.db_session_factory = object()
+        validate, patches = self._patch_validation(object())
+        for p in patches:
+            p.start()
+        try:
+            with mock.patch.object(bot_module, "GUILD_ID", None):
+                asyncio.run(self._run(bot))
         finally:
             for p in patches:
                 p.stop()
@@ -244,7 +272,33 @@ class StartupOnceTests(unittest.TestCase):
         restore = asyncio.run(main())
         self.assertEqual(restore.await_count, 1)
 
-    def test_restore_state_registers_tester_room_view(self):
+    def test_failed_restore_state_is_retried_on_next_ready(self):
+        async def main():
+            b = bot_module.DachshundTiersBot()
+            restore = mock.AsyncMock(side_effect=[RuntimeError("db down"), None])
+            with (
+                mock.patch.object(b, "_sync_commands_once", mock.AsyncMock()),
+                mock.patch.object(
+                    b, "_validate_kit_role_configuration_once", mock.AsyncMock()
+                ),
+                mock.patch.object(b, "_restore_state", restore),
+                mock.patch.object(
+                    type(b), "user", new_callable=mock.PropertyMock,
+                    return_value=mock.Mock(id=1),
+                ),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await b.on_ready()
+                self.assertFalse(b._startup_done)
+                await b.on_ready()
+                await b.on_ready()
+            return b, restore
+
+        b, restore = asyncio.run(main())
+        self.assertEqual(restore.await_count, 2)
+        self.assertTrue(b._startup_done)
+
+    def test_register_persistent_views_registers_tester_room_view(self):
         async def main():
             b = bot_module.DachshundTiersBot()
             added = []
@@ -252,10 +306,90 @@ class StartupOnceTests(unittest.TestCase):
                 mock.patch.object(b, "add_view", side_effect=lambda v, **kw: added.append(v)),
                 mock.patch("bot.get_ht3_panel", mock.AsyncMock(return_value={})),
             ):
-                await b._restore_state()
-            return added
+                await b._register_persistent_views()
+            return b, added
 
-        added = asyncio.run(main())
+        b, added = asyncio.run(main())
+        self.assertTrue(b._views_registered)
         self.assertTrue(
             any(isinstance(v, bot_module.TesterRoomView) for v in added)
         )
+
+
+class MainRetryTests(unittest.TestCase):
+    def _run_main(self, start_effects):
+        created = []
+
+        class FakeBot:
+            def __init__(self):
+                self.close = mock.AsyncMock()
+                self.start = mock.AsyncMock(side_effect=start_effects.pop(0))
+                created.append(self)
+
+        sleep = mock.AsyncMock()
+        engine = object()
+        with (
+            mock.patch.object(bot_module, "ensure_data_dir"),
+            mock.patch.object(
+                bot_module, "_init_database", mock.AsyncMock(return_value=(engine, object()))
+            ) as init_db,
+            mock.patch.object(bot_module, "DachshundTiersBot", FakeBot),
+            mock.patch.object(bot_module.asyncio, "sleep", sleep),
+            mock.patch("db.engine.dispose_engine", mock.AsyncMock()) as dispose,
+        ):
+            error = None
+            try:
+                asyncio.run(bot_module.main())
+            except SystemExit as err:
+                error = err
+        return created, sleep, init_db, dispose, error
+
+    def test_transient_errors_back_off_exponentially_and_init_db_once(self):
+        created, sleep, init_db, dispose, error = self._run_main(
+            [OSError("net"), OSError("net"), None]
+        )
+        self.assertIsNone(error)
+        self.assertEqual(init_db.await_count, 1)
+        self.assertEqual(len(created), 3)
+        self.assertEqual([c.args[0] for c in sleep.await_args_list], [5, 10])
+        for bot in created:
+            bot.close.assert_awaited_once()
+        dispose.assert_awaited_once()
+
+    def test_login_failure_exits_with_code_1_without_retry(self):
+        created, sleep, _init_db, dispose, error = self._run_main(
+            [bot_module.discord.LoginFailure("bad token")]
+        )
+        self.assertEqual(error.code, 1)
+        self.assertEqual(len(created), 1)
+        sleep.assert_not_awaited()
+        created[0].close.assert_awaited_once()
+        dispose.assert_awaited_once()
+
+
+class TreeErrorHandlerTests(unittest.TestCase):
+    def _handle(self, error):
+        inter = mock.MagicMock()
+        inter.response.is_done.return_value = False
+        inter.response.send_message = mock.AsyncMock()
+        tree = bot_module.DachshundTiersTree.__new__(bot_module.DachshundTiersTree)
+        with mock.patch.object(bot_module.log, "exception") as log_exception:
+            asyncio.run(tree.on_error(inter, error))
+        return inter.response.send_message.await_args.args[0], log_exception
+
+    def test_check_failure_is_not_logged_as_exception(self):
+        msg, log_exception = self._handle(bot_module.discord.app_commands.CheckFailure())
+        log_exception.assert_not_called()
+        self.assertIn("nemůžeš", msg)
+
+    def test_cooldown_reports_retry_after(self):
+        cooldown = bot_module.discord.app_commands.Cooldown(1, 10)
+        error = bot_module.discord.app_commands.CommandOnCooldown(cooldown, 7.0)
+        msg, log_exception = self._handle(error)
+        log_exception.assert_not_called()
+        self.assertIn("7 s", msg)
+
+    def test_unexpected_error_is_logged(self):
+        msg, log_exception = self._handle(bot_module.discord.app_commands.AppCommandError("x"))
+        log_exception.assert_called_once()
+        self.assertIn("neočekávaná chyba", msg)

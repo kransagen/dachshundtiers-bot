@@ -17,7 +17,6 @@ from services.kit_catalog import (
     remove_kit,
 )
 from services.permissions import has_admin_role
-from utils import has_tester_role
 from views import HT3PanelView
 
 
@@ -131,9 +130,9 @@ class Kits(commands.Cog):
         kit: str,
         kanal: discord.TextChannel = None,
     ) -> None:
-        if not has_tester_role(interaction.user):
+        if not has_admin_role(interaction.user):
             return await interaction.response.send_message(
-                "❌ Jen testeři můžou nastavit kanál fronty.", ephemeral=True
+                "❌ Pouze pro administrátory.", ephemeral=True
             )
         kit_name = kit.strip()
         kit_key = kit_name.lower()
@@ -149,21 +148,22 @@ class Kits(commands.Cog):
                 ephemeral=True,
             )
 
+        registered = await get_kits(
+            session_factory=getattr(self.bot, "db_session_factory", None)
+        )
+        if not any(existing.lower() == kit_key for existing in registered):
+            return await interaction.response.send_message(
+                f"❌ Kit **{kit_name}** není registrovaný. Nejdřív ho přidej přes `/addkit`.",
+                ephemeral=True,
+            )
+
         await set_queue_channel_id(
             kit_key,
             channel.id,
             session_factory=getattr(self.bot, "db_session_factory", None),
         )
 
-        registered = await get_kits(
-            session_factory=getattr(self.bot, "db_session_factory", None)
-        )
         message = f"✅ Panel fronty pro kit **{kit_name}** bude chodit do <#{channel.id}>."
-        if not any(existing.lower() == kit_key for existing in registered):
-            message += (
-                "\n💡 Kit zatím není v seznamu – přidej ho ještě přes `/addkit`, "
-                "ať se objeví v HT3+ panelu a u autocomplete."
-            )
         await interaction.response.send_message(message)
 
     # ------------------------------------------------------------------

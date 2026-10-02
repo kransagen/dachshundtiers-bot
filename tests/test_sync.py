@@ -1,28 +1,22 @@
-"""Cog-level testy centrální synchronizace – cogs/sync.py (a deprecated aliasy).
+"""Cog-level testy centrální synchronizace – cogs/sync.py.
 
-Pokrývají požadavky konsolidace /sync (orchestrace, logika zůstává ve
-službách):
+Pokrývají /sync (orchestrace, logika zůstává ve službách):
 
 - ``/sync check``    – read-only diagnostika: severity OK/WARNING/CONFLICT/
                        ERROR, filter podle oblasti (area), web nedostupný se
                        NEPOSÍLÁ do analyze_websync (žádné falešné nálezy),
-                       poškozená data → bezpečný abort, idempotence, audity
-                       zůstávají ve stávajících checkweb_log/datacheck_log,
-- ``/sync discord``  – observe-only: Discord → PostgreSQL mirror přes
-                       DiscordSyncService; ROLE SE NIKDY NEMĚNÍ (add_roles /
-                       remove_roles / edit = 0), bez PostgreSQL → tvrdá
-                       chyba (service neběží), DB selhání → loud error,
-                       strukturální kontrakt: cog neobsahuje žádný mutující
-                       helper (apply_role_actions / auto_grant_kit_role),
+                       idempotence, audit v checkweb_log,
+- ``/sync discord``  – jediná brána Discord → PostgreSQL: dry run náhled,
+                       zápis mirroru až po potvrzení tlačítkem (jednou);
+                       ROLE SE NIKDY NEMĚNÍ (add_roles / remove_roles / edit
+                       = 0), bez PostgreSQL → tvrdá chyba, DB selhání → loud
+                       error, strukturální kontrakt: cog neobsahuje žádný
+                       mutující helper,
 - ``/sync web``      – preview nic neposílá; apply → view; potvrzení nahraje
                        přes services.websync (GitHub), failure NIKDY není
                        success, bez GITHUB_TOKEN → nelze, prázdná DB se
                        neposílá, stale → nic,
-- ``/sync data``     – report + bezpečné opravy po potvrzení (ticket se zavře,
-                       záznam zůstává), poškozená data → abort,
-- deprecated aliasy /playersync /websync /checkweb /datacheck delegují na
-  sdílené orchestrace (`_run_discord`/`_run_web`/`_run_check`/`_run_data`/
-  `_run_checkweb_apply`) a v patičce upozorní „Deprecated",
+- povrch příkazů je jen discord / web / check / rollback,
 - administrátorský gate (has_admin_role / ADMIN_ROLE_IDS) u KAŽDÉ operace
   i u potvrzovacích tlačítek.
 """
@@ -42,19 +36,17 @@ import storage
 import cogs.sync as sync_mod
 from services import permissions
 from services.checkweb import CHECKWEB_LOG_FILE
-from services.datacheck import DATACHECK_LOG_FILE
 from services.websync import WEBSYNC_LOG_FILE
-from storage import DataCorruptionError
 
 from db.repositories.sync_audit import SYNC_RUN_SUCCESS
 from db.services import DiscordSyncService
+from db.services.mirror_sync import CHANGE_TIER_CHANGED, SyncChange
 
 from cogs.sync import (
     Sync,
-    SyncDataRepairView,
+    SyncDiscordConfirmView,
     SyncWebConfirmView,
     _check_embed,
-    _datacheck_embed,
     _send_embed_pack,
     build_embed_pack,
 )
@@ -190,10 +182,8 @@ class SyncCheckTests(unittest.TestCase):
         # Komplexní scénář – všechny severity najednou (ověřeno proti reálným
         # službám):
         #   conflict  = Alice (Discord HT3 vs DB HT2 -> DATABASE_MISMATCH)
-        #   warning   = 4× MISSING_DISCORD_ROLE + 3× websync missing_player
-        #               + invalid_tiers (Dave) + 2× missing_website_records
-        #               + retired_tiers_in_modes (Carol)
-        #   error     = duplicate_player_discord_ids (Alice+Eve)
+        #   warning   = MISSING_DISCORD_ROLE + websync missing_player
+        #   error     = Carol je v DB 2× (DUPLICATE_PLAYER)
         self.players = [
             _player("AliceMC", {"randompot": "HT2"}, discord_id="1",
                     history={"randompot": [{"date": "01.01.2026", "tier": "HT2"}]}),
@@ -202,7 +192,7 @@ class SyncCheckTests(unittest.TestCase):
             _player("CarolMC", {"randompot": "RHT2"}, discord_id="3",
                     history={"randompot": [{"date": "01.01.2024", "tier": "HT3"}]}),
             _player("DaveMC", {"randompot": "NONSENSE"}, discord_id="4"),
-            _player("EveMC", {"randompot": "HT2"}, discord_id="1"),
+            _player("carolmc", {"randompot": "HT2"}, discord_id="5"),
         ]
         self.web = [
             _player("AliceMC", {"randompot": "HT2"},
@@ -283,13 +273,13 @@ class SyncCheckTests(unittest.TestCase):
         self.assertIn("🔎 /sync check", embed.title)
         self.assertIn("❌ ERROR: **1**", embed.description)
         self.assertIn("🔶 CONFLICT: **1**", embed.description)
-        self.assertIn("⚠️ WARNING: **11**", embed.description)
-        self.assertIn("Nálezů celkem: **13**", embed.description)
+        self.assertIn("⚠️ WARNING: **5**", embed.description)
+        self.assertIn("Nálezů celkem: **7**", embed.description)
         self.assertIn("**GitHub**", embed.description)
         field_names = [f.name for f in embed.fields]
         self.assertTrue(any("ERROR (1)" in n for n in field_names))
         self.assertTrue(any("CONFLICT (1)" in n for n in field_names))
-        self.assertTrue(any("WARNING (11)" in n for n in field_names))
+        self.assertTrue(any("WARNING (5)" in n for n in field_names))
         # read-only – data beze změny
         self.assertEqual(storage.load_data("players.json", []), self.players)
 
@@ -298,14 +288,12 @@ class SyncCheckTests(unittest.TestCase):
         self._run(inter)
         cw_log = storage.load_data(CHECKWEB_LOG_FILE, [])
         self.assertTrue(any(e.get("mode") == "preview" for e in cw_log))
-        dc_log = storage.load_data(DATACHECK_LOG_FILE, [])
-        self.assertTrue(any(e.get("mode") == "check" for e in dc_log))
 
     def test_check_area_filter_web(self):
         inter = _interaction(user=_admin_member())
         self._run(inter, area="web")
         embed, _ = _sent(inter)
-        self.assertIn("⚠️ WARNING: **5**", embed.description)  # 3 websync + 2 datacheck
+        self.assertIn("⚠️ WARNING: **3**", embed.description)  # websync
         self.assertIn("❌ ERROR: **0**", embed.description)
         self.assertIn("🔶 CONFLICT: **0**", embed.description)
         self.assertIn("(Web)", embed.title)
@@ -322,34 +310,16 @@ class SyncCheckTests(unittest.TestCase):
         self._run(inter, area="roles")
         embed, _ = _sent(inter)
         self.assertIn("🔶 CONFLICT: **1**", embed.description)
-        self.assertIn("⚠️ WARNING: **4**", embed.description)
+        self.assertIn("⚠️ WARNING: **2**", embed.description)
 
     def test_check_website_unavailable_skips_websync_no_false_positives(self):
         inter = _interaction(user=_admin_member())
         self._run(inter, web=False)
         embed, _ = _sent(inter)
         self.assertIn("nedostupný", embed.description)
-        # warning: 4 checkweb MISSING + 1 invalid + 2 missing_website +
-        #          1 retired – ŽÁDNÝ websync missing_player (falešné nálezy)
-        self.assertIn("⚠️ WARNING: **8**", embed.description)
+        # warning: 2 checkweb MISSING – ŽÁDNÝ websync missing_player (falešné nálezy)
+        self.assertIn("⚠️ WARNING: **2**", embed.description)
         self.assertIn("❌ ERROR: **1**", embed.description)
-
-    def test_check_corrupted_data_aborts_cleanly(self):
-        _write_corrupt("players.json")
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-        guild_members = mock.AsyncMock()
-
-        async def main():
-            with mock.patch("cogs.sync.guild_members", new=guild_members):
-                await Sync.sync_check.callback(cog, inter)
-
-        asyncio.run(main())
-        embed, _ = _sent(inter)
-        self.assertIn("❌ /sync check – poškozená data", embed.title)
-        self.assertIn("`players.json`", embed.description)
-        # bezpečný abort – žádná analýza se neproběhla
-        guild_members.assert_not_awaited()
 
     def test_check_idempotent(self):
         inter1 = _interaction(user=_admin_member())
@@ -417,6 +387,8 @@ class SyncDiscordTests(unittest.TestCase):
             unknown_members=0,
             failed_members=0,
             unknown_roles=(),
+            tier_changes=0,
+            changes=(),
         )
         base.update(overrides)
         return SimpleNamespace(**base)
@@ -442,7 +414,7 @@ class SyncDiscordTests(unittest.TestCase):
         alice.remove_roles.assert_not_awaited()
         alice.edit.assert_not_awaited()
 
-    def test_observe_runs_service_and_reports(self):
+    def test_preview_runs_dry_run_and_offers_no_button_when_in_sync(self):
         cog = Sync.__new__(Sync)
         cog.bot = SimpleNamespace(db_session_factory=object())
         alice = _member(1, "AliceMC")
@@ -452,13 +424,103 @@ class SyncDiscordTests(unittest.TestCase):
             with mock.patch.object(
                 DiscordSyncService, "sync_guild", new=mock.AsyncMock()
             ) as sync_guild:
-                sync_guild.return_value = self._make_outcome()
+                sync_guild.return_value = self._make_outcome(sync_run_id=None)
+                await Sync.sync_discord.callback(cog, inter)
+                return sync_guild.await_args.kwargs
+
+        kwargs = asyncio.run(main())
+        self.assertTrue(kwargs["dry_run"])
+        embed, sent = _sent(inter)
+        self.assertIn("Discord → PostgreSQL mirror (náhled)", embed.title)
+        self.assertIn("Observe-only", embed.footer.text)
+        self.assertNotIn("view", sent)
+
+    def test_preview_with_changes_shows_confirm_button(self):
+        cog = Sync.__new__(Sync)
+        cog.bot = SimpleNamespace(db_session_factory=object())
+        inter = _interaction(user=_admin_member(), guild=_guild([_member(1, "A")]))
+        changes = (
+            SyncChange(
+                member_id=1, kind=CHANGE_TIER_CHANGED, kit_key="ht3",
+                old_tier="HT4", new_tier="HT3",
+            ),
+            SyncChange(member_id=2, kind="unknown_player"),
+        )
+
+        async def main():
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.return_value = self._make_outcome(
+                    sync_run_id=None, tier_changes=1, anomalies=1, changes=changes
+                )
                 await Sync.sync_discord.callback(cog, inter)
 
         asyncio.run(main())
+        embed, sent = _sent(inter)
+        self.assertIsInstance(sent["view"], SyncDiscordConfirmView)
+        text = " ".join(f.value for f in embed.fields)
+        self.assertIn("HT4 → **HT3**", text)
+        self.assertIn("unknown_player", text)
+
+    def test_confirm_writes_mirror_once_and_never_touches_roles(self):
+        alice = _member(1, "AliceMC")
+        alice.edit = mock.AsyncMock()
+        guild = _guild([alice])
+        view = SyncDiscordConfirmView()
+        inter = _interaction(user=_admin_member(), guild=guild)
+        inter.client.db_session_factory = object()
+        again = _interaction(user=_admin_member(), guild=guild)
+
+        async def main():
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.return_value = self._make_outcome()
+                await view.confirm.callback(inter)
+                await view.confirm.callback(again)
+                return sync_guild
+
+        sync_guild = asyncio.run(main())
+        self.assertEqual(sync_guild.await_count, 1)
+        self.assertFalse(sync_guild.await_args.kwargs["dry_run"])
         embed, _ = _sent(inter)
-        self.assertIn("Discord → PostgreSQL mirror", embed.title)
-        self.assertIn("Observe-only", embed.footer.text)
+        self.assertIn("Run: #7", embed.footer.text)
+        again.response.send_message.assert_awaited_once_with(
+            "✅ Synchronizace už proběhla.", ephemeral=True
+        )
+        alice.add_roles.assert_not_awaited()
+        alice.remove_roles.assert_not_awaited()
+        alice.edit.assert_not_awaited()
+
+    def test_confirm_db_failure_is_loud_and_allows_retry(self):
+        view = SyncDiscordConfirmView()
+        inter = _interaction(user=_admin_member(), guild=_guild([]))
+        inter.client.db_session_factory = object()
+
+        async def main():
+            with mock.patch.object(
+                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
+            ) as sync_guild:
+                sync_guild.side_effect = OSError("connection refused")
+                await view.confirm.callback(inter)
+
+        asyncio.run(main())
+        embed, _ = _sent(inter)
+        self.assertIn("databáze selhala", embed.title)
+        self.assertFalse(view.finished)
+
+    def test_confirm_permission_denied(self):
+        view = SyncDiscordConfirmView()
+        inter = _interaction(user=_plain_member())
+
+        async def main():
+            await view.confirm.callback(inter)
+
+        asyncio.run(main())
+        inter.response.send_message.assert_awaited_once_with(
+            "❌ Pouze pro administrátory.", ephemeral=True
+        )
 
     def test_no_db_configured_is_loud_and_never_calls_service(self):
         cog = Sync.__new__(Sync)
@@ -516,6 +578,14 @@ class SyncDiscordTests(unittest.TestCase):
 # Strukturální kontrakt: cogs/sync.py nesmí přímo mutovat Discord role
 # ---------------------------------------------------------------------------
 class SyncStructuralContractTests(unittest.TestCase):
+    def test_command_surface_is_discord_web_check_rollback(self):
+        self.assertEqual(
+            {c.name for c in Sync.sync.commands},
+            {"discord", "web", "check", "rollback"},
+        )
+        for removed in ("playersync", "websync", "checkweb", "datacheck"):
+            self.assertFalse(hasattr(Sync, removed))
+
     def test_no_role_mutation_helpers_or_calls_in_cog(self):
         src = inspect.getsource(Sync)
         for forbidden in (
@@ -757,306 +827,6 @@ class SyncWebTests(unittest.TestCase):
         )
 
 
-# ---------------------------------------------------------------------------
-# /sync data – kontrola integrity + bezpečné opravy
-# ---------------------------------------------------------------------------
-class SyncDataTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        patch = mock.patch.object(permissions, "ADMIN_ROLE_IDS", [999])
-        patch.start()
-        self.addCleanup(patch.stop)
-
-        storage.save_data(
-            "players.json",
-            [
-                _player("AliceMC", {"randompot": "HT3"},
-                        history={"randompot": [{"date": "01.01.2026", "tier": "HT3"}]}),
-            ],
-        )
-        # Osamocený otevřený ticket bez kanálu → bezpečná oprava „zavřít".
-        storage.save_data(
-            "ht_tickets.json",
-            {
-                "1": {
-                    "id": "1",
-                    "status": "open",
-                    "ownerId": "111",
-                    "ign": "GhostMC",
-                    "kit": "randompot",
-                    "tier": "HT3",
-                }
-            },
-        )
-
-    def test_report_shows_repair_view(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member(), guild=_guild([]))
-
-        async def main():
-            await Sync.sync_data.callback(cog, inter)
-
-        asyncio.run(main())
-        embed, kwargs = _sent(inter)
-        self.assertIn("🔍 /sync data – kontrola integrity", embed.title)
-        self.assertIsInstance(kwargs.get("view"), SyncDataRepairView)
-        logs = storage.load_data(DATACHECK_LOG_FILE, [])
-        self.assertTrue(any(e.get("mode") == "check" for e in logs))
-
-    def test_repair_closes_ticket_keeps_record(self):
-        cog = Sync.__new__(Sync)
-        guild = _guild([])
-        inter = _interaction(user=_admin_member(), guild=guild)
-        holder = {}
-
-        async def main():
-            await Sync.sync_data.callback(cog, inter)
-            view = inter.followup.send.call_args.kwargs["view"]
-            holder["repair"] = _interaction(user=_admin_member(), guild=guild)
-            await view.repair.callback(holder["repair"])
-
-        asyncio.run(main())
-        tickets = storage.load_data("ht_tickets.json", {})
-        self.assertEqual(tickets["1"]["status"], "closed")  # záznam zůstává
-        self.assertEqual(len(tickets), 1)
-        embed, _ = _sent(holder["repair"])
-        self.assertIn("bezpečné opravy", embed.title)
-        logs = storage.load_data(DATACHECK_LOG_FILE, [])
-        self.assertTrue(any(e.get("mode") == "repair" for e in logs))
-
-    def test_corrupt_data_aborts_nothing_changes(self):
-        _write_corrupt("players.json")
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-        run_datacheck = mock.AsyncMock()
-
-        async def main():
-            with mock.patch("cogs.sync.run_datacheck", new=run_datacheck):
-                await Sync.sync_data.callback(cog, inter)
-
-        asyncio.run(main())
-        embed, _ = _sent(inter)
-        self.assertIn("❌ /sync data – poškozená data", embed.title)
-        run_datacheck.assert_not_awaited()
-
-    def test_repair_view_corruption_never_performs(self):
-        cog = Sync.__new__(Sync)
-        guild = _guild([])
-        inter = _interaction(user=_admin_member(), guild=guild)
-        holder = {}
-
-        async def main():
-            await Sync.sync_data.callback(cog, inter)
-            view = inter.followup.send.call_args.kwargs["view"]
-            holder["repair"] = _interaction(user=_admin_member(), guild=guild)
-            with mock.patch(
-                "cogs.sync.run_datacheck",
-                new=mock.AsyncMock(
-                    side_effect=DataCorruptionError("players.json corrupt")
-                ),
-            ):
-                await view.repair.callback(holder["repair"])
-
-        asyncio.run(main())
-        embed, _ = _sent(holder["repair"])
-        self.assertIn("❌ /sync data – poškozená data", embed.title)
-        tickets = storage.load_data("ht_tickets.json", {})
-        self.assertEqual(tickets["1"]["status"], "open")  # nic se nezměnilo
-
-    def test_report_permission_denied(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_plain_member())
-
-        async def main():
-            await Sync.sync_data.callback(cog, inter)
-
-        asyncio.run(main())
-        inter.response.send_message.assert_awaited_once_with(
-            "❌ Pouze pro administrátory.", ephemeral=True
-        )
-
-    def test_repair_view_permission_denied(self):
-        view = SyncDataRepairView()
-        inter = _interaction(user=_plain_member())
-
-        async def main():
-            await view.repair.callback(inter)
-
-        asyncio.run(main())
-        inter.response.send_message.assert_awaited_once_with(
-            "❌ Pouze pro administrátory.", ephemeral=True
-        )
-
-
-# ---------------------------------------------------------------------------
-# Deprecated aliasy – FUNKČNÍ, delegují na sdílené orchestrace + upozorní
-# ---------------------------------------------------------------------------
-class DeprecatedAliasTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        patch = mock.patch.object(storage, "DATA_DIR", self._tmp)
-        patch.start()
-        self.addCleanup(patch.stop)
-        patch = mock.patch.object(permissions, "ADMIN_ROLE_IDS", [999])
-        patch.start()
-        self.addCleanup(patch.stop)
-        storage.save_data("players.json", [])
-        storage.save_data("kit_roles.json", {})
-
-    def test_playersync_alias_end_to_end_announces_deprecated(self):
-        cog = Sync.__new__(Sync)
-        cog.bot = SimpleNamespace(db_session_factory=object())
-        inter = _interaction(
-            user=_admin_member(), guild=_guild([_member(1, "AliceMC")])
-        )
-
-        async def main():
-            with mock.patch.object(
-                DiscordSyncService, "sync_guild", new=mock.AsyncMock()
-            ) as sync_guild:
-                sync_guild.return_value = SimpleNamespace(
-                    sync_run_id=7,
-                    status=SYNC_RUN_SUCCESS,
-                    scanned_members=1,
-                    observations_applied=1,
-                    anomalies=0,
-                    unknown_members=0,
-                    failed_members=0,
-                    unknown_roles=(),
-                )
-                await Sync.playersync_preview.callback(cog, inter)
-
-        asyncio.run(main())
-        embed, _ = _sent(inter)
-        self.assertIn(
-            "⚠️ Deprecated – použij /sync discord.", embed.footer.text
-        )
-
-    def test_playersync_preview_delegates_to_run_discord(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(Sync, "_run_discord", new=mock.AsyncMock()) as run:
-                await Sync.playersync_preview.callback(cog, inter)
-                run.assert_awaited_once_with(
-                    inter,
-                    note="⚠️ Deprecated – použij /sync discord.",
-                )
-
-        asyncio.run(main())
-
-    def test_playersync_apply_delegates_to_run_discord(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(Sync, "_run_discord", new=mock.AsyncMock()) as run:
-                await Sync.playersync_apply.callback(cog, inter)
-                run.assert_awaited_once_with(
-                    inter,
-                    note="⚠️ Deprecated – použij /sync discord.",
-                )
-
-        asyncio.run(main())
-
-    def test_websync_preview_delegates_to_run_web(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(Sync, "_run_web", new=mock.AsyncMock()) as run:
-                await Sync.websync_preview.callback(cog, inter)
-                run.assert_awaited_once_with(
-                    inter, mode="preview",
-                    note="⚠️ Deprecated – použij /sync web mode:preview.",
-                )
-
-        asyncio.run(main())
-
-    def test_websync_apply_delegates_to_run_web(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(Sync, "_run_web", new=mock.AsyncMock()) as run:
-                await Sync.websync_apply.callback(cog, inter)
-                run.assert_awaited_once_with(
-                    inter, mode="apply",
-                    note="⚠️ Deprecated – použij /sync web mode:apply.",
-                )
-
-        asyncio.run(main())
-
-    def test_checkweb_preview_delegates_to_run_check(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(Sync, "_run_check", new=mock.AsyncMock()) as run:
-                await Sync.checkweb_preview.callback(cog, inter)
-                run.assert_awaited_once_with(
-                    inter, area="all",
-                    note="⚠️ Deprecated – použij /sync check.",
-                )
-
-        asyncio.run(main())
-
-    def test_checkweb_apply_delegates_to_run_checkweb_apply(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(
-                Sync, "_run_checkweb_apply", new=mock.AsyncMock()
-            ) as run:
-                await Sync.checkweb_apply.callback(cog, inter)
-                run.assert_awaited_once()
-                self.assertIn("Deprecated", run.await_args.kwargs["note"])
-
-        asyncio.run(main())
-
-    def test_datacheck_delegates_to_run_data(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            with mock.patch.object(Sync, "_run_data", new=mock.AsyncMock()) as run:
-                await Sync.datacheck.callback(cog, inter)
-                run.assert_awaited_once_with(
-                    inter, note="⚠️ Deprecated – použij /sync data."
-                )
-
-        asyncio.run(main())
-
-    def test_datacheck_alias_end_to_end_runs_and_announces(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_admin_member())
-
-        async def main():
-            await Sync.datacheck.callback(cog, inter)
-
-        asyncio.run(main())
-        embed, _ = _sent(inter)
-        self.assertIn("✅ /sync data – vše v pořádku", embed.title)
-        self.assertIn("⚠️ Deprecated – použij /sync data", embed.footer.text)
-
-    def test_alias_permission_denied(self):
-        cog = Sync.__new__(Sync)
-        inter = _interaction(user=_plain_member())
-
-        async def main():
-            await Sync.datacheck.callback(cog, inter)
-
-        asyncio.run(main())
-        inter.response.send_message.assert_awaited_once_with(
-            "❌ Pouze pro administrátory.", ephemeral=True
-        )
-
-
 class SyncEmbedPackTests(unittest.TestCase):
     """Embed pack (/sync check • data • discord • web • checkweb).
 
@@ -1172,42 +942,6 @@ class SyncEmbedPackTests(unittest.TestCase):
         self.assertEqual(len(embeds), 1)
         self.assertEqual(embeds[0].fields[0].value, "_žádné_")
 
-    def test_datacheck_embed_many_findings_preserved(self):
-        # Přesně scénář produkčního bugu: /sync data s hromadou nálezů.
-        findings = [
-            {"kind": "orphan_ticket", "message": f"ticket {i}: " + "t" * 100}
-            for i in range(200)
-        ]
-        report = {
-            "has_issues": True,
-            "total_findings": len(findings),
-            "summary": {"orphan_ticket": len(findings)},
-            "findings": findings,
-            "repairable": {"close_ticket": [], "normalize_tier": []},
-            "repairable_count": 0,
-        }
-        embeds = _datacheck_embed(report)
-        self.assertGreater(len(embeds), 1)
-        for embed in embeds:
-            self.assertLessEqual(len(embed.fields), 25)
-            for field in embed.fields:
-                self.assertLessEqual(len(field.value), 1024)
-            self.assertLessEqual(self._embed_total(embed), 6000)
-        self.assertEqual(self._reconstruct(embeds), [f["message"] for f in findings])
-
-    def test_datacheck_embed_no_issues_single_embed(self):
-        embeds = _datacheck_embed(
-            {
-                "has_issues": False,
-                "summary": {},
-                "findings": [],
-                "repairable": {"close_ticket": [], "normalize_tier": []},
-                "repairable_count": 0,
-            }
-        )
-        self.assertEqual(len(embeds), 1)
-        self.assertEqual(embeds[0].fields, [])
-
     def test_check_embed_many_long_findings_no_silent_loss(self):
         items = [
             {"severity": "warning", "kind": "k", "message": f"nález {i} " + "x" * 300}
@@ -1218,8 +952,6 @@ class SyncEmbedPackTests(unittest.TestCase):
             counts={"error": 0, "conflict": 0, "warning": len(items)},
             website_source="GitHub",
             area="all",
-            corrupt=[],
-            repairable_count=0,
         )
         self.assertGreater(len(embeds), 1)
         for embed in embeds:
@@ -1227,6 +959,21 @@ class SyncEmbedPackTests(unittest.TestCase):
                 self.assertLessEqual(len(field.value), 1024)
             self.assertLessEqual(self._embed_total(embed), 6000)
         self.assertEqual(self._reconstruct(embeds), [i["message"] for i in items])
+
+    def test_split_long_line_with_space_after_prefix_terminates(self):
+        import signal
+
+        from cogs.sync import _split_long_line
+
+        line = "a" * 10 + " " + "b" * 3000
+        signal.alarm(5)
+        try:
+            chunks = _split_long_line(line, 1024, "» ")
+        finally:
+            signal.alarm(0)
+        self.assertTrue(all(len(c) <= 1024 for c in chunks))
+        joined = chunks[0] + "".join(c[len("» "):] for c in chunks[1:])
+        self.assertEqual(joined, line)
 
     def test_send_embed_pack_splits_messages_of_ten_keeps_ephemeral_and_view(self):
         followup = mock.MagicMock()

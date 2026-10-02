@@ -14,7 +14,7 @@ from typing import Optional
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Tournament, TournamentEntry
+from db.models import Player, Tournament, TournamentEntry
 
 
 class TournamentRepository:
@@ -68,11 +68,13 @@ class TournamentRepository:
         await session.flush()
         return row
 
-    async def mark_ended(self, session: AsyncSession, tournament_id: int) -> None:
+    async def mark_ended(
+        self, session: AsyncSession, tournament_id: int, *, ended: bool = True
+    ) -> None:
         row = await self.get(session, tournament_id)
         if row is None:
             return
-        row.ended = True
+        row.ended = ended
         await session.flush()
 
     async def is_participant(
@@ -112,6 +114,20 @@ class TournamentRepository:
             select(TournamentEntry.player_id)
             .where(TournamentEntry.tournament_id == tournament_id)
             .order_by(TournamentEntry.joined_at)
+        )
+        return list(result.scalars())
+
+    async def list_participant_discord_ids(
+        self, session: AsyncSession, tournament_id: int
+    ) -> list[int]:
+        result = await session.execute(
+            select(Player.discord_id)
+            .join(TournamentEntry, TournamentEntry.player_id == Player.id)
+            .where(
+                TournamentEntry.tournament_id == tournament_id,
+                Player.discord_id.is_not(None),
+            )
+            .order_by(TournamentEntry.joined_at, TournamentEntry.id)
         )
         return list(result.scalars())
 

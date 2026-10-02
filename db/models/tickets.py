@@ -68,6 +68,7 @@ class Ticket(Base):
             postgresql_where=text("status = 'open'"),
         ),
         Index("ix_tickets_claimer", "claimer_id"),
+        Index("ix_tickets_kit", "kit_id"),
         CheckConstraint("status IN ('open', 'closed')", name="status"),
         CheckConstraint(
             "ticket_type IN ('eval', 'fight', 'unretire')", name="ticket_type"

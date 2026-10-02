@@ -7,6 +7,8 @@ granted_by, revoked_at). Eval vyžaduje existující Player + Kit řádek
 
 from __future__ import annotations
 
+from sqlalchemy.exc import IntegrityError
+
 from db.repositories.evaluations import EvaluationRepository
 from db.repositories.kits import KitRepository
 from db.repositories.players import PlayerRepository
@@ -26,7 +28,9 @@ async def has_eval(ign: str, kit: str, *, session_factory) -> bool:
         )
 
 
-async def set_eval(ign: str, kit: str, *, session_factory) -> bool:
+async def set_eval(
+    ign: str, kit: str, *, granted_by: int | None = None, session_factory
+) -> bool:
     kit_key = (kit or "").strip().lower()
     if not (ign or "").strip() or not kit_key:
         return False
@@ -39,9 +43,16 @@ async def set_eval(ign: str, kit: str, *, session_factory) -> bool:
             session, player_id=player.id, kit_id=kit_row.id
         ):
             return True
-        await EvaluationRepository().grant(
-            session, player_id=player.id, kit_id=kit_row.id
-        )
+        try:
+            async with session.begin_nested():
+                await EvaluationRepository().grant(
+                    session,
+                    player_id=player.id,
+                    kit_id=kit_row.id,
+                    granted_by=granted_by,
+                )
+        except IntegrityError:
+            return True
     return True
 
 

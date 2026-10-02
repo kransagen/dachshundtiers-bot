@@ -446,6 +446,24 @@ def _cooldown_upsert_calls(tree: ast.AST) -> list[ast.Call]:
     return calls
 
 
+def _cooldown_spec_calls(tree: ast.AST) -> list[ast.Call]:
+    """``CooldownSpec(...)`` – cooldowns handed to the promotion service.
+
+    ``/result`` no longer upserts cooldowns itself: it passes specs to
+    ``commit_after_discord_success``, so they exist only after a confirmed
+    Discord grant. A spec without ``kit_id`` falls back to the promotion's kit
+    (``test_promotion_service_cannot_write_a_global_cooldown``), so the only
+    thing to forbid here is an explicit ``None``.
+    """
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "CooldownSpec"
+    ]
+
+
 def test_production_cooldown_writers_always_pass_a_kit_id():
     """AST guard: no production cooldown writer can emit a global cooldown.
 
@@ -469,6 +487,20 @@ def test_production_cooldown_writers_always_pass_a_kit_id():
         ):
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(rel))
+        for node in _cooldown_spec_calls(tree):
+            total += 1
+            literal_none = any(
+                kw.arg == "kit_id"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is None
+                for kw in node.keywords
+            ) or (
+                len(node.args) >= 3
+                and isinstance(node.args[2], ast.Constant)
+                and node.args[2].value is None
+            )
+            if literal_none:
+                offenders.append(f"{rel}:{node.lineno} (CooldownSpec kit_id=None)")
         for node in _cooldown_upsert_calls(tree):
             total += 1
             kwargs = {kw.arg for kw in node.keywords if kw.arg}

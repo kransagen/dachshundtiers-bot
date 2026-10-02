@@ -15,7 +15,7 @@ from unittest import mock
 
 import discord
 import cogs.roles as roles_mod
-from cogs.roles import TierRoleGrant, auto_grant_kit_role
+from cogs.roles import Roles, TierRoleGrant, auto_grant_kit_role
 
 
 def _role(rid, name=None):
@@ -225,13 +225,14 @@ class AutoGrantKitRoleTests(unittest.TestCase):
 
     def test_success_path_uses_patch_response_as_confirmation(self):
         """A successful PATCH whose response body already shows the intended
-        roles IS the confirmation — no extra API call needed."""
+        roles IS the confirmation — the only live read is the one taken
+        before the edit (fresh base for the target role set)."""
         async def main():
             guild, member = self._guild()
             grant = await auto_grant_kit_role(guild, "1", "MolePVP", "HT3")
             self.assertTrue(grant.ok)
             self.assertTrue(grant.verified)
-            guild.fetch_member.assert_not_awaited()
+            guild.fetch_member.assert_awaited_once()
         asyncio.run(main())
 
     def test_success_path_falls_back_to_live_read_when_body_unusable(self):
@@ -370,6 +371,58 @@ class AutoGrantKitRoleTests(unittest.TestCase):
             self.assertTrue(grant.verified)
             self.assertFalse(grant.ambiguous)
         asyncio.run(main())
+
+
+class _RoleStub:
+    def __init__(self, position, *, default=False, managed=False):
+        self.id = 5000 + position
+        self.mention = f"<@&{self.id}>"
+        self.position = position
+        self.managed = managed
+        self._default = default
+
+    def is_default(self):
+        return self._default
+
+    def __ge__(self, other):
+        return self.position >= other.position
+
+
+class SetKitRoleValidationTests(unittest.TestCase):
+    def _run(self, role, *, bot_top=_RoleStub(10)):
+        inter = mock.MagicMock()
+        inter.guild.me.top_role = bot_top
+        inter.response.send_message = mock.AsyncMock()
+        cog = Roles(mock.MagicMock())
+
+        async def main():
+            with mock.patch.object(
+                roles_mod, "has_admin_role", return_value=True
+            ), mock.patch.object(
+                roles_mod, "set_kit_role", new=mock.AsyncMock(return_value=True)
+            ) as setter:
+                await Roles.setkitrole.callback(cog, inter, "MolePVP", "S", role)
+                return setter
+
+        setter = asyncio.run(main())
+        return inter.response.send_message.await_args, setter
+
+    def test_assignable_role_is_saved(self):
+        call, setter = self._run(_RoleStub(5))
+        setter.assert_awaited_once()
+        self.assertIn("je namapovaná", call.args[0])
+
+    def test_unassignable_roles_are_refused_and_not_saved(self):
+        for role in (
+            _RoleStub(1, default=True),
+            _RoleStub(5, managed=True),
+            _RoleStub(10),
+            _RoleStub(11),
+        ):
+            call, setter = self._run(role)
+            setter.assert_not_awaited()
+            self.assertIn("nemůže přidělovat", call.args[0])
+            self.assertTrue(call.kwargs["ephemeral"])
 
 
 if __name__ == "__main__":

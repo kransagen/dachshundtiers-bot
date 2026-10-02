@@ -8,6 +8,7 @@ ambiguous input or unknown players (anomalies, never fabrications).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -20,6 +21,9 @@ from db.services.outbox_consumer import (
     OutboxConsumer,
     default_stale_cutoff,
 )
+from db.services.retention import purge_old_records
+
+log = logging.getLogger("dachshundtiers.db.reconciliation")
 
 RECONCILE_COMMAND = "reconcile"
 RECONCILE_MODE = "automatic"
@@ -64,9 +68,13 @@ class ReconciliationService:
         # Discord state" guarantee the outbox exists for was silently dead
         # in the running bot. See db/repositories/outbox.py claim_next() for
         # how staleness is now measured from claimed_at, not created_at.
-        consumed = await self._consumer.consume_many(
-            session_factory, in_progress_before=default_stale_cutoff()
-        )
+        try:
+            consumed = await self._consumer.consume_many(
+                session_factory, in_progress_before=default_stale_cutoff()
+            )
+        except Exception:  # noqa: BLE001 — a broken outbox must not skip the mirror sync
+            log.exception("Outbox consumption failed; continuing with mirror sync")
+            consumed = []
         sync_outcome = await self._sync.sync_guild(
             session_factory,
             members=members,
@@ -75,7 +83,12 @@ class ReconciliationService:
             triggered_by_name=triggered_by_name,
             command=RECONCILE_COMMAND,
             mode=RECONCILE_MODE,
+            dedupe_anomalies=True,
         )
+        try:
+            await purge_old_records(session_factory)
+        except Exception:  # noqa: BLE001 — retention is housekeeping only
+            log.exception("Retention purge failed")
         return ReconciliationOutcome(
             outbox_consumed=tuple(consumed), sync=sync_outcome
         )
@@ -97,4 +110,5 @@ class ReconciliationService:
             triggered_by_name=triggered_by_name,
             command=RECONCILE_COMMAND,
             mode=RECONCILE_MODE,
+            dedupe_anomalies=True,
         )

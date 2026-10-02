@@ -17,7 +17,6 @@ from db.models import (
     OutboxEvent,
     PlayerCurrentTier,
     Result,
-    SyncAction,
     SyncRun,
 )
 from db.repositories.outbox import (
@@ -26,7 +25,7 @@ from db.repositories.outbox import (
     OUTBOX_PENDING,
 )
 from db.repositories.results import PROMOTION_DISCORD_PENDING
-from db.repositories.sync_audit import SYNC_ACTION_ANOMALY, SYNC_RUN_SUCCESS
+from db.repositories.sync_audit import SYNC_RUN_PARTIAL, SYNC_RUN_SUCCESS
 from db.services.outbox_consumer import default_stale_cutoff
 from db.services.session import transaction
 
@@ -155,19 +154,21 @@ async def build_health_report(
             )
         )
 
-        anomalies = (
+        latest_run = (
             await session.execute(
-                select(func.count(SyncAction.id)).where(
-                    SyncAction.status == SYNC_ACTION_ANOMALY
-                )
+                select(SyncRun)
+                .where(SyncRun.status.in_((SYNC_RUN_SUCCESS, SYNC_RUN_PARTIAL)))
+                .order_by(SyncRun.started_at.desc())
+                .limit(1)
             )
-        ).scalar()
+        ).scalar_one_or_none()
+        anomalies = int((latest_run.summary or {}).get("anomalies") or 0) if latest_run else 0
         checks.append(
             HealthCheck(
                 key="sync_anomalies",
                 label="Sync anomalies",
                 status=DEGRADED if anomalies else HEALTHY,
-                detail=f"{anomalies} anomaly actions",
+                detail=f"{anomalies} anomalies in the latest sync run",
             )
         )
 

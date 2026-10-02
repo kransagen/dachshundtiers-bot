@@ -319,6 +319,9 @@ def _report_embed(report: dict, payload: dict) -> discord.Embed:
                 if errs:
                     wval += "\n" + "\n".join(f"  • {e}" for e in errs)
                 embed.add_field(name="Web (GitHub)", value=wval, inline=False)
+    warnings = report.get("warnings") or []
+    if warnings:
+        embed.add_field(name="Pozor", value="\n".join(warnings), inline=False)
     embed.set_footer(text="Audit: PostgreSQL (audit_logs)")
     return embed
 
@@ -335,7 +338,7 @@ class DiscordIdModal(SafeModal):
             label="Nové Discord ID (17–19 číslic)",
             placeholder="např. 123456789012345678",
             min_length=15,
-            max_length=32,
+            max_length=19,
             required=True,
         )
         self.add_item(self.input)
@@ -575,7 +578,7 @@ class TierKitSelectView(SafeView):
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=str(k), value=str(k)) for k in kits
+                discord.SelectOption(label=str(k), value=str(k)) for k in kits[:25]
             ],
         )
         select.callback = self.on_kit
@@ -654,26 +657,29 @@ class TierSelectView(SafeView):
         self.cog = cog
         self.player_id = player_id
         self.kit_key = kit_key
-        options = []
-        for t in edituser_service.current_tier_choices():
-            options.append(
-                discord.SelectOption(label=t, value=t, description="aktuální tier")
+        current = [
+            discord.SelectOption(label=t, value=t, description="aktuální tier")
+            for t in edituser_service.current_tier_choices()
+        ]
+        retired = [
+            discord.SelectOption(
+                label=t, value=t, description="retired (archivace historie)"
             )
-        for t in retired_tier_choices():
-            options.append(
-                discord.SelectOption(
-                    label=t, value=t, description="retired (archivace historie)"
-                )
+            for t in retired_tier_choices()
+        ]
+        for custom_id, placeholder, options in (
+            ("edituser_tier_value", "Aktuální tier...", current),
+            ("edituser_tier_value_retired", "Retired tier (archivace)...", retired),
+        ):
+            select = discord.ui.Select(
+                custom_id=custom_id,
+                placeholder=placeholder,
+                min_values=1,
+                max_values=1,
+                options=options[:25],
             )
-        select = discord.ui.Select(
-            custom_id="edituser_tier_value",
-            placeholder="Vyber novou hodnotu tieru...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-        select.callback = self.on_tier
-        self.add_item(select)
+            select.callback = self.on_tier
+            self.add_item(select)
 
     async def on_tier(self, interaction: discord.Interaction) -> None:
         if not has_admin_role(interaction.user):
@@ -781,7 +787,7 @@ class CooldownEditView(SafeView):
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=str(k), value=str(k)) for k in kits
+                discord.SelectOption(label=str(k), value=str(k)) for k in kits[:25]
             ],
         )
         select.callback = self.on_kit
@@ -1032,13 +1038,13 @@ class ConfirmEditView(SafeView):
             return await interaction.response.send_message(
                 "✅ Změny už byly aplikované.", ephemeral=True
             )
+        self.finished = True
 
         await interaction.response.defer(ephemeral=True)
 
         # 1) Stale check – aplikujeme PŘESNĚ to, co admin viděl.
         stale_msg = await self._stale_check()
         if stale_msg:
-            self.finished = True
             embed = _stale_embed(stale_msg)
             await self._finish_message(interaction, embed)
             await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1082,7 +1088,6 @@ class ConfirmEditView(SafeView):
             session_factory=_cog_session_factory(self.cog),
         )
 
-        self.finished = True
         embed = _report_embed(report, self.payload)
         await self._finish_message(interaction, embed)
         await interaction.followup.send(embed=embed, ephemeral=True)

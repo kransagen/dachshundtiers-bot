@@ -40,3 +40,39 @@ async def test_engine_dispose_releases_pool(db_engine):
     await db_engine.dispose()
     async with db_engine.connect() as conn:
         assert (await conn.exec_driver_sql("SELECT 1")).first()[0] == 1
+
+def test_engine_timeouts_can_be_disabled_and_overridden(monkeypatch):
+    from db import engine as engine_module
+
+    captured = {}
+
+    def fake_create(url, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(engine_module, "create_async_engine", fake_create)
+    monkeypatch.setenv("DB_STATEMENT_TIMEOUT_MS", "0")
+    monkeypatch.setenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "9000")
+    create_async_engine_from_url("postgresql://u:p@localhost/db")
+    assert captured["connect_args"]["server_settings"] == {
+        "idle_in_transaction_session_timeout": "9000"
+    }
+
+    monkeypatch.setenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", "0")
+    create_async_engine_from_url("postgresql://u:p@localhost/db")
+    assert captured["connect_args"] == {}
+
+
+def test_engine_default_timeouts_passed_as_server_settings(monkeypatch):
+    from db import engine as engine_module
+
+    captured = {}
+    monkeypatch.setattr(
+        engine_module, "create_async_engine", lambda url, **kw: captured.update(kw)
+    )
+    monkeypatch.delenv("DB_STATEMENT_TIMEOUT_MS", raising=False)
+    monkeypatch.delenv("DB_IDLE_IN_TRANSACTION_TIMEOUT_MS", raising=False)
+    create_async_engine_from_url("postgresql://u:p@localhost/db")
+    assert captured["connect_args"]["server_settings"] == {
+        "statement_timeout": "120000",
+        "idle_in_transaction_session_timeout": "300000",
+    }

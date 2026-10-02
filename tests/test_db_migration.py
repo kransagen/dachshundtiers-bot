@@ -245,3 +245,68 @@ def test_upgrade_to_head_escapes_percent_in_url(monkeypatch):
     monkeypatch.setattr("sqlalchemy.create_engine", lambda url: _Engine())
     validation.upgrade_to_head("postgresql://u:p%40ss@h/db")
     assert seen["url"] == "postgresql://u:p%40ss@h/db"
+
+
+def test_migration_chain_has_single_head():
+    from alembic.script import ScriptDirectory
+
+    from db.validation import migration_head
+
+    script = ScriptDirectory.from_config(_alembic_config("postgresql://unused/x"))
+    assert script.get_heads() == [migration_head()]
+
+
+def test_backoff_indexes_and_checks_exist_and_enforce(migration_db_url):
+    from alembic import command
+    from sqlalchemy.exc import IntegrityError
+
+    command.upgrade(_alembic_config(migration_db_url), "head")
+    with create_engine(migration_db_url).connect() as conn:
+        inspector = inspect(conn)
+        assert "next_attempt_at" in {c["name"] for c in inspector.get_columns("outbox_events")}
+        assert "ix_queue_entries_player" in {i["name"] for i in inspector.get_indexes("queue_entries")}
+        assert "ix_tickets_kit" in {i["name"] for i in inspector.get_indexes("tickets")}
+        assert "ix_results_evaluator" in {i["name"] for i in inspector.get_indexes("results")}
+        sync_idx = {i["name"] for i in inspector.get_indexes("sync_actions")}
+        assert {"ix_sync_actions_status", "ix_sync_actions_created"} <= sync_idx
+        assert "ck_tournaments_groups_count" in {
+            c["name"] for c in inspector.get_check_constraints("tournaments")
+        }
+        assert "ck_queue_entries_position" in {
+            c["name"] for c in inspector.get_check_constraints("queue_entries")
+        }
+
+    with create_engine(migration_db_url).connect() as conn:
+        conn.execute(text("INSERT INTO kits (key, name, active) VALUES ('ck', 'CK', true)"))
+        try:
+            conn.execute(
+                text(
+                    "INSERT INTO tournaments (kit_id, name, tier, groups_count, category_id, "
+                    "signup_channel_id, signup_message_id, role_id, guild_id, deadline) "
+                    "SELECT id, 'T', 'LT3', 0, 1, 1, 1, 1, 1, now() FROM kits WHERE key = 'ck'"
+                )
+            )
+            raise AssertionError("groups_count = 0 must be rejected")
+        except IntegrityError:
+            conn.rollback()
+
+
+def test_new_migration_downgrades_and_reupgrades(embedded_pg):
+    from alembic import command
+
+    _create_fresh_database(embedded_pg, "pytest_migration_c9d0")
+    url = _sync_url(embedded_pg, "pytest_migration_c9d0")
+    try:
+        command.upgrade(_alembic_config(url), "head")
+        command.downgrade(_alembic_config(url), "b8c9d0e1f2a3")
+        with create_engine(url).connect() as conn:
+            inspector = inspect(conn)
+            assert "next_attempt_at" not in {
+                c["name"] for c in inspector.get_columns("outbox_events")
+            }
+            assert "ix_tickets_kit" not in {i["name"] for i in inspector.get_indexes("tickets")}
+        command.upgrade(_alembic_config(url), "head")
+    finally:
+        with create_engine(url).connect() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            conn.commit()

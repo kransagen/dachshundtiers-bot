@@ -339,6 +339,9 @@ class Importer:
             if not isinstance(tier_map, dict):
                 self.r.issue("kit_roles_malformed", str(kit_name), "Hodnota není objekt tier → role.")
                 continue
+            if not str(kit_name or "").strip():
+                self.r.issue("kit_roles_malformed", repr(kit_name), "Prázdný klíč kitu.")
+                continue
             kit = await self.kit_for(kit_name, create_inactive=False)
             if kit is None:
                 # /setkitrole mapuje jen skutečné kity → založit jako aktivní.
@@ -401,6 +404,9 @@ class Importer:
             if not isinstance(entries, list):
                 continue
             kit = await self.kit_for(kit_name)
+            if kit is None:
+                self.r.issue("history_invalid", f"{label}:{kit_name!r}", "Prázdný klíč kitu v historii.")
+                continue
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
@@ -437,6 +443,9 @@ class Importer:
             return
         for kit_name, code in modes.items():
             kit = await self.kit_for(kit_name)
+            if kit is None:
+                self.r.issue("modes_invalid", f"{kit_name!r}", "Prázdný klíč kitu v modes.")
+                continue
             if await MirrorRepository().get_current(
                 self.s, player_id=player.id, kit_id=kit.id
             ) is None:
@@ -518,6 +527,9 @@ class Importer:
             if not isinstance(bucket, dict):
                 continue
             kit = await self.kit_for(kit_name)
+            if kit is None:
+                self.r.issue("eval_invalid", f"{kit_name!r}", "Prázdný klíč kitu v evals.")
+                continue
             for ign, ms in bucket.items():
                 player = await self.players.get_by_ign(self.s, str(ign))
                 if player is None:
@@ -616,6 +628,9 @@ class Importer:
                     self.r.inc("cooldowns_expired_skipped")
                     continue
                 kit = await self.kit_for(kit_name)
+                if kit is None:
+                    self.r.issue("ht3_cooldown_invalid", f"{key}:{kit_name!r}", "Prázdný klíč kitu.")
+                    continue
                 player = await self.player_for_discord(did)
                 await self._upsert_cooldown(player, COOLDOWN_HT3, kit.id, expires_at)
 

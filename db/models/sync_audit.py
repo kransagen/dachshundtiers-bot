@@ -50,6 +50,7 @@ class OutboxEvent(Base):
     # active processing.
     claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     processed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    next_attempt_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         Index(
@@ -125,6 +126,8 @@ class SyncAction(Base):
     __table_args__ = (
         Index("ix_sync_actions_run", "sync_run_id"),
         Index("ix_sync_actions_anom", "anomaly_category"),
+        Index("ix_sync_actions_status", "status"),
+        Index("ix_sync_actions_created", "created_at"),
         CheckConstraint(
             "status IN ('applied', 'skipped', 'failed', 'anomaly')",
             name="status",

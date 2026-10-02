@@ -22,6 +22,7 @@ from db.repositories.kits import (
 )
 from db.repositories.players import PlayerRepository
 from db.repositories.tiers import MirrorServiceRepository
+from db.services.retire_peak import player_peaks
 from db.services.session import transaction
 from services import edituser
 from services import player_export
@@ -436,7 +437,11 @@ async def test_db_tier_retired_archive_exact_value_allowed(session_factory, clea
         )
         tier = await TierDefinitionRepository().get_by_id(session, rows[0].tier_id)
         assert tier.code == "RLT3"
-        assert tier.kind == "virtual"
+        assert tier.kind == "retired"
+        assert tier.is_retired is True
+        assert tier.retired_of_id is not None
+        peaks = await player_peaks(session, player)
+        assert peaks == [("MolePVP", "LT3")]
 
 
 async def test_db_tier_retired_over_different_current_rejected(session_factory, clean_db):
@@ -807,3 +812,54 @@ async def test_db_write_players_export_deterministic(
     assert [p["username"] for p in on_disk] == ["mendu__", "bob_"]
     assert on_disk[0]["discordId"] == "111111111111111111"
     assert on_disk[0]["modes"] == {"MolePVP": "LT3"}
+
+
+async def test_db_discord_id_over_bigint_rejected(session_factory, clean_db):
+    await _seed_player(session_factory)
+    result = await edituser.apply_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "discord_id", "new_value": "9" * 20},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+    )
+    assert result["status"] == "error"
+
+
+async def test_execute_tier_edit_without_role_sync_warns(session_factory, clean_db):
+    await _seed_player(session_factory)
+    report = await edituser.execute_player_edit(
+        player_id=str(111111111111111111),
+        edit={"field": "tier", "kit": "molepvp", "tier": "HT3"},
+        actor_id=ACTOR_ID,
+        actor_name=ACTOR_NAME,
+        now=NOW,
+        queue_cooldown_ms=QUEUE_MS,
+        ht3_cooldown_ms=HT3_MS,
+        session_factory=session_factory,
+    )
+    assert report["status"] == "SUCCESS"
+    assert any("/sync discord" in w for w in report["warnings"])
+
+
+def test_valid_discord_id_bounds():
+    assert edituser.valid_discord_id("123456789012345678")
+    assert not edituser.valid_discord_id("1234")
+    assert not edituser.valid_discord_id("9" * 19)
+    assert not edituser.valid_discord_id("1" * 20)
+    assert not edituser.valid_discord_id("12345678901234567x")
+
+
+async def test_tier_select_view_splits_options_under_discord_limit():
+    import discord
+
+    from cogs.edituser import TierSelectView
+
+    view = TierSelectView(cog=None, player_id="1", kit_key="molepvp")
+    selects = [c for c in view.children if isinstance(c, discord.ui.Select)]
+    assert len(selects) == 2
+    assert all(len(sel.options) <= 25 for sel in selects)
+    assert sum(len(sel.options) for sel in selects) == 32

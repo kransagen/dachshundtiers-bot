@@ -5,18 +5,19 @@ Jak web spotřebovává data (ověřeno – viz ``github_sync.py``)
 Web (DachshundTiers) čte ``players.json`` na GitHubu (repo + cesta
 z ``GITHUB_*`` env). Jeho jediným zapisovatelem je tento bot:
 - ``/result`` posílá změny přes ``github_sync.push_players`` a
-  ``/websync apply`` nahrazuje celý soubor kanonickou DB (PUTo přes GitHub
+  ``/sync web mode:apply`` nahrazuje celý soubor kanonickou DB (PUT přes GitHub
   Contents API, při konfliktu 409 se merge zopakuje na čerstvých datech,
   všechny pushy sdílí jeden lock),
 - bez ``GITHUB_TOKEN`` se web nikdy nemění.
 
 Neexistuje žádná druhá databáze: pokaždé se vybere **kanonická** hráčská
-databáze (``data/players.json``) a ta se po potvrzení zapíše na web.
+databáze (PostgreSQL, export ``services.player_export``) a ta se po potvrzení
+zapíše na web.
 
 Požadavky Phase 5
 -----------------
-- ``/websync preview`` – jen porovná web s kanonickou DB (detekce),
-- ``/websync apply``   – po **explicitním potvrzení** nahradí web kanonickou DB,
+- ``/sync web mode:preview`` – jen porovná web s kanonickou DB (detekce),
+- ``/sync web mode:apply``   – po **explicitním potvrzení** nahradí web kanonickou DB,
 - detekce: chybějící hráči na webu, špatné tiery, zastaralá data, duplicitní
   hráči, neplatné záznamy,
 - po synchronizaci se zapíše do ``data/websync_log.json`` (audit):
@@ -47,6 +48,7 @@ from services.store import read as store_read, transaction
 log = logging.getLogger("dachshundtiers")
 
 WEBSYNC_LOG_FILE = "websync_log.json"
+AUDIT_LOG_LIMIT = 1000
 
 DEFAULT_ATTEMPTS = 3
 DEFAULT_RETRY_DELAY_S = 1.0
@@ -538,7 +540,7 @@ async def log_websync_event(
         if not isinstance(entries, list):
             entries = []
         entries.append(entry)
-        tx.set(WEBSYNC_LOG_FILE, entries)
+        tx.set(WEBSYNC_LOG_FILE, entries[-AUDIT_LOG_LIMIT:])
         return entry
 
     return await transaction((WEBSYNC_LOG_FILE,), _run)

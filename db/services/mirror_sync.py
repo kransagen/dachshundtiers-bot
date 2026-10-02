@@ -16,19 +16,21 @@ Used by:
 Each member is processed in its own SAVEPOINT, so one failing member never
 aborts the surrounding PostgreSQL transaction for the rest of the server.
 Only real changes and anomalies are written to ``sync_actions``; an unchanged
-re-observation leaves no audit row.
+re-observation leaves no audit row. With ``dedupe_anomalies`` (the automatic
+reconciliation) an anomaly already recorded within ``ANOMALY_DEDUP_WINDOW`` is
+counted in the run summary but not written again.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Iterator, Optional, Sequence, TypeVar
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from db.models import Player, PlayerCurrentTier, TierDefinition
+from db.models import Player, PlayerCurrentTier, SyncAction, TierDefinition
 from db.repositories.kits import KitRepository, KitRoleRepository
 from db.repositories.players import PlayerIdentityError, PlayerRepository
 from db.repositories.sync_audit import (
@@ -58,6 +60,9 @@ SYNC_ANOMALY_MISSING_ON_DISCORD = "missing_on_discord"
 CHANGE_PLAYER_CREATED = "player_created"
 CHANGE_TIER_ADDED = "tier_added"
 CHANGE_TIER_CHANGED = "tier_changed"
+
+ANOMALY_DEDUP_WINDOW = timedelta(hours=24)
+IN_CLAUSE_BATCH = 5000
 
 OBSERVE_SOURCE = "discord_sync"
 OBSERVE_REASON = "Discord → PostgreSQL mirror"
@@ -89,6 +94,14 @@ class DiscordSyncOutcome:
     tier_changes: int = 0
     dry_run: bool = False
     changes: tuple[SyncChange, ...] = ()
+
+
+_T = TypeVar("_T")
+
+
+def _batched(items: Sequence[_T], size: int = IN_CLAUSE_BATCH) -> Iterator[Sequence[_T]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
 
 
 def member_role_ids(member) -> set[int]:
@@ -153,6 +166,7 @@ class DiscordSyncService:
         mode: str = "observe",
         create_missing_players: bool = False,
         dry_run: bool = False,
+        dedupe_anomalies: bool = False,
     ) -> DiscordSyncOutcome:
         """Mirror one guild scan into PG.
 
@@ -179,6 +193,11 @@ class DiscordSyncService:
                     (await session.execute(
                         select(TierDefinition.id, TierDefinition.code)
                     )).all()
+                )
+                known_anomalies = (
+                    await self._load_known_anomalies(session)
+                    if dedupe_anomalies
+                    else frozenset()
                 )
                 players_by_did = await self._load_players(session, members)
                 mirrors = await self._load_mirrors(
@@ -210,6 +229,7 @@ class DiscordSyncService:
                                 tier_codes=tier_codes,
                                 observed_at=observed_at,
                                 create_missing_players=create_missing_players,
+                                known_anomalies=known_anomalies,
                             )
                     except Exception as exc:  # noqa: BLE001 — one member never kills the run
                         failed_members += 1
@@ -288,28 +308,44 @@ class DiscordSyncService:
         )
 
     async def _load_players(self, session: AsyncSession, members) -> dict[int, Player]:
-        ids = {int(m.id) for m in members}
-        if not ids:
-            return {}
-        rows = await session.execute(select(Player).where(Player.discord_id.in_(ids)))
-        return {int(p.discord_id): p for p in rows.scalars()}
+        ids = sorted({int(m.id) for m in members})
+        out: dict[int, Player] = {}
+        for batch in _batched(ids):
+            rows = await session.execute(
+                select(Player).where(Player.discord_id.in_(batch))
+            )
+            out.update({int(p.discord_id): p for p in rows.scalars()})
+        return out
+
+    async def _load_known_anomalies(
+        self, session: AsyncSession
+    ) -> frozenset[tuple[int, str, Optional[int]]]:
+        since = datetime.now(timezone.utc) - ANOMALY_DEDUP_WINDOW
+        rows = await session.execute(
+            select(SyncAction.member_id, SyncAction.anomaly_category, SyncAction.kit_id)
+            .where(
+                SyncAction.status == SYNC_ACTION_ANOMALY,
+                SyncAction.created_at >= since,
+            )
+            .distinct()
+        )
+        return frozenset((m, c, k) for m, c, k in rows.all())
 
     async def _load_mirrors(
         self, session: AsyncSession, player_ids: list[int]
     ) -> dict[int, dict[int, int]]:
         """player_id -> {kit_id: tier_id} of the current mirror."""
-        if not player_ids:
-            return {}
-        rows = await session.execute(
-            select(
-                PlayerCurrentTier.player_id,
-                PlayerCurrentTier.kit_id,
-                PlayerCurrentTier.tier_id,
-            ).where(PlayerCurrentTier.player_id.in_(player_ids))
-        )
         out: dict[int, dict[int, int]] = {}
-        for player_id, kit_id, tier_id in rows.all():
-            out.setdefault(player_id, {})[kit_id] = tier_id
+        for batch in _batched(player_ids):
+            rows = await session.execute(
+                select(
+                    PlayerCurrentTier.player_id,
+                    PlayerCurrentTier.kit_id,
+                    PlayerCurrentTier.tier_id,
+                ).where(PlayerCurrentTier.player_id.in_(batch))
+            )
+            for player_id, kit_id, tier_id in rows.all():
+                out.setdefault(player_id, {})[kit_id] = tier_id
         return out
 
     async def _anomaly(
@@ -325,18 +361,20 @@ class DiscordSyncService:
         kit_key: Optional[str] = None,
         details: Optional[dict] = None,
         old_tier: Optional[str] = None,
+        known_anomalies: frozenset = frozenset(),
     ) -> None:
-        await self._sync_actions.record(
-            session,
-            sync_run_id=run_id,
-            action_type="observe",
-            player_id=player_id,
-            member_id=member_id,
-            kit_id=kit_id,
-            anomaly_category=category,
-            status=SYNC_ACTION_ANOMALY,
-            details=details,
-        )
+        if (member_id, category, kit_id) not in known_anomalies:
+            await self._sync_actions.record(
+                session,
+                sync_run_id=run_id,
+                action_type="observe",
+                player_id=player_id,
+                member_id=member_id,
+                kit_id=kit_id,
+                anomaly_category=category,
+                status=SYNC_ACTION_ANOMALY,
+                details=details,
+            )
         out.anomalies += 1
         out.changes.append(
             SyncChange(member_id=member_id, kind=category, kit_key=kit_key, old_tier=old_tier)
@@ -357,6 +395,7 @@ class DiscordSyncService:
         tier_codes: dict[int, str],
         observed_at: datetime,
         create_missing_players: bool,
+        known_anomalies: frozenset,
     ) -> _MemberOutcome:
         out = _MemberOutcome()
         role_ids = member_role_ids(member)
@@ -372,6 +411,7 @@ class DiscordSyncService:
                     session, out, run_id=run_id, member_id=member_id,
                     category=SYNC_ANOMALY_UNKNOWN_PLAYER,
                     details={"role_count": len(role_ids)},
+                    known_anomalies=known_anomalies,
                 )
                 out.unknown = True
                 return out
@@ -384,6 +424,7 @@ class DiscordSyncService:
                     session, out, run_id=run_id, member_id=member_id,
                     category=SYNC_ANOMALY_IDENTITY_CONFLICT,
                     details={"error": str(err)[:500]},
+                    known_anomalies=known_anomalies,
                 )
                 return out
             out.created = True
@@ -403,6 +444,7 @@ class DiscordSyncService:
                     session, out, run_id=run_id, member_id=member_id,
                     category=obs.anomaly, player_id=player.id,
                     kit_id=obs.kit_id, kit_key=obs.kit_key,
+                    known_anomalies=known_anomalies,
                 )
             elif obs.kit_id in current:
                 # DB has a tier for this kit, Discord has no role → report only.
@@ -412,6 +454,7 @@ class DiscordSyncService:
                     kit_id=obs.kit_id, kit_key=obs.kit_key,
                     old_tier=tier_codes.get(current[obs.kit_id]),
                     details={"db_tier_id": current[obs.kit_id]},
+                    known_anomalies=known_anomalies,
                 )
 
         if not clean:

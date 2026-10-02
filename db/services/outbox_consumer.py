@@ -97,6 +97,25 @@ def _parse_dt(value, field_name: str) -> datetime:
     raise ValueError(f"{field_name} must be an ISO-8601 string or datetime")
 
 
+def _parse_cooldowns(cooldowns_raw) -> tuple[CooldownSpec, ...]:
+    specs = []
+    for raw in cooldowns_raw or ():
+        if not isinstance(raw, dict):
+            raise ValueError("cooldowns entries must be objects")
+        cooldown_type = raw.get("cooldown_type")
+        expires_at = raw.get("expires_at")
+        if cooldown_type is None or expires_at is None:
+            raise ValueError("cooldown entries need 'cooldown_type' and 'expires_at'")
+        specs.append(
+            CooldownSpec(
+                cooldown_type=str(cooldown_type),
+                expires_at=_parse_dt(expires_at, "cooldowns[].expires_at"),
+                kit_id=raw.get("kit_id"),
+            )
+        )
+    return tuple(specs)
+
+
 def default_stale_cutoff(*, seconds: int = DEFAULT_STALE_LOCK_SECONDS) -> datetime:
     """Cutoff for reclaiming ``in_progress`` events orphaned by a crash."""
     return datetime.now(timezone.utc) - timedelta(seconds=seconds)
@@ -165,26 +184,9 @@ async def resolve_unresolved_payload_kwargs(
     if recorded_at is not None:
         kwargs["recorded_at"] = _parse_dt(recorded_at, "recorded_at")
 
-    cooldowns_raw = payload.get("cooldowns") or ()
-    if cooldowns_raw:
-        specs = []
-        for raw in cooldowns_raw:
-            if not isinstance(raw, dict):
-                raise ValueError("cooldowns entries must be objects")
-            cooldown_type = raw.get("cooldown_type")
-            expires_at = raw.get("expires_at")
-            if cooldown_type is None or expires_at is None:
-                raise ValueError(
-                    "cooldown entries need 'cooldown_type' and 'expires_at'"
-                )
-            specs.append(
-                CooldownSpec(
-                    cooldown_type=str(cooldown_type),
-                    expires_at=_parse_dt(expires_at, "cooldowns[].expires_at"),
-                    kit_id=raw.get("kit_id"),
-                )
-            )
-        kwargs["cooldowns"] = tuple(specs)
+    cooldowns = _parse_cooldowns(payload.get("cooldowns"))
+    if cooldowns:
+        kwargs["cooldowns"] = cooldowns
     return kwargs
 
 
@@ -212,26 +214,9 @@ def build_commit_kwargs(payload: dict) -> dict:
     if recorded_at is not None:
         kwargs["recorded_at"] = _parse_dt(recorded_at, "recorded_at")
 
-    cooldowns_raw = payload.get("cooldowns") or ()
-    if cooldowns_raw:
-        specs = []
-        for raw in cooldowns_raw:
-            if not isinstance(raw, dict):
-                raise ValueError("cooldowns entries must be objects")
-            cooldown_type = raw.get("cooldown_type")
-            expires_at = raw.get("expires_at")
-            if cooldown_type is None or expires_at is None:
-                raise ValueError(
-                    "cooldown entries need 'cooldown_type' and 'expires_at'"
-                )
-            specs.append(
-                CooldownSpec(
-                    cooldown_type=str(cooldown_type),
-                    expires_at=_parse_dt(expires_at, "cooldowns[].expires_at"),
-                    kit_id=raw.get("kit_id"),
-                )
-            )
-        kwargs["cooldowns"] = tuple(specs)
+    cooldowns = _parse_cooldowns(payload.get("cooldowns"))
+    if cooldowns:
+        kwargs["cooldowns"] = cooldowns
     return kwargs
 
 
@@ -265,7 +250,8 @@ class OutboxConsumer:
             event_id = event.id
             event_type_actual = event.event_type
             aggregate_id = event.aggregate_id
-            attempts_before = event.attempts or 0
+            attempts_before = (event.attempts or 1) - 1
+            claimed_at = event.claimed_at
             confirmed = event.discord_role_confirmed
             payload = event.payload or {}
         # Claim commits here; a crash mid-replay leaves a stale in_progress the
@@ -277,6 +263,7 @@ class OutboxConsumer:
                 event_type=event_type_actual,
                 aggregate_id=aggregate_id,
                 attempts_before=attempts_before,
+                claimed_at=claimed_at,
             )
 
         result_key = aggregate_id
@@ -319,10 +306,19 @@ class OutboxConsumer:
                 attempts_before=attempts_before,
                 error=str(exc),
                 result_key=result_key,
+                claimed_at=claimed_at,
             )
 
         async with transaction(session_factory) as session:
-            await self._outbox.mark_done(session, event_id=event_id)
+            if not await self._outbox.mark_done(
+                session, event_id=event_id, claimed_at=claimed_at
+            ):
+                log.warning(
+                    "Outbox event %s (%s) was reclaimed by another consumer "
+                    "before completion; replay is idempotent",
+                    event_id,
+                    result_key,
+                )
             await self._audit.append(
                 session,
                 action="outbox_committed",
@@ -375,13 +371,14 @@ class OutboxConsumer:
         event_type: str,
         aggregate_id: str,
         attempts_before: int,
+        claimed_at: Optional[datetime],
     ) -> OutboxConsumption:
         error = (
             "refusing unconfirmed outbox event: discord_role_confirmed is not True"
         )
         async with transaction(session_factory) as session:
             status = await self._outbox.mark_failed(
-                session, event_id=event_id, error=error
+                session, event_id=event_id, error=error, claimed_at=claimed_at
             )
             await self._audit.append(
                 session,
@@ -417,10 +414,11 @@ class OutboxConsumer:
         attempts_before: int,
         error: str,
         result_key: str,
+        claimed_at: Optional[datetime],
     ) -> OutboxConsumption:
         async with transaction(session_factory) as session:
             status = await self._outbox.mark_failed(
-                session, event_id=event_id, error=error
+                session, event_id=event_id, error=error, claimed_at=claimed_at
             )
             await self._audit.append(
                 session,

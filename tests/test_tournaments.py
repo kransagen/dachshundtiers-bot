@@ -80,6 +80,53 @@ class TournamentResultPingTests(unittest.TestCase):
 
         asyncio.run(main())
 
+    def test_invalid_tiers_are_rejected_before_sending(self):
+        async def main():
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock()
+            inter = _interaction(_guild(), channel)
+            cog = tournaments.Tournaments(mock.MagicMock())
+            await cog.turnajresult.callback(
+                cog, interaction=inter, kit="AnchorPvP", hrac=_player(),
+                z_tieru="LT3", na_tier="Bůh",
+            )
+            self.assertIn("Neplatný nový tier", inter.response.send_message.await_args.args[0])
+            channel.send.assert_not_awaited()
+
+        asyncio.run(main())
+
+    def test_send_failure_is_reported(self):
+        async def main():
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(
+                side_effect=discord.HTTPException(mock.MagicMock(), "boom")
+            )
+            inter = _interaction(_guild(), channel)
+            cog = tournaments.Tournaments(mock.MagicMock())
+            await cog.turnajresult.callback(
+                cog, interaction=inter, kit="AnchorPvP", hrac=_player(),
+                z_tieru="LT3", na_tier="HT3",
+            )
+            self.assertIn("nepodařilo odeslat", inter.response.send_message.await_args.args[0])
+
+        asyncio.run(main())
+
+    def test_only_the_player_is_pingable(self):
+        async def main():
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(return_value=mock.MagicMock())
+            inter = _interaction(_guild(), channel)
+            cog = tournaments.Tournaments(mock.MagicMock())
+            player = _player()
+            await cog.turnajresult.callback(
+                cog, interaction=inter, kit="AnchorPvP", hrac=player,
+                z_tieru="LT3", na_tier="HT3",
+            )
+            allowed = channel.send.await_args.kwargs["allowed_mentions"]
+            self.assertEqual([u.id for u in allowed.users], [player.id])
+
+        asyncio.run(main())
+
     def test_missing_role_aborts_with_clear_error(self):
         async def main():
             channel = mock.MagicMock()
@@ -160,3 +207,53 @@ class TournamentPermissionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class EndSignupRollbackTests(unittest.TestCase):
+    """Selhání vytváření skupin vrátí turnaj do stavu „přihlašování“ a uklidí kanály."""
+
+    def test_group_failure_reopens_tournament_and_deletes_channels(self):
+        from contextlib import asynccontextmanager
+        from types import SimpleNamespace
+
+        async def main():
+            tournament = SimpleNamespace(
+                id=7, ended=False, tier="HT3", groups_count=2,
+                signup_channel_id=11, category_id=12,
+            )
+            repo = mock.MagicMock()
+            repo.get_by_kit = mock.AsyncMock(return_value=tournament)
+            repo.list_participant_discord_ids = mock.AsyncMock(return_value=[1, 2, 3, 4])
+            repo.mark_ended = mock.AsyncMock()
+
+            @asynccontextmanager
+            async def fake_tx(_sf):
+                yield mock.MagicMock()
+
+            kit_repo = mock.MagicMock()
+            kit_repo.get_by_key = mock.AsyncMock(
+                return_value=SimpleNamespace(id=1, name="Mole")
+            )
+
+            first = mock.MagicMock()
+            first.send = mock.AsyncMock()
+            first.delete = mock.AsyncMock()
+            guild = mock.MagicMock()
+            guild.get_channel.return_value = mock.MagicMock(send=mock.AsyncMock())
+            guild.get_member.return_value = None
+            guild.create_text_channel = mock.AsyncMock(
+                side_effect=[first, RuntimeError("discord down")]
+            )
+
+            with mock.patch.object(tournaments, "transaction", fake_tx), \
+                 mock.patch.object(tournaments, "TournamentRepository", return_value=repo), \
+                 mock.patch.object(tournaments, "KitRepository", return_value=kit_repo):
+                with self.assertRaises(RuntimeError):
+                    await tournaments.end_tournament_signup(object(), guild, "mole")
+
+            first.delete.assert_awaited_once()
+            self.assertEqual(
+                [c.kwargs.get("ended", True) for c in repo.mark_ended.await_args_list],
+                [True, False],
+            )
+
+        asyncio.run(main())

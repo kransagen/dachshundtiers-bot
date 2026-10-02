@@ -141,8 +141,15 @@ class PlayerRepository:
         if player is not None:
             return player
         player = Player(discord_id=did, ign=shell_ign(did), source=PLAYER_SOURCE_DISCORD)
-        session.add(player)
-        await session.flush()
+        try:
+            async with session.begin_nested():
+                session.add(player)
+                await session.flush()
+        except IntegrityError:
+            existing = await self.get_by_discord_id(session, did)
+            if existing is None:
+                raise
+            return existing
         return player
 
     async def get_or_create_by_ign(

@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from config import TESTER_ROOM_CATEGORY_ID
 from panel import create_queue_embed, update_panel
 from services.config_store import get_queue_channel_id
+from services.permissions import has_admin_role
 from services.queue_service import (
     PULL_EMPTY,
     PULL_NO_KIT,
@@ -65,37 +66,17 @@ class Queues(commands.Cog):
                 "❌ Pouze na serveru.", ephemeral=True
             )
 
+        await interaction.response.defer(ephemeral=True)
         kit_key = kit.lower()
         sf = getattr(self.bot, "db_session_factory", None)
 
-        # Otevření fronty je atomické v obou režimech (JSON transakce / DB
-        # transakce): kontrola, že už není otevřená, i zápis proběhnou v
-        # jednom kritickém úseku (žádné dvojité otevření).
-        status, qdata = await open_queue(
-            kit_key,
-            kit,
-            str(interaction.user.id),
-            interaction.user.display_name,
-            session_factory=sf,
-        )
-        if status == "exists":
-            existing = qdata
-            return await interaction.response.send_message(
-                f"❌ Pouze jeden tester může přímo inicializovat frontu! "
-                f"Queue pro **{existing['name']}** už je otevřená testerem "
-                f"<@{existing['opener']}>. Pokud v ní chceš také testovat, "
-                f"použij `/queue joinasqueue kit:{kit}`.",
-                ephemeral=True,
-            )
-        if status == "unknown_kit":
-            return await interaction.response.send_message(
-                f"❌ Neznámý kit: {kit}", ephemeral=True
-            )
-
+        # Kanál panelu ověříme dřív, než se fronta otevře: fronta bez panelu
+        # by zůstala aktivní a další /openq by hlásil „už otevřená“.
         channel_id = await get_queue_channel_id(kit_key, session_factory=sf)
         if not channel_id:
-            return await interaction.response.send_message(
-                f"❌ Neznámý kit: {kit}", ephemeral=True
+            return await interaction.followup.send(
+                f"❌ Pro kit **{kit}** není nastavený kanál fronty (`/addqchannel`).",
+                ephemeral=True,
             )
 
         # Panel vždy jde do určeného kanálu daného kitu, ne do kanálu příkazu
@@ -106,38 +87,56 @@ class Queues(commands.Cog):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException):
                 kit_channel = None
         if kit_channel is None:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Nepodařilo se najít kanál pro tento kit.", ephemeral=True
             )
 
-        # Purge všech zpráv v kanálu kitu před novým panelem (jako v originále)
-        purged = 0
-        try:
-            async for message in kit_channel.history(limit=100):
-                await message.delete()
-                purged += 1
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as err:
-            log.warning(
-                "Purge kanálu %s (kit %s) skončil po %d zprávách: %s",
-                channel_id,
-                kit_key,
-                purged,
-                err,
+        # Otevření fronty je atomické: kontrola, že už není otevřená, i zápis
+        # proběhnou v jednom kritickém úseku (žádné dvojité otevření).
+        status, qdata = await open_queue(
+            kit_key,
+            kit,
+            str(interaction.user.id),
+            interaction.user.display_name,
+            session_factory=sf,
+        )
+        if status == "exists":
+            existing = qdata
+            return await interaction.followup.send(
+                f"❌ Pouze jeden tester může přímo inicializovat frontu! "
+                f"Queue pro **{existing['name']}** už je otevřená testerem "
+                f"<@{existing['opener']}>. Pokud v ní chceš také testovat, "
+                f"použij `/queue joinasqueue kit:{kit}`.",
+                ephemeral=True,
+            )
+        if status == "unknown_kit":
+            return await interaction.followup.send(
+                f"❌ Neznámý kit: {kit}", ephemeral=True
             )
 
-        entries = await list_queue_entries(kit_key, session_factory=sf)
-        embed = create_queue_embed(kit, entries, qdata["testers"])
-
-        view = QueueView(kit)
         try:
-            message = await kit_channel.send("📢 @everyone", embed=embed, view=view)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as err:
-            log.exception("Panel fronty %s se nepodařilo odeslat do %s", kit_key, channel_id)
-            return await interaction.response.send_message(
-                f"❌ Fronta pro **{kit}** je uložená jako otevřená, ale panel se "
-                f"nepodařilo poslat do <#{channel_id}> ({type(err).__name__}). "
-                f"Staré zprávy jsou částečně smazané. Zavři ji `/closeq {kit_key}` "
-                "a zkus to znovu.",
+            # Purge zpráv v kanálu kitu před novým panelem (jako v originále)
+            try:
+                await kit_channel.purge(limit=100)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+            entries = await list_queue_entries(kit_key, session_factory=sf)
+            embed = create_queue_embed(kit, entries, qdata["testers"])
+
+            view = QueueView(kit)
+            message = await kit_channel.send(
+                "📢 @everyone",
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(everyone=True),
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Panel fronty %s se nepodařilo odeslat", kit)
+            await close_queue(kit_key, session_factory=sf)
+            return await interaction.followup.send(
+                "❌ Panel fronty se nepodařilo odeslat (zkontroluj oprávnění bota "
+                "v kanálu kitu). Fronta nebyla otevřena.",
                 ephemeral=True,
             )
 
@@ -147,7 +146,7 @@ class Queues(commands.Cog):
         # Zaregistrování persistentní view pro restart bota
         self.bot.add_view(view, message_id=message.id)
 
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Fronta pro **{kit}** byla otevřena v <#{channel_id}>!", ephemeral=True
         )
 
@@ -174,6 +173,14 @@ class Queues(commands.Cog):
         if qdata is None:
             return await interaction.response.send_message(
                 f"Queue pro **{kit}** není aktivní.", ephemeral=True
+            )
+
+        if str(interaction.user.id) not in qdata.get("testers", []) and not has_admin_role(
+            interaction.user
+        ):
+            return await interaction.response.send_message(
+                "❌ Frontu může zavřít jen tester, který v ní je, nebo admin.",
+                ephemeral=True,
             )
 
         if len(qdata.get("testers", [])) > 1:
@@ -313,11 +320,11 @@ class Queues(commands.Cog):
                 "V této frontě už jsi zapsaný jako aktivní tester.", ephemeral=True
             )
 
-        await update_panel(interaction.guild, kit_key, session_factory=sf)
         await interaction.response.send_message(
             f"⚔️ <@{user_id}> se přidal jako další aktivní tester pro frontu "
             f"**{qdata['name']}**."
         )
+        await update_panel(interaction.guild, kit_key, session_factory=sf)
 
     @queue.command(name="leaveq", description="Leave an active queue you are currently testing in")
     @app_commands.describe(kit="Name of the kit")
@@ -341,12 +348,18 @@ class Queues(commands.Cog):
             return await interaction.response.send_message(
                 "V této frontě nejsi zapsaný.", ephemeral=True
             )
+        if status == "last_tester":
+            return await interaction.response.send_message(
+                f"❌ Jsi poslední tester ve frontě **{qdata['name']}**. "
+                f"Zavři ji přes `/closeq kit:{kit}`.",
+                ephemeral=True,
+            )
 
-        await update_panel(interaction.guild, kit_key, session_factory=sf)
         await interaction.response.send_message(
             f"👋 <@{user_id}> opustil frontu **{qdata['name']}**. "
             "Ostatní testeři mohou pokračovat."
         )
+        await update_panel(interaction.guild, kit_key, session_factory=sf)
 
     @queue.command(name="pull", description="Vytáhne prvního hráče z fronty kitu")
     @app_commands.describe(kit="Kit, ze kterého fronty vytahovat")
@@ -359,6 +372,7 @@ class Queues(commands.Cog):
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
 
+        await interaction.response.defer(ephemeral=True)
         sf = getattr(self.bot, "db_session_factory", None)
 
         # Tester NEVYBÍRÁ roomku – roomka patří kitu (založí ji
@@ -368,17 +382,17 @@ class Queues(commands.Cog):
         result = await pull_for_kit(kit, session_factory=sf)
 
         if result.status == PULL_NO_ROOM:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Kit **{kit.strip()}** nemá tester roomku. Vytvoř ji "
                 f"`/mktesterroom {kit.strip()}` – hráč ve frontě zůstal.",
                 ephemeral=True,
             )
         if result.status == PULL_NO_KIT:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Kit `{kit.strip()}` neznám.", ephemeral=True
             )
         if result.status == PULL_EMPTY:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"Fronta pro kit **{kit.strip()}** je prázdná.", ephemeral=True
             )
 
@@ -518,6 +532,10 @@ class Queues(commands.Cog):
                 channel.id,
                 kit_row.key,
             )
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
             return await interaction.response.send_message(
                 "❌ Tato roomka už je přiřazená jinému kitu – mapování nebylo uloženo.",
                 ephemeral=True,
@@ -614,12 +632,18 @@ class Queues(commands.Cog):
                     pass
 
         # 1b) Voice: skipnutý hráč nesmí zůstat připojený ve voice roomce
-        #     (odebrání práv ho z voice kanálu samo neodpojí).
+        #     (odebrání práv ho z voice kanálu samo neodpojí). Odpojuje se jen
+        #     z té roomky, ve které testoval – ne z libovolného voice kanálu.
         try:
             vs = hrac.voice
         except (AttributeError, TypeError):
             vs = None
-        if vs is not None and vs.channel is not None:
+        if (
+            vs is not None
+            and vs.channel is not None
+            and channel_id
+            and vs.channel.id == channel_id
+        ):
             try:
                 await hrac.move_to(interaction.guild.afk_channel)
             except (discord.Forbidden, discord.HTTPException) as err:

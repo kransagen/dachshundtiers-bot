@@ -28,12 +28,12 @@ from services.cooldowns import get_cooldowns
 from services.evals import set_eval, unset_eval
 from services.ht3_tickets import ensure_eval_ticket
 from services.kit_catalog import get_kits
-from services.queue_service import preset_player_room
+from services.permissions import has_admin_role
+from services.queue_service import is_tester_room, preset_player_room
 from services.tickets import (
     add_member,
     claim_ticket,
     get_ticket,
-    log_ticket_event,
     remove_member,
     unclaim_ticket,
 )
@@ -73,6 +73,19 @@ def _eval_ticket_skip_note(request) -> str:
         return "ℹ️ Hráč není v databázi, ticket se nezaložil."
     if reason == "no_kit":
         return "ℹ️ Kit neznámý, ticket se nezaložil."
+    if reason == "no_discord":
+        return (
+            "ℹ️ Hráč nemá propojený Discord účet, ticket se nezaložil. "
+            "Otevře si ho sám přes HT3+ panel."
+        )
+    if reason == "cooldown":
+        remaining = int(request.remaining_ms or 0)
+        days, rem = divmod(remaining, 86_400_000)
+        hours = rem // 3_600_000
+        return (
+            f"ℹ️ Hráč má HT3+ cooldown na tenhle kit ještě **{days}d {hours}h**, "
+            "ticket se nezaložil. Eval zůstává, ticket si otevře po skončení cooldownu."
+        )
     if reason == "no_database":
         return "ℹ️ Bez PostgreSQL evalu nejsou uložené trvalé, ticket se nezaložil."
     return "ℹ️ HT3+ ticket se nezaložil."
@@ -188,7 +201,16 @@ class HT3(commands.Cog):
                     "❌ Ticket je zavřený – přidávat hráče jde jen do otevřeného.",
                     ephemeral=True,
                 )
-            result = await add_member(channel.id, str(hrac.id), session_factory=getattr(self.bot, "db_session_factory", None))
+            result = await add_member(
+                channel.id,
+                str(hrac.id),
+                session_factory=getattr(self.bot, "db_session_factory", None),
+                audit={
+                    "actor_id": str(interaction.user.id),
+                    "actor_name": interaction.user.display_name,
+                    "details": f"Přidán hráč <@{hrac.id}> ({hrac.display_name})",
+                },
+            )
             r = result["result"]
             if r == "is_owner":
                 return await interaction.response.send_message(
@@ -208,21 +230,20 @@ class HT3(commands.Cog):
                 )
 
             await _ticket_set_perms(channel, hrac)
-            await log_ticket_event(
-                channel.id,
-                "added",
-                str(interaction.user.id),
-                interaction.user.display_name,
-                details=f"Přidán hráč <@{hrac.id}> ({hrac.display_name})",
-                session_factory=getattr(self.bot, "db_session_factory", None),
-            )
             await _sync_ticket_embed(self.bot, result["ticket"])
             return await interaction.response.send_message(
                 f"✅ Hráč **{hrac.display_name}** (<@{hrac.id}>) byl přidán do "
                 f"ticketu <#{channel.id}>. Po `/result` mu bude přístup odebrán."
             )
 
-        # Tester roomka (legacy): přímá práva + záznam pro /result
+        # Tester roomka: přímá práva + záznam pro /result. Jen v roomce
+        # zaregistrované přes /mktesterroom, ne v libovolném kanálu.
+        if not await is_tester_room(
+            channel.id, session_factory=getattr(self.bot, "db_session_factory", None)
+        ):
+            return await interaction.response.send_message(
+                "❌ /add funguje jen v HT ticketu nebo tester roomce.", ephemeral=True
+            )
         try:
             await channel.set_permissions(hrac, view_channel=True, send_messages=True)
         except (discord.Forbidden, discord.HTTPException):
@@ -281,7 +302,16 @@ class HT3(commands.Cog):
                 ephemeral=True,
             )
 
-        result = await remove_member(channel.id, str(hrac.id), session_factory=getattr(self.bot, "db_session_factory", None))
+        result = await remove_member(
+            channel.id,
+            str(hrac.id),
+            session_factory=getattr(self.bot, "db_session_factory", None),
+            audit={
+                "actor_id": str(interaction.user.id),
+                "actor_name": interaction.user.display_name,
+                "details": f"Odebrán hráč <@{hrac.id}> ({hrac.display_name})",
+            },
+        )
         r = result["result"]
         if r == "is_owner":
             return await interaction.response.send_message(
@@ -305,14 +335,6 @@ class HT3(commands.Cog):
             )
 
         await revoke_channel_access(channel, str(hrac.id))
-        await log_ticket_event(
-            channel.id,
-            "removed",
-            str(interaction.user.id),
-            interaction.user.display_name,
-            details=f"Odebrán hráč <@{hrac.id}> ({hrac.display_name})",
-            session_factory=getattr(self.bot, "db_session_factory", None),
-        )
         await _sync_ticket_embed(self.bot, result["ticket"])
         await interaction.response.send_message(
             f"✅ Hráč **{hrac.display_name}** (<@{hrac.id}>) byl odebrán z "
@@ -358,6 +380,11 @@ class HT3(commands.Cog):
             str(interaction.user.id),
             interaction.user.display_name,
             session_factory=getattr(self.bot, "db_session_factory", None),
+            audit={
+                "actor_id": str(interaction.user.id),
+                "actor_name": interaction.user.display_name,
+                "details": f"Claim: {ticket.get('ign')} / {ticket.get('kit')}",
+            },
         )
         r = result["result"]
         if r == "own_ticket":
@@ -376,14 +403,6 @@ class HT3(commands.Cog):
             )
 
         await grant_channel_access(channel, str(interaction.user.id))
-        await log_ticket_event(
-            channel.id,
-            "claimed",
-            str(interaction.user.id),
-            interaction.user.display_name,
-            details=f"Claim: {result['ticket'].get('ign')} / {result['ticket'].get('kit')}",
-            session_factory=getattr(self.bot, "db_session_factory", None),
-        )
         await _sync_ticket_embed(self.bot, result["ticket"])
         await interaction.response.send_message(
             f"✅ **{interaction.user.display_name}** převzal/a ticket "
@@ -421,7 +440,22 @@ class HT3(commands.Cog):
                 ephemeral=True,
             )
 
-        result = await unclaim_ticket(channel.id, str(interaction.user.id), force=True, session_factory=getattr(self.bot, "db_session_factory", None))
+        result = await unclaim_ticket(
+            channel.id,
+            str(interaction.user.id),
+            force=has_admin_role(interaction.user),
+            session_factory=getattr(self.bot, "db_session_factory", None),
+            audit={
+                "actor_id": str(interaction.user.id),
+                "actor_name": interaction.user.display_name,
+            },
+        )
+        if result["result"] == "not_claimer":
+            other = result.get("claimer_name") or f"<@{result.get('claimer_id')}>"
+            return await interaction.response.send_message(
+                f"❌ Ticket má převzatý **{other}** – uvolnit ho může jen on nebo admin.",
+                ephemeral=True,
+            )
         if result["result"] != "unclaimed":
             return await interaction.response.send_message(
                 "❌ Ticket nemá nikdo převzatý (nebo se nepodařilo uvolnit).",
@@ -430,14 +464,6 @@ class HT3(commands.Cog):
 
         previous = result["previous"]
         await revoke_channel_access(channel, previous["claimer_id"])
-        await log_ticket_event(
-            channel.id,
-            "unclaimed",
-            str(interaction.user.id),
-            interaction.user.display_name,
-            details=f"Vzdal se: {previous['claimer_name'] or previous['claimer_id']}",
-            session_factory=getattr(self.bot, "db_session_factory", None),
-        )
         await _sync_ticket_embed(self.bot, result["ticket"])
         await interaction.response.send_message(
             "↩️ Ticket je zase volný – nikdo ho nemá převzatý.", ephemeral=True
@@ -459,7 +485,12 @@ class HT3(commands.Cog):
             )
 
         session_factory = getattr(self.bot, "db_session_factory", None)
-        if not await set_eval(ign, kit, session_factory=session_factory):
+        if not await set_eval(
+            ign,
+            kit,
+            granted_by=interaction.user.id,
+            session_factory=session_factory,
+        ):
             return await interaction.response.send_message(
                 f"❌ Neplatný IGN nebo kit (`{ign}` / `{kit}`).", ephemeral=True
             )

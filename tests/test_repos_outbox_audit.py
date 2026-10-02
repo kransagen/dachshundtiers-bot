@@ -3,11 +3,13 @@
 from datetime import datetime, timedelta, timezone
 
 
+from db.models import OutboxEvent
 from db.repositories.outbox import (
     OUTBOX_DEAD_LETTER,
     OUTBOX_IN_PROGRESS,
     OUTBOX_PENDING,
     OutboxRepository,
+    retry_delay,
 )
 from db.repositories.sync_audit import (
     AuditRepository,
@@ -66,24 +68,72 @@ async def test_outbox_mark_failed_retries_then_dead_letters(session_factory, cle
         ev = await OutboxRepository().enqueue(
             session, event_type="x", aggregate_type="r", aggregate_id="3", payload={}
         )
+    statuses = []
+    for attempt in range(1, 6):
+        async with transaction(session_factory) as session:
+            repo = OutboxRepository()
+            row = await session.get(OutboxEvent, ev.id)
+            row.next_attempt_at = None
+            await session.flush()
+            claimed = await repo.claim_next(session)
+            assert claimed is not None and claimed.attempts == attempt
+            statuses.append(
+                await repo.mark_failed(
+                    session,
+                    event_id=ev.id,
+                    error=f"boom {attempt}",
+                    claimed_at=claimed.claimed_at,
+                )
+            )
+    assert statuses == [OUTBOX_PENDING] * 4 + [OUTBOX_DEAD_LETTER]
     async with transaction(session_factory) as session:
-        repo = OutboxRepository()
-        status_1 = await repo.mark_failed(session, event_id=ev.id, error="boom 1")
-        assert status_1 == OUTBOX_PENDING
-        status_2 = await repo.mark_failed(session, event_id=ev.id, error="boom 2")
-        assert status_2 == OUTBOX_PENDING
-    async with transaction(session_factory) as session:
-        repo = OutboxRepository()
-        event = await repo.claim_next(session)
-        assert event is not None
-        status_3 = await repo.mark_failed(session, event_id=ev.id, error="boom 3")
-        assert status_3 == OUTBOX_PENDING
-        status_4 = await repo.mark_failed(session, event_id=ev.id, error="boom 4")
-        assert status_4 == OUTBOX_PENDING
-        status_5 = await repo.mark_failed(session, event_id=ev.id, error="boom 5")
-        assert status_5 == OUTBOX_DEAD_LETTER
-        dead = await repo.list_by_status(session, status=OUTBOX_DEAD_LETTER)
+        dead = await OutboxRepository().list_by_status(session, status=OUTBOX_DEAD_LETTER)
     assert [e.id for e in dead] == [ev.id]
+
+
+async def test_outbox_retry_is_delayed_by_backoff(session_factory, clean_db):
+    async with transaction(session_factory) as session:
+        repo = OutboxRepository()
+        ev = await repo.enqueue(
+            session, event_type="x", aggregate_type="r", aggregate_id="bo", payload={}
+        )
+    async with transaction(session_factory) as session:
+        repo = OutboxRepository()
+        claimed = await repo.claim_next(session)
+        await repo.mark_failed(
+            session, event_id=ev.id, error="boom", claimed_at=claimed.claimed_at
+        )
+    async with transaction(session_factory) as session:
+        assert await OutboxRepository().claim_next(session) is None
+    assert retry_delay(1) == timedelta(seconds=60)
+    assert retry_delay(2) == timedelta(seconds=120)
+    assert retry_delay(50) == timedelta(hours=1)
+
+
+async def test_outbox_lost_claim_cannot_complete_or_fail_event(session_factory, clean_db):
+    async with transaction(session_factory) as session:
+        repo = OutboxRepository()
+        ev = await repo.enqueue(
+            session, event_type="x", aggregate_type="r", aggregate_id="lc", payload={}
+        )
+    async with transaction(session_factory) as session:
+        first = await OutboxRepository().claim_next(session)
+        first_claim = first.claimed_at
+        first.claimed_at = first_claim - timedelta(hours=1)
+        await session.flush()
+    async with transaction(session_factory) as session:
+        second = await OutboxRepository().claim_next(
+            session, in_progress_before=first_claim - timedelta(minutes=30)
+        )
+        assert second is not None and second.attempts == 2
+    async with transaction(session_factory) as session:
+        repo = OutboxRepository()
+        stale_claim = first_claim - timedelta(hours=1)
+        assert not await repo.mark_done(session, event_id=ev.id, claimed_at=stale_claim)
+        assert await repo.mark_failed(
+            session, event_id=ev.id, error="late", claimed_at=stale_claim
+        ) == ""
+        assert await repo.mark_done(session, event_id=ev.id, claimed_at=second.claimed_at)
 
 
 async def test_outbox_stale_in_progress_reclaim(session_factory, clean_db):

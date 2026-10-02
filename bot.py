@@ -14,7 +14,7 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
-from config import DISCORD_TOKEN, GUILD_ID
+from config import DISCORD_TOKEN, GUILD_ID, TESTER_ROLE_IDS
 from services.config_store import get_ht3_panel
 from services.kit_catalog import get_kits
 from storage import backend_name, ensure_data_dir
@@ -33,6 +33,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("dachshundtiers")
 
+RETRY_BASE_DELAY = 5
+RETRY_MAX_DELAY = 300
+RETRY_RESET_AFTER = 300
+
 
 class DachshundTiersTree(discord.app_commands.CommandTree):
     """Fallback error handler pro VŠECHNY aplikace příkazů.
@@ -47,8 +51,13 @@ class DachshundTiersTree(discord.app_commands.CommandTree):
         interaction: discord.Interaction,
         error: discord.app_commands.AppCommandError,
     ) -> None:
-        log.exception("Chyba v příkazu %s: %s", interaction.command, error)
-        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        if isinstance(error, discord.app_commands.CommandOnCooldown):
+            msg = f"⏳ Příkaz je na cooldownu, zkus to znovu za {error.retry_after:.0f} s."
+        elif isinstance(error, discord.app_commands.CheckFailure):
+            msg = "❌ Tento příkaz nemůžeš použít."
+        else:
+            log.exception("Chyba v příkazu %s: %s", interaction.command, error)
+            msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
         try:
             if interaction.response.is_done():
                 await interaction.followup.send(msg, ephemeral=True)
@@ -185,7 +194,6 @@ def _build_intents() -> discord.Intents:
     intents = discord.Intents.default()
     intents.guilds = True
     intents.guild_messages = True
-    intents.message_content = True  # jako v originále
     intents.members = True  # privileged – zapnout v portálu (viz README)
     return intents
 
@@ -193,11 +201,11 @@ def _build_intents() -> discord.Intents:
 class DachshundTiersBot(commands.Bot):
     def __init__(self):
         super().__init__(
-            command_prefix="!",
+            command_prefix=commands.when_mentioned,
             intents=_build_intents(),
             tree_cls=DachshundTiersTree,
             allowed_mentions=discord.AllowedMentions(
-                everyone=True, users=True, roles=True
+                everyone=False, users=True, roles=False
             ),
         )
         # Synchronizace příkazů běží přesně jednou za běh procesu (viz
@@ -210,6 +218,8 @@ class DachshundTiersBot(commands.Bot):
         # ``on_ready`` se volá znovu po každém reconnectu; bez příznaku by se
         # hodinové smyčky i plánovače turnajů při každém výpadku zdvojily.
         self._startup_done = False
+        self._views_registered = False
+        self._scheduled_tournament_ends: set[str] = set()
 
         # PostgreSQL pool (Phase C): engine + session factory žijí po celý běh
         # procesu; cog příkazy (např. /sync discord) z nich berou transakce.
@@ -219,7 +229,16 @@ class DachshundTiersBot(commands.Bot):
         self.db_session_factory = None
 
     async def setup_hook(self) -> None:
-        # Načtení cogů
+        if not TESTER_ROLE_IDS:
+            log.warning(
+                "TESTER_ROLE_IDS není nastaveno – testerem je každá role s „tester“ "
+                "v názvu (např. „Beta Tester“). Nastav TESTER_ROLE_IDS (viz .env.example)."
+            )
+        if GUILD_ID is None:
+            log.warning(
+                "GUILD_ID není nastaveno – příkazy se synchronizují globálně a "
+                "validace rolí i hodinová reconciliation poběží vypnuté."
+            )
         extensions = [
             "cogs.queues",
             "cogs.results",
@@ -258,6 +277,10 @@ class DachshundTiersBot(commands.Bot):
             raise RuntimeError(
                 f"Nepodařilo se načíst cogy: {details}. Bot se nespustí."
             )
+        try:
+            await self._register_persistent_views()
+        except Exception:  # noqa: BLE001 – bez DB se tlačítka zaregistrují později
+            log.exception("Registrace persistentních views selhala.")
 
     async def close(self) -> None:
         """Zavře client i PostgreSQL pool; disposuje se až po client close."""
@@ -325,6 +348,12 @@ class DachshundTiersBot(commands.Bot):
         if self.db_session_factory is None:
             self._kit_role_config_validated = True
             return
+        if GUILD_ID is None:
+            log.warning(
+                "GUILD_ID není nastaveno – validace kit-role mapování se přeskakuje."
+            )
+            self._kit_role_config_validated = True
+            return
         guild = self.get_guild(GUILD_ID)
         if guild is None:
             log.warning(
@@ -370,7 +399,7 @@ class DachshundTiersBot(commands.Bot):
         try:
             from cogs.info import git_commit
 
-            log.info("Commit běžícího bota: %s", git_commit())
+            log.info("Commit běžícího bota: %s", await asyncio.to_thread(git_commit))
         except Exception:  # noqa: BLE001
             pass
 
@@ -383,18 +412,36 @@ class DachshundTiersBot(commands.Bot):
 
         if self._startup_done:
             return
-        self._startup_done = True
         await self._restore_state()
+        self._startup_done = True
 
-    async def _restore_state(self) -> None:
+    async def _load_tournaments(self) -> list[tuple]:
+        """Turnaje z PostgreSQL jako ``(turnaj, kit_key)``; bez DB prázdný seznam."""
+        if self.db_session_factory is None:
+            return []
+        from db.repositories.kits import KitRepository
+        from db.repositories.tournaments import TournamentRepository
+        from db.services.session import transaction
+
+        resolved: list[tuple] = []
+        async with transaction(self.db_session_factory) as session:
+            for tournament in await TournamentRepository().list_all(session):
+                kit = await KitRepository().get_by_id(session, tournament.kit_id)
+                if kit is not None:
+                    resolved.append((tournament, kit.key))
+        return resolved
+
+    async def _register_persistent_views(self) -> None:
+        """Znovuzaregistrování persistentních view (tlačítka přežijí restart).
+
+        Běží v ``setup_hook`` – ještě před připojením ke gateway, takže tlačítka
+        fungují hned po startu. Stav se čte z PostgreSQL (F10); bez DB se bloky
+        přeskočí (žádný JSON fallback).
+        """
         # Tlačítko 🔒 Zavřít místnost má statický custom_id – stačí jedna
         # registrace a funguje pro všechny tester roomky i po restartu.
         self.add_view(TesterRoomView())
 
-        # Znovuzaregistrování persistentních view pro živé panely front a
-        # otevřené HT tickety. Stav se čte z PostgreSQL (F10) – queue_messages.json
-        # ani ht_tickets.json se už nečtou; bez DB se bloky přeskočí (žádný
-        # JSON fallback).
         if self.db_session_factory is not None:
             from db.repositories.kits import KitRepository
             from db.repositories.queues import QueueRepository
@@ -435,6 +482,17 @@ class DachshundTiersBot(commands.Bot):
                         err,
                     )
 
+            for tournament, kit_key in await self._load_tournaments():
+                if not tournament.signup_message_id:
+                    continue
+                try:
+                    self.add_view(
+                        TournamentSignupView(kit_key),
+                        message_id=int(tournament.signup_message_id),
+                    )
+                except (ValueError, discord.ClientException) as err:
+                    log.warning("Nelze zaregistrovat turnaj %s: %s", kit_key, err)
+
         # HT3 panel
         ht3_panel = await get_ht3_panel(session_factory=self.db_session_factory)
         if ht3_panel.get("message_id"):
@@ -445,41 +503,24 @@ class DachshundTiersBot(commands.Bot):
                 )
             except (ValueError, discord.ClientException) as err:
                 log.warning("Nelze zaregistrovat HT3 panel: %s", err)
+        self._views_registered = True
 
-        # Turnaje: zaregistrování tlačítek a naplánování konce přihlašování.
-        # Fáze F (F2/F3): stav se čte z PostgreSQL (tournaments.json se už
-        # nezapisuje); bez DB se tento blok přeskočí – žádný JSON fallback.
+    async def _restore_state(self) -> None:
+        if not self._views_registered:
+            await self._register_persistent_views()
+
+        # Turnaje: naplánování konce přihlašování. Fáze F (F2/F3): stav se čte
+        # z PostgreSQL; bez DB se tento blok přeskočí – žádný JSON fallback.
         if self.db_session_factory is not None:
             from cogs.tournaments import end_tournament_signup
-            from db.repositories.kits import KitRepository
-            from db.repositories.tournaments import TournamentRepository
-            from db.services.session import transaction
 
             now_ts = time.time()
-            resolved: list[tuple] = []
-            async with transaction(self.db_session_factory) as session:
-                tourneys = await TournamentRepository().list_all(session)
-                for tournament in tourneys:
-                    kit = await KitRepository().get_by_id(
-                        session, tournament.kit_id
-                    )
-                    if kit is not None:
-                        resolved.append((tournament, kit.key))
-
-            for tournament, kit_key in resolved:
-                if tournament.signup_message_id:
-                    try:
-                        self.add_view(
-                            TournamentSignupView(kit_key),
-                            message_id=int(tournament.signup_message_id),
-                        )
-                    except (ValueError, discord.ClientException) as err:
-                        log.warning("Nelze zaregistrovat turnaj %s: %s", kit_key, err)
-
+            for tournament, kit_key in await self._load_tournaments():
                 if (
                     not tournament.ended
                     and tournament.deadline is not None
                     and tournament.guild_id
+                    and kit_key not in self._scheduled_tournament_ends
                 ):
                     remaining_s = max(
                         0.0, tournament.deadline.timestamp() - now_ts
@@ -500,6 +541,7 @@ class DachshundTiersBot(commands.Bot):
                                 self.db_session_factory, guild, key
                             )
 
+                    self._scheduled_tournament_ends.add(kit_key)
                     spawn(
                         _auto_end(int(tournament.guild_id), kit_key, remaining_s),
                         name=f"tournament-auto-end-{kit_key}",
@@ -508,7 +550,7 @@ class DachshundTiersBot(commands.Bot):
         # Fáze E: observe-only reconciliation (startup jednou + hodinový timer).
         # Nikdy nemění Discord role; jen drainuje potvrzené wedges a zrcadlí
         # aktuální Discord role do PostgreSQL. Bez DB se tiše přeskočí.
-        if self.db_session_factory is not None:
+        if self.db_session_factory is not None and GUILD_ID is not None:
             await self._run_reconciliation_once()
             spawn(self._reconciliation_loop(), name="reconciliation-loop")
 
@@ -631,37 +673,46 @@ async def main() -> None:
         f"guild {GUILD_ID}" if GUILD_ID else "GLOBÁLNÍ",
     )
     engine, session_factory = await _init_database()
-    bot = DachshundTiersBot()
-    bot.db_engine, bot.db_session_factory = engine, session_factory
     log.info("PostgreSQL pool připraven pro cog příkazy.")
-    await bot.start(DISCORD_TOKEN)
+    delay = RETRY_BASE_DELAY
+    try:
+        while True:
+            bot = DachshundTiersBot()
+            bot.db_engine, bot.db_session_factory = engine, session_factory
+            started = time.monotonic()
+            try:
+                await bot.start(DISCORD_TOKEN)
+                return
+            except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as err:
+                log.error("Nepřekonatelná chyba autentizace/konfigurace: %s", err)
+                raise SystemExit(1) from err
+            except (
+                discord.ConnectionClosed,
+                discord.GatewayNotFound,
+                discord.HTTPException,
+                OSError,
+                asyncio.TimeoutError,
+            ) as err:
+                if time.monotonic() - started > RETRY_RESET_AFTER:
+                    delay = RETRY_BASE_DELAY
+                log.warning("Přechodná chyba gateway (%s). Retry za %d s...", err, delay)
+            finally:
+                await bot.close()
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RETRY_MAX_DELAY)
+    finally:
+        from db.engine import dispose_engine
+
+        await dispose_engine(engine)
 
 
 def run() -> None:
-    """Spustí bota s retry při přechodných chybách gateway."""
+    """Spustí bota s retry (exponenciální backoff) při přechodných chybách gateway."""
     if not DISCORD_TOKEN:
         raise SystemExit(
             "❌ Chybí DISCORD_TOKEN. Nastav proměnnou prostředí (viz .env.example)."
         )
-
-    # Původní bot neměl vycházet z provozu při přechodných chybách gateway
-    # (WebSocket 503 / timeout handshaku), ale u neplatného tokenu se má zastavit.
-    while True:
-        try:
-            asyncio.run(main())
-            break
-        except (discord.LoginFailure, discord.PrivilegedIntentsRequired) as err:
-            log.error("Nepřekonatelná chyba autentizace/konfigurace: %s", err)
-            break
-        except (
-            discord.ConnectionClosed,
-            discord.GatewayNotFound,
-            discord.HTTPException,
-            OSError,
-            asyncio.TimeoutError,
-        ) as err:
-            log.warning("Přechodná chyba gateway (%s). Retry za 5 s...", err)
-            time.sleep(5)
+    asyncio.run(main())
 
 
 if __name__ == "__main__":

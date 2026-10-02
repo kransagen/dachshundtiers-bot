@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import select, text
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.exc import IntegrityError
 
@@ -29,6 +29,7 @@ from db.repositories.queues import (
     QUEUE_ENTRY_LEFT,
     QUEUE_ENTRY_PULLED,
     QUEUE_ENTRY_TESTED,
+    QUEUE_ENTRY_WAITING,
     QueueEntryRepository,
     QueueRepository,
     QueueTesterRepository,
@@ -84,7 +85,22 @@ async def _db_join_queue_once(
 ) -> dict:
     async with db_transaction(session_factory) as session:
         kit_row, queue = await _db_resolve_queue(session, kit)
-        if kit_row is None or queue is None:
+        if kit_row is None or not kit_row.active or queue is None:
+            return {"result": "closed"}
+
+        # E4 audit fix: ``next_position`` is MAX(position)+1 — a read of
+        # shared state. Two concurrent joins (distinct players) both read the
+        # same MAX and would both insert the SAME position unless this
+        # transaction serializes on the queue row first (there is no unique
+        # index on (queue_id, position) to reject the loser, and then the
+        # queue's FIFO order would silently flip). The FOR UPDATE lock on the
+        # queue row is held to commit, so each concurrent join computes the
+        # next position after the previous one commits — EXACTLY like the
+        # advisory lock used for mirror apply (db/repositories/tiers.py).
+        # The same lock serializes join against close: a queue closed while
+        # this join waited for the lock is seen as closed here.
+        locked = await QueueRepository().lock(session, queue_id=queue.id)
+        if locked is None or locked.closed_at is not None:
             return {"result": "closed"}
 
         # Do fronty jen s propojeným IGN (/linkign) – IGN z fronty se tak
@@ -109,20 +125,6 @@ async def _db_join_queue_once(
         )
         if existing is not None:
             return {"result": "duplicate"}
-
-        # E4 audit fix: ``next_position`` is MAX(position)+1 — a read of
-        # shared state. Two concurrent joins (distinct players) both read the
-        # same MAX and would both insert the SAME position unless this
-        # transaction serializes on the queue row first (there is no unique
-        # index on (queue_id, position) to reject the loser, and then the
-        # queue's FIFO order would silently flip). The FOR UPDATE lock on the
-        # queue row is held to commit, so each concurrent join computes the
-        # next position after the previous one commits — EXACTLY like the
-        # advisory lock used for mirror apply (db/repositories/tiers.py).
-        await session.execute(
-            text("SELECT id FROM queues WHERE id = :qid FOR UPDATE"),
-            {"qid": queue.id},
-        )
 
         await QueueEntryRepository().enqueue(
             session,
@@ -302,6 +304,32 @@ async def clear_tester_room(
         return await KitTesterRoomRepository().clear(session, kit_id=kit_row.id)
 
 
+async def clear_tester_room_for_channel(
+    channel_id: int, *, session_factory: async_sessionmaker[AsyncSession]
+) -> bool:
+    """Smaže mapování roomky podle kanálu (kanál už neexistuje)."""
+    async with db_transaction(session_factory) as session:
+        room = await KitTesterRoomRepository().get_for_channel(
+            session, channel_id=int(channel_id)
+        )
+        if room is None:
+            return False
+        return await KitTesterRoomRepository().clear(session, kit_id=room.kit_id)
+
+
+async def is_tester_room(
+    channel_id: int, *, session_factory: async_sessionmaker[AsyncSession]
+) -> bool:
+    """Je kanál zaregistrovaná tester roomka nějakého kitu?"""
+    async with db_transaction(session_factory) as session:
+        return (
+            await KitTesterRoomRepository().get_for_channel(
+                session, channel_id=int(channel_id)
+            )
+            is not None
+        )
+
+
 async def _resolve_kit_any(session: AsyncSession, kit_key: str) -> Optional[object]:
     """Kit by key, s fallbackem na case-insensitive display name.
 
@@ -360,7 +388,7 @@ async def _db_pull_for_kit(
 ) -> PullResult:
     async with db_transaction(session_factory) as session:
         kit_row = await _resolve_kit_any(session, kit)
-        if kit_row is None:
+        if kit_row is None or not kit_row.active:
             return PullResult(status=PULL_NO_KIT)
 
         # Roomku řešíme PRVNÍ. Když chybí, hráče z fronty vůbec nevybavíme —
@@ -408,6 +436,58 @@ async def pull_for_kit(
     )
 
 
+async def _db_requeue_pulled_player(session_factory, *, uid: str, kit: str) -> bool:
+    async with db_transaction(session_factory) as session:
+        _kit_row, queue = await _db_resolve_queue(session, kit)
+        player = await PlayerRepository().get_by_discord_id(session, int(uid))
+        if queue is None or player is None:
+            return False
+        pulled = await QueueEntryRepository().list_by_status(
+            session, player_id=player.id, status=QUEUE_ENTRY_PULLED
+        )
+        entry = next((e for e in pulled if e.queue_id == queue.id), None)
+        if entry is None:
+            return False
+        if (
+            await QueueEntryRepository().get_waiting(
+                session, queue_id=queue.id, player_id=player.id
+            )
+            is not None
+        ):
+            await QueueEntryRepository().transition(
+                session,
+                entry_id=entry.id,
+                status=QUEUE_ENTRY_LEFT,
+                removed_at=datetime.now(timezone.utc),
+                removed_reason="room_missing",
+            )
+            return False
+        entry.status = QUEUE_ENTRY_WAITING
+        entry.pulled_at = None
+        entry.room_channel_id = None
+        await session.flush()
+        return True
+
+
+async def requeue_pulled_player(
+    player: dict,
+    kit: str,
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> bool:
+    """Vrátí právě vytaženého hráče na jeho místo ve frontě (roomka nebyla k nalezení).
+
+    Vrací True, když je hráč zase ``waiting``. Pokud se mezitím zapsal znovu,
+    starý záznam se jen uzavře a vrací False.
+    """
+    uid = str(player.get("id", ""))
+    if not uid:
+        return False
+    return await _db_requeue_pulled_player(
+        session_factory, uid=uid, kit=str(kit).lower()
+    )
+
+
 async def _db_remove_by_player_id(session_factory, *, uid: str) -> bool:
     async with db_transaction(session_factory) as session:
         player = await PlayerRepository().get_by_discord_id(session, int(uid))
@@ -433,9 +513,9 @@ async def remove_by_player_id(
     player_id: str,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> bool:
-    """Transakčně vyjme hráče z fronty podle Discord ID (nezávisle na kitu).
+    """Transakčně označí čekající záznamy hráče (nezávisle na kitu) jako vytažené.
 
-    Vrací True, když byl ve frontě nalezen a odebrán.
+    Záznam dostane stav ``pulled`` bez roomky. Vrací True, když byl ve frontě nalezen.
     """
     uid = str(player_id)
     return await _db_remove_by_player_id(session_factory, uid=uid)
@@ -613,7 +693,7 @@ async def _db_open_queue_once(
 ) -> tuple[str, Optional[dict]]:
     async with db_transaction(session_factory) as session:
         kit_row = await KitRepository().get_by_name(session, name)
-        if kit_row is None:
+        if kit_row is None or not kit_row.active:
             return ("unknown_kit", None)
         queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
         if queue is not None:
@@ -681,6 +761,9 @@ async def _db_close_queue(session_factory, *, kit_key: str) -> Optional[dict]:
             return None
         queue = await QueueRepository().get_active(session, kit_id=kit_row.id)
         if queue is None:
+            return None
+        queue = await QueueRepository().lock(session, queue_id=queue.id)
+        if queue is None or queue.closed_at is not None:
             return None
         old_panel = (
             {"message_id": str(queue.panel_message_id)}
@@ -835,6 +918,14 @@ async def peek_first_player(
         return _db_entry_to_dict(entry, player, kit.name)
 
 
+async def _retry_on_integrity(fn, **kwargs):
+    """Souběžné vytvoření „shell“ hráče: poražená transakce se zopakuje."""
+    try:
+        return await fn(**kwargs)
+    except IntegrityError:
+        return await fn(**kwargs)
+
+
 async def _db_join_queue_tester(
     session_factory, *, kit_key: str, uid: str, ign: str
 ) -> tuple[str, Optional[dict]]:
@@ -852,9 +943,13 @@ async def _db_join_queue_tester(
             session, queue_id=queue.id, player_id=player.id
         ):
             return ("duplicate", await _db_qdata(session, queue))
-        await QueueTesterRepository().add(
-            session, queue_id=queue.id, player_id=player.id
-        )
+        try:
+            async with session.begin_nested():
+                await QueueTesterRepository().add(
+                    session, queue_id=queue.id, player_id=player.id
+                )
+        except IntegrityError:
+            return ("duplicate", await _db_qdata(session, queue))
         return ("ok", await _db_qdata(session, queue))
 
 
@@ -868,8 +963,12 @@ async def join_queue_tester(
     """Přidá testera k aktivní frontě (joinasqueue). Status ok/closed/duplicate."""
     kit_key = str(kit_key).lower()
     uid = str(uid)
-    return await _db_join_queue_tester(
-        session_factory, kit_key=kit_key, uid=uid, ign=ign
+    return await _retry_on_integrity(
+        _db_join_queue_tester,
+        session_factory=session_factory,
+        kit_key=kit_key,
+        uid=uid,
+        ign=ign,
     )
 
 
@@ -886,10 +985,14 @@ async def _db_leave_queue_tester(
         player = await PlayerRepository().get_by_discord_id(session, int(uid))
         if player is None:
             return ("not_listed", None)
-        if not await QueueTesterRepository().remove(
-            session, queue_id=queue.id, player_id=player.id
-        ):
+        testers = await QueueTesterRepository().list(session, queue_id=queue.id)
+        if not any(t.player_id == player.id for t in testers):
             return ("not_listed", None)
+        if len(testers) == 1:
+            return ("last_tester", await _db_qdata(session, queue))
+        await QueueTesterRepository().remove(
+            session, queue_id=queue.id, player_id=player.id
+        )
         return ("ok", await _db_qdata(session, queue))
 
 
@@ -899,7 +1002,7 @@ async def leave_queue_tester(
     *,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> tuple[str, Optional[dict]]:
-    """Odebere testera z aktivní fronty. Status ok/closed/not_listed."""
+    """Odebere testera z aktivní fronty. Status ok/closed/not_listed/last_tester."""
     kit_key = str(kit_key).lower()
     uid = str(uid)
     return await _db_leave_queue_tester(
@@ -916,9 +1019,14 @@ async def _db_register_global_tester(
         )
         if await TesterRepository().is_tester(session, player_id=player.id):
             return True
-        return await TesterRepository().grant(
-            session, player_id=player.id, granted_by=int(uid)
-        ) is not None
+        try:
+            async with session.begin_nested():
+                await TesterRepository().grant(
+                    session, player_id=player.id, granted_by=int(uid)
+                )
+        except IntegrityError:
+            return True
+        return True
 
 
 async def register_global_tester(
@@ -932,7 +1040,9 @@ async def register_global_tester(
     `testers` řádek (graceful no-op při už existujícím — unique PK).
     """
     uid = str(uid)
-    return await _db_register_global_tester(session_factory, uid=uid, ign=ign)
+    return await _retry_on_integrity(
+        _db_register_global_tester, session_factory=session_factory, uid=uid, ign=ign
+    )
 
 
 async def _db_removeq(session_factory, *, uid: str) -> Optional[dict]:

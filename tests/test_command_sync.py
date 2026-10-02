@@ -304,15 +304,17 @@ class VerzeDiagnosticsTests(unittest.TestCase):
             bot.tree = tree
 
             inter = mock.MagicMock()
-            inter.response.send_message = mock.AsyncMock()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
 
             with mock.patch.object(info_module, "git_commit", return_value="abc1234"), \
                  mock.patch.object(info_module, "GUILD_ID", 777):
                 cog = info_module.Info(bot)
                 await cog.verze.callback(cog, inter)
 
-            inter.response.send_message.assert_awaited_once()
-            embed = inter.response.send_message.await_args.kwargs["embed"]
+            inter.response.defer.assert_awaited_once()
+            inter.followup.send.assert_awaited_once()
+            embed = inter.followup.send.await_args.kwargs["embed"]
             desc = embed.description
             self.assertIn("**Slash – lokální (tree):** 2", desc)
             self.assertIn("**Slash – Discord globální:** 1", desc)
@@ -335,7 +337,8 @@ class VerzeDiagnosticsTests(unittest.TestCase):
             bot.tree = tree
 
             inter = mock.MagicMock()
-            inter.response.send_message = mock.AsyncMock()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
 
             with mock.patch.object(info_module, "git_commit", return_value="abc1234"), \
                  mock.patch.object(info_module, "GUILD_ID", 777):
@@ -343,10 +346,55 @@ class VerzeDiagnosticsTests(unittest.TestCase):
                     info_module.Info(bot), inter
                 )
 
-            desc = inter.response.send_message.await_args.kwargs["embed"].description
+            desc = inter.followup.send.await_args.kwargs["embed"].description
             self.assertIn("**Duplicitní jména (global ∩ guild):** žádné", desc)
 
         asyncio.run(main())
+
+
+
+class DbStatusTests(unittest.TestCase):
+    def _run(self, engine, validate=None):
+        async def main():
+            bot = mock.MagicMock()
+            bot.db_engine = engine
+            inter = mock.MagicMock()
+            inter.guild = object()
+            inter.response.defer = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
+            patches = [mock.patch.object(info_module, "admin_gate_error", return_value=None)]
+            if validate is not None:
+                patches.append(mock.patch.object(info_module, "validate_database", validate))
+            for p in patches:
+                p.start()
+            try:
+                cog = info_module.Info(bot)
+                await cog.dbstatus.callback(cog, inter)
+            finally:
+                for p in patches:
+                    p.stop()
+            inter.response.defer.assert_awaited_once()
+            return inter.followup.send.await_args.kwargs["embed"]
+
+        return asyncio.run(main())
+
+    def test_ok_reports_schema_revision(self):
+        validate = mock.AsyncMock(return_value={"schema_revision": "abc123"})
+        embed = self._run(object(), validate)
+        self.assertIn("abc123", embed.description)
+        self.assertIn("připravená", embed.title)
+
+    def test_failure_reports_generic_message(self):
+        from db.config import DatabaseConfigError
+
+        validate = mock.AsyncMock(side_effect=DatabaseConfigError("PostgreSQL není dostupné"))
+        embed = self._run(object(), validate)
+        self.assertIn("není dostupná", embed.title)
+        self.assertIn("PostgreSQL není dostupné", embed.description)
+
+    def test_missing_engine(self):
+        embed = self._run(None)
+        self.assertIn("není inicializovaný", embed.description)
 
 
 if __name__ == "__main__":

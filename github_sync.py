@@ -5,7 +5,7 @@ někdo jiný): při konfliktu se aktuální soubor znovu stáhne, merge funkce s
 znovu aplikuje na čerstvá data a PUT se zopakuje (až ``MAX_PUSH_ATTEMPTS``).
 
 Všechny push navíc sdílejí jeden lock, takže dvě naše vlastní synchronizace
-(např. ``/result`` a ``/websync apply`` naráz) si navzájem nekonfliktují.
+(např. ``/result`` a ``/sync web`` naráz) si navzájem nekonfliktují.
 
 Merge funkce (``build_fn``) musí být idempotentní pro libovolný aktuální
 seznam hráčů – kvůli opakování po konfliktu. Návratová hodnota je nový
@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 
 import requests
 
@@ -24,6 +25,9 @@ from config import GITHUB_FILE_PATH, GITHUB_OWNER, GITHUB_REPO, GITHUB_TOKEN
 log = logging.getLogger("dachshundtiers")
 
 MAX_PUSH_ATTEMPTS = 3
+MAX_HTTP_ATTEMPTS = 3
+MAX_RETRY_WAIT = 30
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
 # loop id -> asyncio.Lock (serializace všech GitHub push v jednom loopu)
 _github_lock_registry: "dict[int, asyncio.Lock]" = {}
@@ -53,6 +57,36 @@ def _headers() -> dict:
     }
 
 
+def _is_retryable(response) -> bool:
+    status = response.status_code
+    if status in RETRYABLE_STATUSES:
+        return True
+    headers = getattr(response, "headers", None) or {}
+    return status == 403 and (
+        "Retry-After" in headers or headers.get("X-RateLimit-Remaining") == "0"
+    )
+
+
+def _retry_wait(response, attempt: int) -> float:
+    headers = getattr(response, "headers", None) or {}
+    try:
+        wait = float(headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        wait = 2.0**attempt
+    return min(wait, MAX_RETRY_WAIT)
+
+
+def _request(method, *, headers=None, **kwargs):
+    """HTTP volání s opakováním při rate limitu (403/429) a chybách 5xx."""
+    for attempt in range(MAX_HTTP_ATTEMPTS):
+        response = method(
+            _api_url(), headers=headers or _headers(), timeout=20, **kwargs
+        )
+        if attempt == MAX_HTTP_ATTEMPTS - 1 or not _is_retryable(response):
+            return response
+        time.sleep(_retry_wait(response, attempt))
+
+
 def _get_players_data():
     """Stáhne aktuální ``players.json`` z GitHubu (synchronně, v threadu).
 
@@ -62,19 +96,28 @@ def _get_players_data():
       - jiné / chyba → (None, None, zpráva)
     """
     try:
-        response = requests.get(_api_url(), headers=_headers(), timeout=20)
-    except requests.RequestException as err:
-        return None, None, f"❌ GitHub GET selhal: {err}"
-
-    if response.status_code == 200:
-        try:
+        response = _request(requests.get)
+        if response.status_code == 200:
             data = response.json()
-            players = json.loads(base64.b64decode(data["content"]).decode("utf-8"))
+            if data.get("content"):
+                raw = base64.b64decode(data["content"]).decode("utf-8")
+            else:
+                # Contents API vrací obsah souborů nad 1 MB prázdný – stáhnout raw.
+                raw_response = _request(
+                    requests.get,
+                    headers={**_headers(), "Accept": "application/vnd.github.raw+json"},
+                )
+                if raw_response.status_code != 200:
+                    return None, None, f"GitHub GET selhal ({raw_response.status_code})"
+                raw = raw_response.text
+            players = json.loads(raw)
             if isinstance(players, list):
                 return players, data.get("sha"), None
-        except (json.JSONDecodeError, ValueError):
-            return None, None, "❌ GitHub vrací poškozený JSON"
-        return None, None, f"GitHub GET selhal ({response.status_code})"
+            return None, None, f"GitHub GET selhal ({response.status_code})"
+    except requests.RequestException as err:
+        return None, None, f"❌ GitHub GET selhal: {err}"
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
+        return None, None, "❌ GitHub vrací poškozený JSON"
 
     if response.status_code == 404:
         return [], None, None
@@ -94,7 +137,7 @@ def _put_players(players: list, sha, message: str):
     if sha:
         body["sha"] = sha
     try:
-        response = requests.put(_api_url(), headers=_headers(), json=body, timeout=20)
+        response = _request(requests.put, json=body)
     except requests.RequestException as err:
         return False, str(err)
     return response.status_code in (200, 201), response.status_code
@@ -122,6 +165,12 @@ async def push_players(
             "⚠️ GITHUB_TOKEN není nastaven – uloženo jen lokálně (web se nezmění).",
             None,
         )
+    if not GITHUB_OWNER:
+        return (
+            False,
+            "⚠️ GITHUB_OWNER není nastaven – uloženo jen lokálně (web se nezmění).",
+            None,
+        )
 
     async with _github_lock():
         last_built = None
@@ -141,9 +190,9 @@ async def push_players(
                 return True, success_message, last_built
             if isinstance(status, str):
                 return False, f"❌ GitHub zápis selhal: {status}", last_built
-            if status != 409:
+            if status != 409 and not (status == 422 and sha is None):
                 return False, f"❌ GitHub zápis selhal ({status})", last_built
-            # 409 – mezitím zapsal někdo jiný: stáhnout čerstvá data a sloučit znovu
+            # 409 / 422 bez sha – mezitím zapsal někdo jiný: stáhnout čerstvá data a sloučit znovu
 
         return (
             False,
@@ -158,7 +207,7 @@ async def fetch_players():
     Vrací ``(players, sha, error)``; error je ``None`` při úspěchu. Bez tokenu
     vrací ``(None, None, None)`` – volající má spadnout na lokální kopii.
     """
-    if not GITHUB_TOKEN:
+    if not GITHUB_TOKEN or not GITHUB_OWNER:
         return None, None, None
     players, sha, error = await asyncio.to_thread(_get_players_data)
     return players, sha, error

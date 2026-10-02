@@ -215,7 +215,9 @@ async def complete_link(
 
     async with db_transaction(session_factory) as session:
         tokens = PlayerLinkTokenRepository()
-        token = await tokens.get_live_by_code(session, code=(code or "").strip())
+        token = await tokens.get_live_by_code(
+            session, code=(code or "").strip().upper()
+        )
         if token is None:
             # Nothing to mark: an unknown code has no row to annotate.
             rejection = LinkError("unknown_code", "Kód neexistuje nebo už byl použitý.")
@@ -236,7 +238,21 @@ async def complete_link(
             owner = await identity.get_player_for_account(
                 session, account_id=account.id
             )
-            if owner is not None and owner.id != token.player_id:
+            current = await identity.get_account_for_player(
+                session, player_id=token.player_id
+            )
+            if current is not None and current.id != account.id:
+                await tokens.consume(
+                    session,
+                    token_id=token.id,
+                    consumed_at=now,
+                    rejection_reason="wrong_uuid",
+                )
+                rejection = LinkError(
+                    "already_linked",
+                    "Už jsi propojený s jiným Minecraft účtem. Nejdřív použij /unlink.",
+                )
+            elif owner is not None and owner.id != token.player_id:
                 # Burn the code: a mismatched UUID is either a mistake or an
                 # attempt to steal somebody's account, and either way this code
                 # must not stay usable.

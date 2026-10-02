@@ -53,6 +53,8 @@ def _interaction():
     inter.message = mock.MagicMock()
     inter.message.edit = mock.AsyncMock()
     inter.response.send_message = mock.AsyncMock()
+    inter.response.defer = mock.AsyncMock()
+    inter.followup.send = mock.AsyncMock()
     return inter
 
 
@@ -159,12 +161,12 @@ class HTTicketViewRegressionTests(unittest.TestCase):
                      "views.claim_ticket",
                      new=mock.AsyncMock(return_value={"result": "claimed", "ticket": claimed}),
                  ), \
-                 mock.patch("views.grant_channel_access", new=mock.AsyncMock()), \
-                 mock.patch("views.log_ticket_event", new=mock.AsyncMock()):
+                 mock.patch("views.grant_channel_access", new=mock.AsyncMock()):
                 await view.children[0].callback(inter)  # ht_claim
 
+            inter.response.defer.assert_awaited_once()
             inter.message.edit.assert_awaited_once()  # _refresh_ticket_state proběhl
-            inter.response.send_message.assert_awaited_once()
+            inter.followup.send.assert_awaited_once()
 
         asyncio.run(main())
 

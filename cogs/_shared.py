@@ -27,6 +27,9 @@ from services.role_sync import make_member
 
 log = logging.getLogger("dachshundtiers")
 
+ROLE_ACTION_REASON = "DachshundTiers: úprava tier rolí"
+ROLLBACK_REASON = "DachshundTiers: rollback /sync discord"
+
 
 async def guild_members(guild: discord.Guild) -> list:
     """Všichni členové serveru bez botů (plný seznam, jinak cache)."""
@@ -37,11 +40,10 @@ async def guild_members(guild: discord.Guild) -> list:
             members = [m for m in fetched if not m.bot]
     except Exception as err:  # noqa: BLE001 – bez members intentu fallback na cache
         log.warning(
-            "fetch_members() selhalo (%s: %s) – používám cache (%d členů). "
-            "Výsledek analýzy může být neúplný.",
-            type(err).__name__,
-            err,
+            "Načtení členů serveru %s selhalo, používá se cache (%d členů): %s",
+            guild.id,
             len(members),
+            err,
         )
     return members
 
@@ -101,9 +103,9 @@ async def apply_role_actions(guild: discord.Guild, actions: list) -> list:
         else:
             try:
                 if action.get("op") == "add":
-                    await member.add_roles(role)
+                    await member.add_roles(role, reason=ROLE_ACTION_REASON)
                 else:
-                    await member.remove_roles(role)
+                    await member.remove_roles(role, reason=ROLE_ACTION_REASON)
                 record["ok"] = True
             except (discord.Forbidden, discord.HTTPException) as err:
                 record["error"] = str(err)
@@ -242,9 +244,9 @@ async def apply_rollback_actions(
             else:
                 try:
                     if op == "add":
-                        await member.add_roles(role)
+                        await member.add_roles(role, reason=ROLLBACK_REASON)
                     else:
-                        await member.remove_roles(role)
+                        await member.remove_roles(role, reason=ROLLBACK_REASON)
                     record["status"] = "applied"
                 except (discord.Forbidden, discord.HTTPException) as err:
                     record["error"] = str(err)

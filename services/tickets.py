@@ -245,12 +245,16 @@ async def create_ticket(
     panel_message_id=None,
     ticket_type: str = TICKET_TYPE_EVAL,
     now: int,
+    audit: dict | None = None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Transakčně vytvoří ticket (prevence duplicit uvnitř kritického úseku).
 
     Vrací ``{"result": "created", "ticket": {...}}``, nebo
     ``{"result": "duplicate", "ticket": {existující otevřený ticket}}``.
+
+    ``audit`` (``{"actor_id", "actor_name", "details"}``) se u všech stavových
+    operací zapíše do ``audit_logs`` ve STEJNÉ transakci jako změna ticketu.
     """
     if session_factory is None:
         raise RuntimeError(
@@ -272,6 +276,7 @@ async def create_ticket(
         panel_message_id=panel_message_id,
         ticket_type=ticket_type,
         now=now,
+        audit=audit,
     )
 
 
@@ -280,13 +285,16 @@ async def claim_ticket(
     actor_id: str,
     actor_name: str,
     session_factory: async_sessionmaker[AsyncSession],
+    audit: dict | None = None,
 ) -> dict:
     """Ticket si převezme tester (actor); bez přepisu cizího claimu."""
     if session_factory is None:
         raise RuntimeError(
             "claim_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
         )
-    return await _db_claim_ticket(session_factory, channel_id, actor_id, actor_name)
+    return await _db_claim_ticket(
+        session_factory, channel_id, actor_id, actor_name, audit
+    )
 
 
 async def unclaim_ticket(
@@ -294,6 +302,7 @@ async def unclaim_ticket(
     actor_id: str,
     *,
     force: bool = False,
+    audit: dict | None = None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zruší claim ticketu; bez ``force`` jen aktér sám (kontrola claimera)."""
@@ -302,7 +311,7 @@ async def unclaim_ticket(
             "unclaim_ticket potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
         )
     return await _db_unclaim_ticket(
-        session_factory, channel_id, actor_id, force=force
+        session_factory, channel_id, actor_id, force=force, audit=audit
     )
 
 
@@ -311,26 +320,30 @@ async def add_member(
     member_id: str,
     session_factory: async_sessionmaker[AsyncSession],
     member_name: str | None = None,
+    audit: dict | None = None,
 ) -> dict:
     """Přidá člena týmu ticketu; jen vlastník-id a otevřený ticket."""
     if session_factory is None:
         raise RuntimeError(
             "add_member potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
         )
-    return await _db_add_member(session_factory, channel_id, member_id, member_name)
+    return await _db_add_member(
+        session_factory, channel_id, member_id, member_name, audit
+    )
 
 
 async def remove_member(
     channel_id,
     member_id: str,
     session_factory: async_sessionmaker[AsyncSession],
+    audit: dict | None = None,
 ) -> dict:
     """Odebere člena týmu ticketu; jen vlastník-id a otevřený ticket."""
     if session_factory is None:
         raise RuntimeError(
             "remove_member potřebuje PostgreSQL; ht_tickets.json se už nepoužívá"
         )
-    return await _db_remove_member(session_factory, channel_id, member_id)
+    return await _db_remove_member(session_factory, channel_id, member_id, audit)
 
 
 async def close_ticket(
@@ -339,6 +352,7 @@ async def close_ticket(
     *,
     cooldown_ms: int = 0,
     now: int = None,
+    audit: dict | None = None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zavře ticket + nastaví HT3+ cooldown vlastníkovi (7 dní).
@@ -356,7 +370,12 @@ async def close_ticket(
     if now is None:
         now = _now_ms()
     return await _db_close_ticket(
-        session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
+        session_factory,
+        channel_id,
+        actor_id,
+        cooldown_ms=cooldown_ms,
+        now=now,
+        audit=audit,
     )
 
 
@@ -364,16 +383,15 @@ async def reopen_ticket(
     channel_id,
     actor_id: str,
     *,
-    cooldown_ms: int = 0,
     now: int = None,
+    audit: dict | None = None,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Znovu otevře zavřený ticket (Reopen).
 
-    ``cooldown_ms`` > 0 – pokud má vlastník ticketu na daný kit ještě aktivní
-    HT3+ cooldown, ticket se NEOTEVŘE a vrátí
-    ``{"result": "cooldown", "remaining_ms", "kit", "ticket"}``. Výchozí 0
-    zachovává původní chování bez cooldown kontroly.
+    Cooldown, který nastavil Close, se tím zruší (Reopen je vrácení Close).
+    Má-li hráč mezitím jiný otevřený ticket na stejný kit, vrátí
+    ``{"result": "duplicate", "ticket": {otevřený ticket}}``.
     """
     if session_factory is None:
         raise RuntimeError(
@@ -384,7 +402,7 @@ async def reopen_ticket(
     if now is None:
         now = _now_ms()
     return await _db_reopen_ticket(
-        session_factory, channel_id, actor_id, cooldown_ms=cooldown_ms, now=now
+        session_factory, channel_id, actor_id, now=now, audit=audit
     )
 
 
@@ -462,6 +480,23 @@ def _dt_to_ms(dt: datetime | None) -> int | None:
     if dt is None:
         return None
     return int(dt.timestamp() * 1000)
+
+
+async def _append_audit(
+    session: AsyncSession, action: str, channel_id, audit: dict | None
+) -> None:
+    if audit is None:
+        return
+    actor_id = audit.get("actor_id")
+    await AuditRepository().append(
+        session,
+        action=action,
+        actor_id=int(actor_id) if actor_id else None,
+        actor_name=audit.get("actor_name") or "",
+        entity_type="ticket",
+        entity_id=str(channel_id),
+        details={"details": audit.get("details"), "ts": _now_ms()},
+    )
 
 
 async def _db_resolve_kit(session: AsyncSession, name: str) -> Kit | None:
@@ -603,6 +638,7 @@ async def _db_create_ticket(
     panel_message_id=None,
     ticket_type: str = TICKET_TYPE_EVAL,
     now: int,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
         try:
@@ -663,6 +699,7 @@ async def _db_create_ticket(
                     "ticket": await _db_ticket_to_dict(session, winner[0]),
                 }
             raise
+        await _append_audit(session, "created", channel_id, audit)
         return {"result": "created", "ticket": await _db_ticket_to_dict(session, t)}
 
 
@@ -671,6 +708,7 @@ async def _db_claim_ticket(
     channel_id,
     actor_id: str,
     actor_name: str,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
         # H9 audit fix: řádkový zámek (FOR UPDATE) drží od prvního čtení až
@@ -712,6 +750,7 @@ async def _db_claim_ticket(
             claimer_id=actor.id,
             claimer_name=actor_name or "",
         )
+        await _append_audit(session, "claimed", channel_id, audit)
         return {"result": "claimed", "ticket": await _db_ticket_to_dict(session, row)}
 
 
@@ -721,9 +760,12 @@ async def _db_unclaim_ticket(
     actor_id: str,
     *,
     force: bool = False,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
-        t = await TicketRepository().get_by_channel(session, int(channel_id))
+        t = await TicketRepository().get_by_channel_for_update(
+            session, int(channel_id)
+        )
         if t is None:
             return {"result": "not_found"}
         if t.claimer_id is None:
@@ -752,6 +794,7 @@ async def _db_unclaim_ticket(
         row = await TicketRepository().claim(
             session, ticket_id=t.id, claimer_id=None, claimer_name=None
         )
+        await _append_audit(session, "unclaimed", channel_id, audit)
         return {
             "result": "unclaimed",
             "ticket": await _db_ticket_to_dict(session, row),
@@ -764,6 +807,7 @@ async def _db_add_member(
     channel_id,
     member_id: str,
     member_name: str | None,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
         t = await TicketRepository().get_by_channel(session, int(channel_id))
@@ -809,6 +853,7 @@ async def _db_add_member(
                 "result": "already_member",
                 "ticket": await _db_ticket_to_dict(session, t),
             }
+        await _append_audit(session, "added", channel_id, audit)
         return {"result": "added", "ticket": await _db_ticket_to_dict(session, t)}
 
 
@@ -816,6 +861,7 @@ async def _db_remove_member(
     session_factory: async_sessionmaker[AsyncSession],
     channel_id,
     member_id: str,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
         t = await TicketRepository().get_by_channel(session, int(channel_id))
@@ -852,6 +898,7 @@ async def _db_remove_member(
         await TicketMemberRepository().remove(
             session, ticket_id=t.id, player_id=member.id
         )
+        await _append_audit(session, "removed", channel_id, audit)
         return {"result": "removed", "ticket": await _db_ticket_to_dict(session, t)}
 
 
@@ -862,6 +909,7 @@ async def _db_close_ticket(
     *,
     cooldown_ms: int = 0,
     now: int,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
         t = await TicketRepository().get_by_channel(session, int(channel_id))
@@ -884,6 +932,7 @@ async def _db_close_ticket(
                 expires_at=_ms_to_dt(now + int(cooldown_ms)) or _db_now(),
                 source="ticket_close",
             )
+        await _append_audit(session, "closed", channel_id, audit)
         return {
             "result": "closed",
             "ticket": await _db_ticket_to_dict(session, row),
@@ -895,8 +944,8 @@ async def _db_reopen_ticket(
     channel_id,
     actor_id: str,
     *,
-    cooldown_ms: int = 0,
     now: int,
+    audit: dict | None = None,
 ) -> dict:
     async with transaction(session_factory) as session:
         t = await TicketRepository().get_by_channel(session, int(channel_id))
@@ -907,29 +956,43 @@ async def _db_reopen_ticket(
                 "result": "not_closed",
                 "ticket": await _db_ticket_to_dict(session, t),
             }
-        if cooldown_ms > 0:
-            now_dt = _ms_to_dt(now)
-            active = await CooldownRepository().get_active(
-                session,
-                player_id=t.player_id,
-                cooldown_type=COOLDOWN_HT3,
-                kit_id=t.kit_id,
-                now=now_dt,
+        other = [
+            o
+            for o in await TicketRepository().list_open(
+                session, player_id=t.player_id, kit_id=t.kit_id
             )
-            if active:
-                remaining_ms = int(
-                    (active[0].expires_at - now_dt).total_seconds() * 1000
+            if o.id != t.id
+        ]
+        if other:
+            return {
+                "result": "duplicate",
+                "ticket": await _db_ticket_to_dict(session, other[0]),
+            }
+        try:
+            async with session.begin_nested():
+                row = await TicketRepository().reopen_by_channel(
+                    session, channel_id=int(channel_id)
                 )
-                kit = await KitRepository().get_by_id(session, t.kit_id)
+        except IntegrityError:
+            winner = await TicketRepository().list_open(
+                session, player_id=t.player_id, kit_id=t.kit_id
+            )
+            if winner:
                 return {
-                    "result": "cooldown",
-                    "remaining_ms": max(remaining_ms, 0),
-                    "kit": kit.name if kit is not None else "",
-                    "ticket": await _db_ticket_to_dict(session, t),
+                    "result": "duplicate",
+                    "ticket": await _db_ticket_to_dict(session, winner[0]),
                 }
-        row = await TicketRepository().reopen_by_channel(
-            session, channel_id=int(channel_id)
-        )
+            raise
+        for cooldown in await CooldownRepository().get_active(
+            session,
+            player_id=t.player_id,
+            cooldown_type=COOLDOWN_HT3,
+            kit_id=t.kit_id,
+            now=_ms_to_dt(now),
+        ):
+            if cooldown.source == "ticket_close":
+                await session.delete(cooldown)
+        await _append_audit(session, "reopened", channel_id, audit)
         return {
             "result": "reopened",
             "ticket": await _db_ticket_to_dict(session, row),

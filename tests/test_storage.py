@@ -85,6 +85,19 @@ class StorageTests(unittest.TestCase):
         ):
             self.assertEqual(storage.load_data("players.json", []), [])
 
+    def test_postgres_connection_does_not_rewrap_body_exceptions(self):
+        conn = mock.MagicMock()
+        conn.__enter__.return_value = conn
+        with (
+            mock.patch.object(storage, "DATABASE_URL", "postgresql://x/y"),
+            mock.patch.object(storage, "_psycopg", mock.Mock()),
+            mock.patch.object(storage, "_ensure_postgres_schema"),
+            mock.patch.object(storage, "_connect_postgres", return_value=conn),
+        ):
+            with self.assertRaises(storage.DataCorruptionError):
+                with storage.postgres_connection():
+                    raise storage.DataCorruptionError("boom")
+
     def test_save_failure_raises_and_keeps_original(self):
         storage.save_data("x.json", {"v": 1})
         with mock.patch.object(storage.os, "replace", side_effect=OSError("disk full")):

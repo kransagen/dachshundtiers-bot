@@ -76,6 +76,10 @@ class MinecraftAccountRepository:
         await session.flush()
 
 
+class PlayerAlreadyLinked(Exception):
+    """The player is already linked to a different Minecraft account."""
+
+
 class PlayerIdentityRepository:
     """The one-to-one ``Player <-> MinecraftAccount`` link itself."""
 
@@ -104,11 +108,20 @@ class PlayerIdentityRepository:
 
         The UNIQUE constraint on ``players.minecraft_account_id`` is what makes
         this one-to-one; if the account is already linked to somebody else the
-        database rejects the write and the caller reports the conflict.
+        database rejects the write and the caller reports the conflict. A
+        player already linked to a *different* account is refused rather than
+        silently re-pointed; ``unlink`` first.
         """
         player = await session.get(Player, player_id)
         if player is None:
             raise LookupError(f"Player {player_id} neexistuje.")
+        if (
+            player.minecraft_account_id is not None
+            and player.minecraft_account_id != account_id
+        ):
+            raise PlayerAlreadyLinked(
+                f"Player {player_id} je už propojený s jiným účtem."
+            )
         player.minecraft_account_id = account_id
         await session.flush()
 

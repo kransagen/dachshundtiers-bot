@@ -167,10 +167,11 @@ def postgres_connection(*, autocommit: bool = True):
     psycopg = _psycopg()
     try:
         _ensure_postgres_schema()
-        with _connect_postgres(psycopg, autocommit=autocommit) as conn:
-            yield conn
+        conn = _connect_postgres(psycopg, autocommit=autocommit)
     except Exception as err:
         raise RuntimeError(f"PostgreSQL úložiště není dostupné: {err}") from err
+    with conn:
+        yield conn
 
 
 def data_exists(file: str) -> bool:

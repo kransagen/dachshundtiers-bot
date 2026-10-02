@@ -1,7 +1,7 @@
-discord.py>=2.3.0
-python-dotenv>=1.0.0
-requests>=2.31.0
-psycopg[binary]>=3.2.0
-sqlalchemy[asyncio]>=2.0.36
-asyncpg>=0.30.0
-alembic>=1.14.0
+discord.py>=2.3.0,<3
+python-dotenv>=1.0.0,<2
+requests>=2.31.0,<3
+psycopg[binary]>=3.2.0,<4
+sqlalchemy[asyncio]>=2.0.36,<3
+asyncpg>=0.30.0,<1
+alembic>=1.14.0,<2

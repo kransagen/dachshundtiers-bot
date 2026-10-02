@@ -163,8 +163,8 @@ async def test_reconciliation_db_outage_loud_no_discord_mutation_no_json(
 async def test_reconciliation_db_outage_outbox_failure_still_zero_mutations(
     session_factory, clean_db, monkeypatch
 ):
-    """Výpadek DB při first kroku (drain outboxu) → sync se vůbec nesmí
-    spustit a Discord zůstává nedotčený."""
+    """Výpadek DB při drainu outboxu nesmí přeskočit mirror sync a Discord
+    zůstává nedotčený."""
     await _seed_promotion(session_factory)
     member = SpyMember(id=1111, role_ids=(7777,))
 
@@ -173,10 +173,10 @@ async def test_reconciliation_db_outage_outbox_failure_still_zero_mutations(
 
     monkeypatch.setattr(OutboxConsumer, "consume_many", boom)
 
-    service = ReconciliationService()
-    with pytest.raises(RuntimeError, match="DB outage"):
-        await service.reconcile(session_factory, members=[member])
+    outcome = await ReconciliationService().reconcile(session_factory, members=[member])
 
+    assert outcome.outbox_consumed == ()
+    assert outcome.sync.scanned_members == 1
     for api in MUTATION_API:
         assert getattr(member, api).await_count == 0
 

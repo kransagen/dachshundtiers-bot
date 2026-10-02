@@ -198,6 +198,28 @@ class PromotionCommitService:
                 await self._tickets.close_by_channel(
                     session, channel_id=close_ticket_channel_id
                 )
+                tiers = TierDefinitionRepository()
+                previous = (
+                    await tiers.get_by_id(session, previous_tier_id)
+                    if previous_tier_id is not None
+                    else None
+                )
+                new = await tiers.get_by_id(session, new_tier_id)
+                await self._audit.append(
+                    session,
+                    action="result",
+                    actor_id=audit_actor_id,
+                    actor_name=audit_actor_name or "",
+                    entity_type="ticket",
+                    entity_id=str(close_ticket_channel_id),
+                    details={
+                        "details": (
+                            f"{previous.code if previous else 'N/A'} → "
+                            f"{new.code if new else '?'}"
+                        ),
+                        "ts": int((recorded_at or datetime.now(timezone.utc)).timestamp() * 1000),
+                    },
+                )
 
             await self._audit.append(
                 session,

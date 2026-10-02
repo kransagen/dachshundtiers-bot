@@ -217,48 +217,63 @@ async def test_close_ticket_sets_ht3_cooldown(session_factory, clean_db):
     assert int(active[0].expires_at.timestamp() * 1000) == NOW_MS + COOLDOWN_MS
 
 
-async def test_reopen_ticket_respects_cooldown(session_factory, clean_db):
+async def test_reopen_ticket_ignores_and_clears_close_cooldown(session_factory, clean_db):
     await _seed(session_factory)
     await _create(session_factory, channel_id=123, owner_id=100)
     await svc.close_ticket(
         123, "200", cooldown_ms=COOLDOWN_MS, now=NOW_MS, session_factory=session_factory
     )
     r = await svc.reopen_ticket(
-        123,
-        "200",
-        cooldown_ms=COOLDOWN_MS,
-        now=NOW_MS + 1000,
-        session_factory=session_factory,
+        123, "200", now=NOW_MS + 1000, session_factory=session_factory
     )
-    assert r["result"] == "cooldown"
-    assert r["kit"] == "HT3"
-    assert 0 < r["remaining_ms"] <= COOLDOWN_MS
-    r2 = await svc.reopen_ticket(
-        123, "200", cooldown_ms=0, now=NOW_MS + 1000, session_factory=session_factory
-    )
-    assert r2["result"] == "reopened"
-    assert r2["ticket"]["status"] == "open"
-    assert r2["ticket"]["closedAt"] is None
+    assert r["result"] == "reopened"
+    assert r["ticket"]["status"] == "open"
+    assert r["ticket"]["closedAt"] is None
+    async with transaction(session_factory) as session:
+        t = await TicketRepository().get_by_channel(session, 123)
+        active = await CooldownRepository().get_active(
+            session,
+            player_id=t.player_id,
+            cooldown_type=COOLDOWN_HT3,
+            kit_id=t.kit_id,
+            now=datetime.fromtimestamp((NOW_MS + 2000) / 1000, tz=timezone.utc),
+        )
+    assert active == []
     r3 = await svc.reopen_ticket(
         123, "200", now=NOW_MS + 2000, session_factory=session_factory
     )
     assert r3["result"] == "not_closed"
 
 
-async def test_reopen_ticket_after_cooldown_expires(session_factory, clean_db):
+async def test_reopen_ticket_refused_when_player_has_another_open_ticket(
+    session_factory, clean_db
+):
     await _seed(session_factory)
     await _create(session_factory, channel_id=124, owner_id=100)
-    await svc.close_ticket(
-        124, "200", cooldown_ms=COOLDOWN_MS, now=NOW_MS, session_factory=session_factory
+    await svc.close_ticket(124, "200", now=NOW_MS, session_factory=session_factory)
+    await _create(session_factory, channel_id=125, owner_id=100)
+    r = await svc.reopen_ticket(124, "200", now=NOW_MS + 1, session_factory=session_factory)
+    assert r["result"] == "duplicate"
+    assert r["ticket"]["id"] == "125"
+
+
+async def test_state_changes_write_audit_in_same_transaction(session_factory, clean_db):
+    await _seed(session_factory)
+    await _create(session_factory, channel_id=126, owner_id=100)
+    audit = {"actor_id": "200", "actor_name": "Tester", "details": "x"}
+    await svc.claim_ticket(126, "200", "Tester", session_factory=session_factory, audit=audit)
+    await svc.unclaim_ticket(126, "200", session_factory=session_factory, audit=audit)
+    await svc.close_ticket(126, "200", now=NOW_MS, session_factory=session_factory, audit=audit)
+    await svc.reopen_ticket(126, "200", now=NOW_MS, session_factory=session_factory, audit=audit)
+    await svc.claim_ticket(
+        126, "300", "Other", session_factory=session_factory, audit={"actor_id": "300"}
     )
-    r = await svc.reopen_ticket(
-        124,
-        "200",
-        cooldown_ms=COOLDOWN_MS,
-        now=NOW_MS + COOLDOWN_MS + 1000,
-        session_factory=session_factory,
+    r = await svc.claim_ticket(
+        126, "400", "Third", session_factory=session_factory, audit={"actor_id": "400"}
     )
-    assert r["result"] == "reopened"
+    assert r["result"] == "already_claimed"
+    actions = [e["action"] for e in await svc.get_ticket_logs(126, session_factory)]
+    assert actions == ["claimed", "unclaimed", "closed", "reopened", "claimed"]
 
 
 async def test_set_panel_message(session_factory, clean_db):

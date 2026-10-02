@@ -67,8 +67,12 @@ class MinecraftLink(commands.Cog):
             return await interaction.response.send_message(
                 "❌ Pouze na serveru.", ephemeral=True
             )
-        await interaction.response.defer(ephemeral=True)
         session_factory = self._sf()
+        if session_factory is None:
+            return await interaction.response.send_message(
+                "❌ Propojování je dostupné jen s PostgreSQL backendem.", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True)
         try:
             outcome = await link_ign(
                 interaction.user.id,
@@ -122,7 +126,8 @@ class MinecraftLink(commands.Cog):
             f"🔗 Tvůj propojovací kód je **`{code}`**.\n\n"
             f"Platí {minutes} minut a jde použít **jednou**. Kód zadej ze strany "
             "Minecraft serveru (nebo přes jeho plugin) jako jediný způsob, jak "
-            "dokázat, že účet vlastníš. Když už budeš propojený, kód tě smaže.",
+            "dokázat, že účet vlastníš. Dokončení propojení probíhá mimo Discord – "
+            "na straně Minecraft serveru, bot samotný ho nedokončí.",
             ephemeral=True,
         )
 
@@ -157,7 +162,9 @@ class MinecraftLink(commands.Cog):
                     f"{status.pending_code_expires_at:%H:%M})."
                 )
             return await interaction.response.send_message(
-                f"Zatím nejsi propojený.{pending}", ephemeral=True
+                f"Zatím nejsi propojený.{pending}\n"
+                "Propojení dokončuje Minecraft strana kódem z `/link`.",
+                ephemeral=True,
             )
 
         await interaction.response.send_message(

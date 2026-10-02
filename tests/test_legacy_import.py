@@ -284,3 +284,17 @@ async def test_runtime_config_filled_into_bot_config(session_factory, clean_db, 
     }
     again = await _run(session_factory, data_dir, tmp_path, apply=True)
     assert again["noop"] is True
+
+
+async def test_empty_kit_keys_are_reported_instead_of_crashing(
+    session_factory, clean_db, data_dir, tmp_path
+):
+    _write(data_dir, "players.json", [
+        {"username": "Alice", "modes": {"": "LT2"}, "history": {"": [{"date": "16.05.2026", "tier": "LT3"}]}},
+    ])
+    _write(data_dir, "evals.json", {"": {"alice": 1_780_000_000_000}})
+    _write(data_dir, "ht3_cooldowns.json", {"111": {"": FUTURE_MS}})
+    _write(data_dir, "kit_roles.json", {"": {"LT2": "5001"}})
+    summary = await _run(session_factory, data_dir, tmp_path, apply=True)
+    issues = summary.get("issues") or summary["counts"]
+    assert issues

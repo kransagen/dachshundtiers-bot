@@ -27,7 +27,7 @@ Oprávnění se nekontroluje přes Discord „Manage Roles“, ale přes **roli*
 |---|---|---|
 | **Hráč** | propojený účet | `/link`, `/linkign`, `/linked`, `/unlink`, `/retire`, `/peaktier`, `/join`, `/list`, `/leaveq` + tlačítka v panelech |
 | **Tester** | má tester roli | + `/claim`, `/unclaim`, `/add`, `/remove`, `/seteval`, `/uneval`, `/result`, `/topresult`, `/turnajresult`, `/joinastester`, `/joinasqueue`, `/pull`, `/mktesterroom` |
-| **Admin** | má Discord **Administrator**, nebo roli z `ADMIN_ROLE_IDS` | + `/edituser`, `/linkdiscord`, `/addtest`, `/removetest`, `/removeplayertiers`, `/setkitrole`, `/unsetkitrole`, `/addkit`, `/removekit`, `/createturnaj`, `/deleteturnaj`, celé `/sync *`, `/dbstatus` |
+| **Admin** | má Discord **Administrator**, nebo roli z `ADMIN_ROLE_IDS` | + `/edituser`, `/linkdiscord`, `/addtest`, `/removetest`, `/setkitrole`, `/unsetkitrole`, `/addkit`, `/removekit`, `/createturnaj`, `/deleteturnaj`, celé `/sync *`, `/dbstatus` |
 
 Tester roli určuje `TESTER_ROLE_IDS` (přesná ID rolí) — je-li nastaven, funguje
 **jen** přes ID, ne podle názvu. Bez něj stačí, že název tester role obsahuje
@@ -72,7 +72,7 @@ Upravuj tiery **pouze** přes:
 - `/result` – běžný tier test
 - `/topresult` – HT Fight
 - `/edituser` – ruční zásah s historií
-- `/sync discord-rollback` – vrácení botem provedené změny
+- `/sync rollback` – vrácení botem provedené změny
 
 ### 2. Cooldowny se neobchází
 
@@ -91,9 +91,9 @@ Každá oprava má **preview**. Před `apply` vždy pust preview a přečti si v
 
 ```
 /sync check                -> read-only diagnostika, nic nemění
+/sync discord              -> náhled rozdílů Discord vs DB, zápis až po potvrzení
 /sync web mode:preview     -> co přesně se zapíše na web
-/sync importdiscord mode:preview  -> jaké jsou rozdíly Discord vs DB
-/sync discord-rollback     -> defaultně dry run
+/sync rollback             -> defaultně dry run
 ```
 
 ## Tier žebříček
@@ -219,7 +219,7 @@ Otevře editor s pěti akcemi:
 | ⏳ **Cooldowny** | zkrácení / prodloužení cooldownu (např. omluva) |
 | 📜 **Historie** | jen zobrazení, nemění nic |
 
-Bez historie se nepoužívá – použij `/sync data` nebo `/edituser`, ne přímé
+Bez historie se nepoužívá – použij `/edituser`, ne přímé
 zásahy do role.
 
 ### Propojení Discord ↔ Minecraft
@@ -257,20 +257,20 @@ problém.
 
 | Co pozoruješ | Co spustit | Co zjistíš |
 |---|---|---|
-| „Nefunguje to“ / „nesouhlasí to“ | `/sync check` | Discord × DB × web + integrita, agregováno OK/WARNING/CONFLICT/ERROR |
+| „Nefunguje to“ / „nesouhlasí to“ | `/sync check` | Discord × DB × web + health, agregováno OK/WARNING/CONFLICT/ERROR |
 | Chceš zúžit problém | `/sync check area:roles` | jen jedna oblast |
 | „Co bot právě běží?“ | `/verze` | commit + stav `/result` |
 | „Jak dlouho má hráč cooldown?“ | `/cooldown hráč` | přesné cooldowny, read-only |
 | Hráč má jiný Discord účet než IGN | `/edituser` → 🎭 Změnit Discord ID | 17–19 číslic, jde do historie |
 | Web ukazuje starý stav | `/sync web mode:preview` | co přesně chybí; pak `mode:apply` |
-| Zmizela role / rozdíl Discord vs DB | `/sync importdiscord mode:preview` | náhled rozdílů, **nic nezapisuje** |
-| „Udělal jsem chybu v rolích“ | `/sync discord-rollback` | **dry run defaultně** – nejdřív si přečti, až pak `mode:apply` |
+| Zmizela role / rozdíl Discord vs DB | `/sync discord` | náhled rozdílů, zapíše se až po potvrzení tlačítkem |
+| „Udělal jsem chybu v rolích“ | `/sync rollback` | **dry run defaultně** – nejdřív si přečti, až pak `mode:apply` |
 | Změna se nepropisuje | `/dbstatus` | dostupnost DB a počty (nikdy neukáže host/heslo) |
 
 `/sync check` umí filtrovat podle oblasti — hodnoty pro `area` jsou:
-`all` (výchozí), `identity`, `tiers`, `roles`, `web`, `data`, `db`.
+`all` (výchozí), `identity`, `roles`, `web`, `db`.
 
-### `/sync discord-rollback` – tlačí po souvislosti
+### `/sync rollback` – tlačí po souvislosti
 
 Rollback vrátí Discord do stavu **před** posledním aplikovaným `/sync discord`
 a jde **výhradně** přes `memberId`/`roleId` z auditu. Před změnou kontroluje,
@@ -284,10 +284,9 @@ potvrď. Cílový sync lze vybrat přes `target_ts`.
 
 | Operace | Co se stane | Bezpečnější varianta |
 |---|---|---|
-| `/sync discord-rollback mode:apply` | vrací role do stavu před syncem | nejdřív `mode:preview` |
-| `/removeplayertiers ign` | hráči zmizí **všechny** aktuální tiery. **Historie zůstává.** | `/edituser` a změň jen dotčený kit |
+| `/sync rollback mode:apply` | vrací role do stavu před syncem | nejdřív `mode:preview` |
 | `/deleteturnaj kit` | **smaže kanály turnaje** | – |
-| `/sync data` (po potvrzení) | opraví neautoritativní nesrovnalosti | nejdřív `/sync check` |
+| `/sync discord` (po potvrzení) | zapíše tier role z Discordu do DB zrcadla (Discord role se nemění) | náhled před potvrzením |
 | ruční editace tier role | propíše se do DB do hodiny, bez historie | `/result` / `/edituser` |
 | `/sync web mode:apply` | přepíše web soubor | `mode:preview` |
 
@@ -314,7 +313,7 @@ Zbytek této dokumentace. Pokud jsi admin a došel jsi sem omylem, vrať se k
 
 - **Discord je jediná autorita aktuálního tieru hráče.** Role na Discordu se
   mění jen přes autorizované příkazy (`/result`, `/topresult`, `/edituser`,
-  `/sync discord-rollback`) – nikdy automaticky z databáze ani z JSONu.
+  `/sync rollback`) – nikdy automaticky z databáze ani z JSONu.
 - **PostgreSQL je povinný.** `DATABASE_URL` musí být nastavené a schéma
   zmigrované (`alembic upgrade head`), jinak start bota tvrdě selže. Žádný
   JSON-only deployment mode, žádný tichý fallback.
@@ -340,7 +339,7 @@ Podrobnosti a auditní důkaz viz `docs/PHASE_G0_FINAL_REPORT.md` a
   (`RLT2` → `LT2`). Nikdy se nemaže ani nepřepisuje.
 - **`discordId`** je permanentní identita hráče (páruje se přes změnu IGN).
   Konflikt (stejný IGN, jiné `discordId`) se nikdy neřeší automaticky.
-- **`/removeplayertiers`** odebírá jen aktuální tiery (`modes`); historie
+- Odebrání tierů přes `/edituser` mění jen aktuální tiery (`modes`); historie
   zůstává.
 
 ## Funkce
@@ -388,7 +387,6 @@ Tlačítka panelu: **Join Queue** (modál s Minecraft IGN), **Leave Queue**,
 | `/testersstats current\|all` | Žebříček testerů (měsíc / vše). |
 | `/addtest tester amount month` *(admin)* | Ruční přidání historických testů. |
 | `/removetest user amount` *(admin)* | Odečtení testů. |
-| `/removeplayertiers ign` *(admin)* | Odebere hráči všechny aktuální tiery (historie zůstává). |
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru. |
 | `/kitrole` | Vypíše mapování kit → role tieru. |
@@ -401,24 +399,23 @@ Web se z `/result` neaktualizuje přímo – to dělá výhradně `/sync web`.
 
 ### 🔄 Synchronizace (`/sync`)
 
-Jeden centrální příkaz pro admin synchronizační operace. Business logika žije
-ve službách (`services/checkweb`, `services/role_sync`, `services/websync`,
-`services/datacheck`); cog je jen orchestrace. Původní `/checkweb`,
-`/playersync`, `/websync`, `/datacheck` fungují dál jako deprecated aliasy.
+Jedna skupina příkazů pro admin synchronizační operace; hlavní je `/sync discord`
+(Discord → PostgreSQL). Business logika žije ve službách (`services/checkweb`,
+`services/role_sync`, `services/websync`, `db/services/mirror_sync`); cog je
+jen orchestrace. Původní `/checkweb`, `/playersync`, `/websync`, `/datacheck`
+a `/sync importdiscord`, `/sync data` byly odstraněny.
 
 | Příkaz | Co dělá | Mění Discord/DB? |
 |---|---|---|
-| `/sync check [area]` *(admin)* | Read-only diagnostika: Discord role × DB × web + integrita dat. Agreguje OK/WARNING/CONFLICT/ERROR, filtr `area`. | Nic – jen report. |
-| `/sync discord` *(admin)* | Přečte tier role všech členů a zapíše je do PostgreSQL zrcadla (Discord → DB). Hlásí anomálie: více tier rolí pro jeden kit, neznámé hráče, tier v DB bez role na Discordu. | Jen DB zrcadlo; Discord role se nemění. |
-| `/sync discord-rollback [mode] [target_ts]` *(admin)* | Bezpečná inverze posledního `/sync discord apply` – vrátí Discord do stavu před syncem, výhradně přes `memberId`/`roleId` z auditu. Kontroluje, jestli hráč nebyl mezitím znovu povýšen. Výchozí `mode:preview` (dry run). | Jen Discord role, po explicitním potvrzení. |
-| `/sync importdiscord mode:preview\|apply` *(admin)* | Náhled jednoznačných rozdílů Discord × DB – **nic nezapisuje** (ani DB, ani web); nasměruje k `/sync discord` a `/sync web`. | Nic. |
+| `/sync discord` *(admin)* | **Hlavní synchronizace Discord → PostgreSQL.** Přečte tier role všech členů, porovná je s DB zrcadlem a ukáže náhled změn a anomálií (více tier rolí pro jeden kit, neznámí hráči, tier v DB bez role). Zápis do zrcadla proběhne až po potvrzení tlačítkem. | Jen DB zrcadlo, po potvrzení; Discord role se nemění. |
 | `/sync web mode:preview\|apply` *(admin)* | Export kanonických dat na GitHub/web. `apply` po potvrzení nahradí web. Selhání GitHubu se nikdy nehlásí jako úspěch. | Jen GitHub soubor. |
-| `/sync data` *(admin)* | Kontrola integrity: duplicity, neplatné tiery, konfliktní role, osamocené tickety. Opravy jen po potvrzení tlačítkem. | Jen po potvrzení, jen neautoritativní opravy. |
+| `/sync check [area]` *(admin)* | Read-only diagnostika: Discord role × DB × web + health zrcadla. Agreguje OK/WARNING/CONFLICT/ERROR, filtr `area`. | Nic – jen report. |
+| `/sync rollback [mode] [target_ts]` *(admin)* | Bezpečná inverze posledního aplikovaného syncu rolí – vrátí Discord do stavu před syncem, výhradně přes `memberId`/`roleId` z auditu. Kontroluje, jestli hráč nebyl mezitím znovu povýšen. Výchozí `mode:preview` (dry run). | Jen Discord role, po explicitním potvrzení. |
 
 Audit: `/sync discord` a automatická reconciliation zapisují do tabulek
-`sync_runs` / `sync_actions` (jen skutečné změny a anomálie). Ostatní
-podpříkazy zatím zapisují audit ještě přes JSON dokumenty v tabulce
-`dachshundtiers_data` – jejich přesun do `audit_logs` je rozpracovaný.
+`sync_runs` / `sync_actions` (jen skutečné změny a anomálie). `/sync web` a `/sync check` zapisují audit ještě přes JSON dokumenty v tabulce
+`dachshundtiers_data` (posledních 1000 záznamů) – jejich přesun do `audit_logs`
+je rozpracovaný.
 
 ### 💸 HT3+ tickety
 | Příkaz | Popis |
@@ -490,7 +487,7 @@ cogs/
   queues.py             # fronty
   results.py            # výsledky + statistiky + auto role
   roles.py              # /setkitrole, /unsetkitrole, /kitrole + auto-grant rolí
-  sync.py               # /sync (check | discord | web | data) + deprecated aliasy
+  sync.py               # /sync (discord | web | check | rollback)
   _shared.py            # sdílené orchestrace helpery
   topresult.py          # /topresult
   edituser.py           # /edituser
@@ -530,6 +527,7 @@ sám, žádná instalace serveru není potřeba):
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m pytest -q
+.venv/bin/ruff check .      # lint stejný jako v CI
 ```
 
 > `.env` je automaticky načten přes `python-dotenv` (viz `config.py`).
@@ -559,15 +557,22 @@ sám, žádná instalace serveru není potřeba):
 | `TESTER_ROLE_FRAGMENT` | Fragment názvu tester role (default `tester`, case-insensitive). Používá se **jen když není nastaven `TESTER_ROLE_IDS`**. |
 | `TESTER_ROLE_IDS` | Allowlist ID tester rolí (čárkami). Je-li nastaven, tester se pozná **výhradně** podle přesného ID role – název se už nehledá. |
 | `ADMIN_ROLE_IDS` | Allowlist ID admin rolí (čárkami). Když je nastaven, tyto role mají admin práva; bez něj (i s nimi) rozhoduje Discord oprávnění **Administrator**. |
-| `GITHUB_*` | Volitelný export `players.json` na GitHub. |
+| `GITHUB_TOKEN`, `GITHUB_OWNER`, `GITHUB_REPO`, `GITHUB_FILE_PATH` | Volitelný export `players.json` na GitHub (`/sync web`). Bez `GITHUB_TOKEN` se export nespustí. `GITHUB_FILE_PATH` default `players.json`. |
 | `DATABASE_URL` | **Povinné.** PostgreSQL připojení, např. `postgresql://user:heslo@host:5432/dachshundtiers`. Bez něj bot nenastartuje. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | Alternativa k `DATABASE_URL` (bot URL sestaví sám). |
-| `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB (hodí se bez IPv6 trasy). |
+| `DB_HOSTADDR` | Volitelné vynucení IPv4 adresy DB (hodí se bez IPv6 trasy). Čte ji jen legacy vrstva `storage.py`, SQLAlchemy engine ji nepoužívá. |
 | `LEGACY_IMPORT` | `preview` / `apply`: jednorázový import starých JSON dat při startu (viz [Data](#data)). Po importu odeber. |
-| `AUTO_MIGRATE` | Default `1`: bot při startu sám spustí `alembic upgrade head` (hostingy bez konzole). `0` = migrace spouštíš ručně. |
+| `AUTO_MIGRATE` | Default `1`: bot při startu sám spustí `alembic upgrade head` (hostingy bez konzole). `0` = migrace spouštíš ručně. Při více instancích současně nech zapnuté jen u jedné. |
+| `STRICT_KIT_ROLES` | `1` = kity bez mapované Discord role při startu zastaví bota (default: jen varování). |
+| `PHASE_E_JSON_EXPORT_ENABLED` | Default `1`. Řídí generovaný JSON export z PostgreSQL (`players.json`); jen informativní příznak, runtime chování nemění. |
 
 > Kanál panelu fronty jde nastavit i za běhu přes `/addqchannel`
 > (ukládá se do tabulky `bot_config`, má přednost před env i defaulty).
+
+### Provoz
+
+Nasazení (včetně `Dockerfile`), zálohy a obnova, rollback migrace, výpadek DB
+a rotace tokenu: viz [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Data
 

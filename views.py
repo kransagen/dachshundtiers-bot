@@ -17,22 +17,26 @@ from dataclasses import dataclass
 from typing import Optional
 
 import discord
+from sqlalchemy.exc import IntegrityError
 
 from config import HT3_COOLDOWN_MS, PLAYER_COOLDOWN_MS, get_ht3_ticket_category
 from db.repositories.kits import KitRepository
+from db.repositories.players import PlayerRepository
 from db.repositories.tournaments import TournamentRepository
 from db.services.session import transaction
 from panel import update_panel
 from services.cooldowns import get_cooldowns
 from services.ht3_tickets import resolve_ht3_context
-from services.permissions import get_tester_roles
+from services.permissions import get_tester_roles, has_admin_role
 from services.queue_service import (
     PULL_EMPTY,
     PULL_NO_KIT,
     PULL_NO_ROOM,
+    clear_tester_room_for_channel,
     join_queue,
     leave_queue,
     pull_for_kit,
+    requeue_pulled_player,
     save_pulled_player,
 )
 from services.tickets import (
@@ -40,7 +44,6 @@ from services.tickets import (
     close_ticket,
     create_ticket,
     get_ticket,
-    log_ticket_event,
     reopen_ticket,
     set_panel_message,
     unclaim_ticket,
@@ -116,6 +119,7 @@ def queue_join_error(result: dict) -> Optional[str]:
 
 async def join_queue_interaction(interaction: discord.Interaction, kit: str) -> None:
     """Atomický join (aktivní fronta + propojení + cooldown + duplicita)."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
     session_factory = _session_factory(interaction)
     result = await join_queue(
         str(interaction.user.id),
@@ -127,12 +131,12 @@ async def join_queue_interaction(interaction: discord.Interaction, kit: str) -> 
     )
     error = queue_join_error(result)
     if error is not None:
-        return await interaction.response.send_message(error, ephemeral=True)
-    await update_panel(interaction.guild, kit.lower(), session_factory=session_factory)
-    await interaction.response.send_message(
+        return await interaction.followup.send(error, ephemeral=True)
+    await interaction.followup.send(
         f"✅ Byl jsi přidán do fronty **{kit.strip()}** jako `{result['ign']}`.",
         ephemeral=True,
     )
+    await update_panel(interaction.guild, kit.lower(), session_factory=session_factory)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +176,7 @@ class QueueView(SafeView):
 
     # ---- Leave ----
     async def on_leave(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         kit_key = self.kit.lower()
         user_id = str(interaction.user.id)
 
@@ -179,15 +184,15 @@ class QueueView(SafeView):
             user_id, kit_key, session_factory=_session_factory(interaction)
         )
         if not removed:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Nejsi zapsaný ve frontě pro kit **{self.kit}**.", ephemeral=True
             )
 
+        await interaction.followup.send(
+            f"✅ Úspěšně jsi opustil frontu pro kit **{self.kit}**.", ephemeral=True
+        )
         await update_panel(
             interaction.guild, kit_key, session_factory=_session_factory(interaction)
-        )
-        await interaction.response.send_message(
-            f"✅ Úspěšně jsi opustil frontu pro kit **{self.kit}**.", ephemeral=True
         )
 
     # ---- Pull (výběr roomky) ----
@@ -197,6 +202,7 @@ class QueueView(SafeView):
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
 
+        await interaction.response.defer(ephemeral=True, thinking=True)
         kit_key = self.kit.lower()
         # Roomka patří kitu (`/mktesterroom <kit>`), tester ji znovu nevybírá –
         # jinak by existovaly dvě cesty, kam hráče poslat, a mapování v
@@ -205,17 +211,17 @@ class QueueView(SafeView):
         result = await pull_for_kit(kit_key, session_factory=_session_factory(interaction))
 
         if result.status == PULL_NO_ROOM:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Kit **{self.kit}** nemá tester roomku – vytvoř ji "
                 f"`/mktesterroom {kit_key}`. Hráč ve frontě zůstal.",
                 ephemeral=True,
             )
         if result.status == PULL_NO_KIT:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Kit `{self.kit}` neznám.", ephemeral=True
             )
         if result.status == PULL_EMPTY:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Tato fronta je prázdná, není koho vytáhnout.", ephemeral=True
             )
 
@@ -241,21 +247,44 @@ async def grant_pull_access(
 ) -> None:
     """Udělí hráči přístup do roomky, pošle uvítací zprávu a zaloguje pulled player.
 
-    Pokud se práva udělit nepodaří (např. hráč není na serveru), hláška to řekne
-    narovinu, ale vytažení z fronty tím není ztraceno.
+    Volající musí interakci nejdřív ``defer``ovat. Pokud se práva udělit
+    nepodaří (např. hráč není na serveru), hláška to řekne narovinu, ale
+    vytažení z fronty tím není ztraceno. Roomka, která na Discordu není, vrací
+    hráče zpět do fronty a maže své mapování.
     """
     guild = interaction.guild
     channel = guild.get_channel(channel_id)
+    channel_gone = False
     if channel is None:
         try:
             channel = await guild.fetch_channel(channel_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        except discord.NotFound:
+            channel_gone = True
+        except (discord.Forbidden, discord.HTTPException):
             channel = None
 
     if channel is None:
-        return await interaction.response.send_message(
-            "❌ Roomka se nepodařila najít. Zkus to znovu.", ephemeral=True
+        await requeue_pulled_player(
+            player, kit_name, session_factory=session_factory
         )
+        if channel_gone:
+            await clear_tester_room_for_channel(
+                channel_id, session_factory=session_factory
+            )
+        await update_panel(
+            guild, str(kit_name or "").lower(), session_factory=session_factory
+        )
+        if channel_gone:
+            message = (
+                f"❌ Roomka kitu **{kit_name}** už neexistuje (mapování jsem smazal). "
+                f"Vytvoř novou `/mktesterroom {kit_name}`. Hráč zůstal ve frontě."
+            )
+        else:
+            message = (
+                "❌ Roomku se nepodařilo načíst (chyba Discordu). "
+                "Hráč zůstal ve frontě, zkus to znovu."
+            )
+        return await interaction.followup.send(message, ephemeral=True)
 
     member = guild.get_member(int(player["id"]))
     if member is None:
@@ -304,7 +333,7 @@ async def grant_pull_access(
             "udělit (není hráč stále na serveru?). Bot přístup automaticky nedoplní – "
             "jakmile bude hráč na serveru, přidej ho ručně (např. přes /mktesterroom)."
         )
-    await interaction.response.send_message(message, ephemeral=True)
+    await interaction.followup.send(message, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +356,13 @@ async def grant_pull_access(
 # /seteval, který po evalu rovnou založí HT3 ticket. Dvě cesty do stejného
 # kanálu by znamenaly dvě místa, kde se dá rozhodnout „tady ticket vznikne" – a
 # právě tam se při opakovaném zpracování duplikoval.
+
+
+async def _delete_channel_quietly(channel) -> None:
+    try:
+        await channel.delete()
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        pass
 
 
 def _apply_ticket_overwrites(guild, *, owner_member):
@@ -471,27 +507,34 @@ async def _open_ht3_ticket(
             message="❌ Kanál ticketu se nepodařilo vytvořit (zkontroluj oprávnění bota).",
         )
 
-    result = await create_ticket(
-        channel_id=channel.id,
-        owner_id=owner_id,
-        owner_name=interaction.user.display_name or interaction.user.name,
-        ign=ign,
-        kit=kit,
-        target_tier=target_tier,
-        current_tier=current_tier,
-        eval_ok=eval_ok,
-        category_id=category_id,
-        now=int(time.time() * 1000),
-        session_factory=session_factory,
-    )
+    actor_name = interaction.user.display_name or interaction.user.name
+    try:
+        result = await create_ticket(
+            channel_id=channel.id,
+            owner_id=owner_id,
+            owner_name=actor_name,
+            ign=ign,
+            kit=kit,
+            target_tier=target_tier,
+            current_tier=current_tier,
+            eval_ok=eval_ok,
+            category_id=category_id,
+            now=int(time.time() * 1000),
+            audit={
+                "actor_id": owner_id,
+                "actor_name": actor_name,
+                "details": f"Ticket {target_tier} / {kit} (IGN {ign})",
+            },
+            session_factory=session_factory,
+        )
+    except Exception:
+        await _delete_channel_quietly(channel)
+        raise
     if result["result"] != "created":
         # Lost the race: an open ticket for this player+kit already exists
         # (uq_tickets_open_player_kit). The channel we just made is empty and
         # unreferenced, so delete it rather than leave an orphan room.
-        try:
-            await channel.delete()
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
+        await _delete_channel_quietly(channel)
         existing = result.get("ticket") or {}
         if result["result"] == "duplicate":
             return HT3TicketOpened(
@@ -517,28 +560,27 @@ async def _open_ht3_ticket(
         )
     except (discord.Forbidden, discord.HTTPException) as err:
         log.warning("Nelze poslat panel ticketu do %s: %s", channel.id, err)
-        message = None
-
-    if message is not None:
-        # Register the persistent view so the buttons survive a restart.
-        client = getattr(interaction, "client", None)
-        if client is not None:
-            try:
-                client.add_view(ticket_view, message_id=message.id)
-            except (ValueError, AttributeError, discord.ClientException) as err:
-                log.warning("Nelze zaregistrovat view ticketu %s: %s", channel.id, err)
-
-        await set_panel_message(
-            channel.id, str(message.id), session_factory=session_factory
+        # Bez panelu nemá ticket tlačítka a po restartu by nešel ovládat:
+        # uvolníme otevřený slot hráče a kanál smažeme.
+        await close_ticket(
+            channel.id, owner_id, session_factory=session_factory
+        )
+        await _delete_channel_quietly(channel)
+        return HT3TicketOpened(
+            status=TICKET_FAILED,
+            message="❌ Panel ticketu se nepodařilo odeslat – ticket byl zrušen, zkus to znovu.",
         )
 
-    await log_ticket_event(
-        channel.id,
-        "created",
-        owner_id,
-        interaction.user.display_name or interaction.user.name,
-        details=f"Ticket {target_tier} / {kit} (IGN {ign})",
-        session_factory=session_factory,
+    # Register the persistent view so the buttons survive a restart.
+    client = getattr(interaction, "client", None)
+    if client is not None:
+        try:
+            client.add_view(ticket_view, message_id=message.id)
+        except (ValueError, AttributeError, discord.ClientException) as err:
+            log.warning("Nelze zaregistrovat view ticketu %s: %s", channel.id, err)
+
+    await set_panel_message(
+        channel.id, str(message.id), session_factory=session_factory
     )
 
     return HT3TicketOpened(
@@ -565,7 +607,7 @@ class HT3PanelView(SafeView):
             placeholder="Vyber kit pro HT3+ ticket...",
             min_values=1,
             max_values=1,
-            options=[discord.SelectOption(label=kit, value=kit) for kit in kits],
+            options=[discord.SelectOption(label=kit, value=kit) for kit in kits[:25]],
         )
         select.callback = self.on_select
         self.add_item(select)
@@ -582,17 +624,17 @@ class HT3PanelView(SafeView):
                 "❌ Pouze na serveru.", ephemeral=True
             )
 
+        await interaction.response.defer(ephemeral=True)
+
         user_cd = await get_cooldowns(user_id, session_factory=session_factory)
         remaining = user_cd["ht3"].get(selected_kit)
         if remaining:
             days = remaining // (24 * 60 * 60 * 1000)
             hours = (remaining % (24 * 60 * 60 * 1000)) // (60 * 60 * 1000)
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Na kit **{selected_kit}** máš stále HT3+ cooldown! Zbývá: **{days}d {hours}h**.",
                 ephemeral=True,
             )
-
-        await interaction.response.defer(ephemeral=True)
 
         # Vše ostatní (IGN, tier, cílový tier, duplikáty) se odvodí z DB.
         # Bez propojeného Minecraft účtu nebo bez uloženého tieru se ticket
@@ -691,11 +733,20 @@ class HTTicketView(SafeView):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
+    @staticmethod
+    def _audit(interaction, details: str | None = None) -> dict:
+        return {
+            "actor_id": str(interaction.user.id),
+            "actor_name": interaction.user.display_name,
+            "details": details,
+        }
+
     async def on_claim(self, interaction: discord.Interaction) -> None:
         if not has_tester_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ticket = await self._active_ticket(interaction)
         if ticket is None:
             return
@@ -703,37 +754,35 @@ class HTTicketView(SafeView):
             interaction.channel_id, str(interaction.user.id),
             interaction.user.display_name,
             session_factory=_session_factory(interaction),
+            audit=self._audit(
+                interaction,
+                f"Claim: {ticket.get('ign')} / {ticket.get('kit')}",
+            ),
         )
         r = result["result"]
         if r == "not_open":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket je zavřený – nejdřív ho otevři (Reopen).", ephemeral=True
             )
         if r == "own_ticket":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Nemůžeš si převzít vlastní ticket.", ephemeral=True
             )
         if r == "already_claimed":
             other = result.get("claimer_name") or f"<@{result.get('claimer_id')}>"
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"❌ Ticket už má převzatý **{other}** – nejdřív se ho musí vzdát.",
                 ephemeral=True,
             )
         if r != "claimed":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket se nepodařilo převzít.", ephemeral=True
             )
 
         ticket = result["ticket"]
         await grant_channel_access(interaction.channel, str(interaction.user.id))
-        await log_ticket_event(
-            interaction.channel_id, "claimed", str(interaction.user.id),
-            interaction.user.display_name,
-            details=f"Claim: {ticket.get('ign')} / {ticket.get('kit')}",
-            session_factory=_session_factory(interaction),
-        )
         await self._refresh_ticket_state(interaction, ticket)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ **{interaction.user.display_name}** převzal/a ticket "
             f"<#{interaction.channel_id}> – můžeš začít test.",
             ephemeral=True,
@@ -744,28 +793,31 @@ class HTTicketView(SafeView):
             return await interaction.response.send_message(
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ticket = await self._active_ticket(interaction)
         if ticket is None:
             return
         result = await unclaim_ticket(
-            interaction.channel_id, str(interaction.user.id), force=True,
+            interaction.channel_id, str(interaction.user.id),
+            force=has_admin_role(interaction.user),
             session_factory=_session_factory(interaction),
+            audit=self._audit(interaction),
         )
+        if result["result"] == "not_claimer":
+            other = result.get("claimer_name") or f"<@{result.get('claimer_id')}>"
+            return await interaction.followup.send(
+                f"❌ Ticket má převzatý **{other}** – uvolnit ho může jen on nebo admin.",
+                ephemeral=True,
+            )
         if result["result"] != "unclaimed":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket nemá nikdo převzatý (nebo se nepodařilo uvolnit).",
                 ephemeral=True,
             )
         previous = result["previous"]
         await revoke_channel_access(interaction.channel, previous["claimer_id"])
-        await log_ticket_event(
-            interaction.channel_id, "unclaimed", str(interaction.user.id),
-            interaction.user.display_name,
-            details=f"Vzdal se: {previous['claimer_name'] or previous['claimer_id']}",
-            session_factory=_session_factory(interaction),
-        )
         await self._refresh_ticket_state(interaction, result["ticket"])
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "↩️ Ticket je zase volný – nikdo ho nemá převzatý.", ephemeral=True
         )
 
@@ -774,6 +826,7 @@ class HTTicketView(SafeView):
             return await interaction.response.send_message(
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ticket = await self._active_ticket(interaction)
         if ticket is None:
             return
@@ -782,24 +835,19 @@ class HTTicketView(SafeView):
             str(interaction.user.id),
             cooldown_ms=HT3_COOLDOWN_MS,
             session_factory=_session_factory(interaction),
+            audit=self._audit(interaction, "7denní HT3+ cooldown nastaven"),
         )
         r = result["result"]
         if r == "already_closed":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket už je zavřený.", ephemeral=True
             )
         if r != "closed":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket se nepodařilo zavřít.", ephemeral=True
             )
-        await log_ticket_event(
-            interaction.channel_id, "closed", str(interaction.user.id),
-            interaction.user.display_name,
-            details="7denní HT3+ cooldown nastaven",
-            session_factory=_session_factory(interaction),
-        )
         await self._refresh_ticket_state(interaction, result["ticket"])
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "🔒 Ticket zavřený – hráč má 7denní HT3+ cooldown na tento kit. "
             "Kanál zůstává (Reopen / log).",
             ephemeral=True,
@@ -810,54 +858,39 @@ class HTTicketView(SafeView):
             return await interaction.response.send_message(
                 "❌ Na tohle musíš být Tester!", ephemeral=True
             )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ticket = await self._active_ticket(interaction)
         if ticket is None:
             return
         result = await reopen_ticket(
             interaction.channel_id,
             str(interaction.user.id),
-            cooldown_ms=HT3_COOLDOWN_MS,
             session_factory=_session_factory(interaction),
+            audit=self._audit(interaction),
         )
         if result["result"] == "not_closed":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket už je otevřený.", ephemeral=True
             )
-        if result["result"] == "cooldown":
-            remaining = int(result.get("remaining_ms") or 0)
-            days, rem = divmod(remaining, 86_400_000)
-            hours, rem = divmod(rem, 3_600_000)
-            mins = rem // 60_000
-            bits = []
-            if days:
-                bits.append(f"{days} d")
-            if hours:
-                bits.append(f"{hours} h")
-            if mins:
-                bits.append(f"{mins} min")
-            duration = " ".join(bits) or "méně než minutu"
-            return await interaction.response.send_message(
-                "❌ **HT3+ cooldown ještě neskončil** – ticket lze znovu "
-                f"otevřít za **{duration}** (kit `{result.get('kit') or '?'}`).",
+        if result["result"] == "duplicate":
+            return await interaction.followup.send(
+                "❌ Hráč už má pro tenhle kit jiný otevřený ticket: "
+                f"<#{(result.get('ticket') or {}).get('id')}>.",
                 ephemeral=True,
             )
         if result["result"] != "reopened":
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "❌ Ticket se nepodařilo znovu otevřít.", ephemeral=True
             )
-        await log_ticket_event(
-            interaction.channel_id, "reopened", str(interaction.user.id),
-            interaction.user.display_name,
-            session_factory=_session_factory(interaction),
-        )
         await self._refresh_ticket_state(interaction, result["ticket"])
-        await interaction.response.send_message(
-            "🔓 Ticket je zase otevřený.", ephemeral=True
+        await interaction.followup.send(
+            "🔓 Ticket je zase otevřený (cooldown po zavření se zrušil).",
+            ephemeral=True,
         )
 
 
 async def _ticket_not_found(interaction) -> None:
-    await interaction.response.send_message(
+    await interaction.followup.send(
         "❌ Tento kanál není HT ticket (záznam chybí).", ephemeral=True
     )
 
@@ -912,30 +945,50 @@ class TournamentSignupView(SafeView):
                 "⚠️ Databáze není dostupná — zkus to později.", ephemeral=True
             )
         async with transaction(session_factory) as session:
-            kit = await KitRepository().get_by_key(session, self.kit_key)
-            if kit is None:
-                return await interaction.response.send_message(
-                    "Turnaj pro tento kit neexistuje.", ephemeral=True
-                )
-            tournament = await TournamentRepository().get_by_kit(
-                session, kit_id=kit.id
+            result = await signup_player(
+                session, self.kit_key, interaction.user.id
             )
-            if tournament is None or tournament.ended:
-                return await interaction.response.send_message(
-                    "Přihlašování do tohoto turnaje již skončilo.", ephemeral=True
-                )
-            if await TournamentRepository().is_participant(
-                session, tournament_id=tournament.id, player_id=interaction.user.id
-            ):
-                return await interaction.response.send_message(
-                    "Už jsi v tomto turnaji přihlášen.", ephemeral=True
-                )
-            await TournamentRepository().add_participant(
-                session, tournament_id=tournament.id, player_id=interaction.user.id
+        messages = {
+            "no_kit": "Turnaj pro tento kit neexistuje.",
+            "closed": "Přihlašování do tohoto turnaje již skončilo.",
+            "duplicate": "Už jsi v tomto turnaji přihlášen.",
+            "ok": "Byl jsi úspěšně přihlášen do turnaje! ✅",
+        }
+        await interaction.response.send_message(messages[result], ephemeral=True)
+
+
+async def signup_player(session, kit_key: str, discord_id: int) -> str:
+    """Přihlásí hráče do turnaje kitu; vrací no_kit / closed / duplicate / ok.
+
+    ``tournament_entries.player_id`` míří na ``players.id`` (ne na Discord ID),
+    proto se hráč nejdřív dohledá nebo založí podle Discord ID.
+    """
+    kit = await KitRepository().get_by_key(session, kit_key)
+    if kit is None:
+        return "no_kit"
+    repo = TournamentRepository()
+    tournament = await repo.get_by_kit(session, kit_id=kit.id)
+    if tournament is None or tournament.ended:
+        return "closed"
+    player = await PlayerRepository().get_or_create_shell(
+        session, discord_id=discord_id
+    )
+    if await repo.is_participant(
+        session, tournament_id=tournament.id, player_id=player.id
+    ):
+        return "duplicate"
+    try:
+        async with session.begin_nested():
+            await repo.add_participant(
+                session, tournament_id=tournament.id, player_id=player.id
             )
-        await interaction.response.send_message(
-            "Byl jsi úspěšně přihlášen do turnaje! ✅", ephemeral=True
-        )
+    except IntegrityError:
+        if await repo.is_participant(
+            session, tournament_id=tournament.id, player_id=player.id
+        ):
+            return "duplicate"
+        raise
+    return "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -963,12 +1016,19 @@ class TesterRoomView(SafeView):
         await interaction.response.send_message("🔒 Místnost se zavírá...")
 
         channel = interaction.channel
+        session_factory = _session_factory(interaction)
 
         async def _delete_later() -> None:
             await asyncio.sleep(3)
             try:
                 await channel.delete()
-            except (discord.NotFound, discord.HTTPException):
+            except discord.NotFound:
                 pass
+            except discord.HTTPException:
+                return
+            if session_factory is not None:
+                await clear_tester_room_for_channel(
+                    channel.id, session_factory=session_factory
+                )
 
         spawn(_delete_later(), name="close-testerroom")

@@ -38,6 +38,7 @@ def _interaction(db_factory=None):
     inter.response.send_message = mock.AsyncMock()
     inter.response.defer = mock.AsyncMock()
     inter.response.send_modal = mock.AsyncMock()
+    inter.followup.send = mock.AsyncMock()
     return inter
 
 
@@ -79,12 +80,13 @@ class QueueJoinTests(unittest.TestCase):
     def test_joined_refreshes_panel_and_shows_ign(self):
         _, update_panel, inter = self._join({"result": "joined", "ign": "AliceMC"})
         update_panel.assert_awaited_once()
-        self.assertIn("AliceMC", inter.response.send_message.call_args.args[0])
+        self.assertIn("AliceMC", inter.followup.send.call_args.args[0])
+        inter.response.defer.assert_awaited_once()
         inter.response.send_modal.assert_not_called()
 
     def test_not_linked_points_to_linkign(self):
         _, update_panel, inter = self._join({"result": "not_linked"})
-        self.assertEqual(inter.response.send_message.call_args.args[0], NOT_LINKED_MESSAGE)
+        self.assertEqual(inter.followup.send.call_args.args[0], NOT_LINKED_MESSAGE)
         update_panel.assert_not_called()
 
     def test_closed_cooldown_duplicate_messages(self):
@@ -94,7 +96,7 @@ class QueueJoinTests(unittest.TestCase):
             ({"result": "duplicate"}, "zapsaný"),
         ):
             _, update_panel, inter = self._join(result)
-            self.assertIn(needle, inter.response.send_message.call_args.args[0])
+            self.assertIn(needle, inter.followup.send.call_args.args[0])
             update_panel.assert_not_called()
 
 class HT3PanelViewTests(unittest.TestCase):
@@ -117,8 +119,8 @@ class HT3PanelViewTests(unittest.TestCase):
             return_value={"waitlist_ms": None, "ht3": {"AnchorPvP": 1000}}
         )):
             asyncio.run(view.on_select(inter))
-        inter.response.send_message.assert_called_once()
-        self.assertIn("cooldown", inter.response.send_message.call_args.args[0])
+        inter.followup.send.assert_awaited_once()
+        self.assertIn("cooldown", inter.followup.send.call_args.args[0])
 
     def test_on_select_opens_ticket_without_modal(self):
         """Panel vybere jen kit a rovnou založí ticket – žádný modál, žádné psaní IGN/tieru."""
@@ -276,8 +278,7 @@ class OpenHT3TicketTests(unittest.TestCase):
              )) as ct, \
              mock.patch("views.ticket_embed", return_value=mock.MagicMock()), \
              mock.patch("views.HTTicketView"), \
-             mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm, \
-             mock.patch("views.log_ticket_event", new=mock.AsyncMock()) as lte:
+             mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm:
             result = self._call(inter)
 
         self.assertEqual(result.status, "opened")
@@ -286,7 +287,7 @@ class OpenHT3TicketTests(unittest.TestCase):
         self.assertEqual(ct.await_args.kwargs["channel_id"], 2001)
         self.assertEqual(ct.await_args.kwargs["target_tier"], "HT3")
         spm.assert_awaited_once()
-        lte.assert_awaited_once()
+        self.assertEqual(ct.await_args.kwargs["audit"]["actor_id"], "99")
 
     def test_session_factory_propagated_to_services(self):
         factory = object()
@@ -298,11 +299,10 @@ class OpenHT3TicketTests(unittest.TestCase):
              )) as ct, \
              mock.patch("views.ticket_embed", return_value=mock.MagicMock()), \
              mock.patch("views.HTTicketView"), \
-             mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm, \
-             mock.patch("views.log_ticket_event", new=mock.AsyncMock()) as lte:
+             mock.patch("views.set_panel_message", new=mock.AsyncMock()) as spm:
             self._call(inter, session_factory=factory)
 
-        for svc in (ct, spm, lte):
+        for svc in (ct, spm):
             self.assertIs(
                 svc.await_args.kwargs["session_factory"], factory,
                 f"{svc._mock_name} nedostal session_factory",

@@ -12,6 +12,7 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -55,6 +56,7 @@ class Tournament(Base):
             unique=True,
             postgresql_where=text("ended = false"),
         ),
+        CheckConstraint("groups_count > 0", name="groups_count"),
     )
 
 

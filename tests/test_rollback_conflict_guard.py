@@ -1,6 +1,6 @@
 """H3 audit fix regression: ``_rollback_conflicts_with_later_promotion``.
 
-``/sync discord-rollback`` replays ``playersync_log.json`` (scoped to
+``/sync rollback`` replays ``playersync_log.json`` (scoped to
 ``/sync discord apply``) and has no way to know about a later, unrelated
 ``auto_grant_kit_role`` promotion for the same member+kit. The guard in
 ``cogs/_shared.py`` closes that gap by checking real PostgreSQL tier

@@ -5,15 +5,15 @@
 - /testersstats      – tabulka testerů (tento měsíc / všechny časy)
 - /addtest           – admin: přidání historických testů (do `tester_credits`)
 - /removetest        – admin: odečtení testů (upraví total i aktuální měsíc, min 0)
-- /removeplayertiers – tiery v PostgreSQL režimu nelze mazat; píše, jak to udělat
 
 Statistiky testerů se nepočítají do žádného JSONu: odvozují se za běhu z
 tabulky `results` (viz `services.tester_stats`), ruční kredity z `/addtest`
 leží v `tester_credits`. Zápis na GitHub/web je oddělený projekce přes
-`/websync`, nikoli součást `/result`.
+`/sync web`, nikoli součást `/result`.
 """
 
 import logging
+import re
 
 import discord
 from discord import app_commands
@@ -24,13 +24,17 @@ from config import (
     PLAYER_COOLDOWN_MS,
     get_result_channel_id,
 )
+from db.repositories.cooldowns import COOLDOWN_HT3, COOLDOWN_WAITLIST
+from db.services.promotion import CooldownSpec, grant_confirmation
 from panel import update_panel
 from services.permissions import has_admin_role
 from services.queue_service import leave_queue, remove_pulled_player
 from services.results import (
     EVAL_TIER,
     RESULT_TIERS,
+    player_access_channel_ids,
     record_result,
+    validate_result_inputs,
     validate_result_tier,
 )
 from services.tester_stats import (
@@ -41,7 +45,7 @@ from services.tester_stats import (
 )
 from services.evals import set_eval
 from services.kit_catalog import add_kit, get_kits
-from services.tickets import HT3_TIER_LADDER, get_ticket
+from services.tickets import HT3_TIER_LADDER, _ms_to_dt, get_ticket
 from utils import (
     has_tester_role,
     kit_autocomplete,
@@ -52,6 +56,8 @@ from utils import (
 from cogs.roles import TierRoleGrant, auto_grant_kit_role
 
 log = logging.getLogger("dachshundtiers")
+
+MONTH_RE = re.compile(r"^(0[1-9]|1[0-2])\.\d{4}$")
 
 # Povolené tiery v /result a EVAL_TIER žijí v services/results.py (jediný
 # zdroj pravdy): queue výsledky LT5..LT3+eval, HT3+ ticket výsledky ověřuje
@@ -169,6 +175,10 @@ class Results(commands.Cog):
                 "❌ Nemůžeš zapisovat výsledek sám sobě.", ephemeral=True
             )
 
+        ok_inputs, inputs_msg = validate_result_inputs(ign, score, notes)
+        if not ok_inputs:
+            return await interaction.response.send_message(inputs_msg, ephemeral=True)
+
         # Défer hned napřed – stejně jako originál (index.ts: deferReply),
         # abychom se vešli do 3s okna Discord i přes fetch roomky / kanálu.
         await interaction.response.defer(ephemeral=True)
@@ -258,7 +268,6 @@ class Results(commands.Cog):
             now=now_ms(),
             date=today_cz(),
             queue_cooldown_ms=PLAYER_COOLDOWN_MS,
-            ht3_cooldown_ms=HT3_COOLDOWN_MS if ticket is not None else 0,
             session_factory=sf,
         )
         r = record["result"]
@@ -328,9 +337,91 @@ class Results(commands.Cog):
                 "❌ Výsledek se nepodařilo uložit.", ephemeral=True
             )
         previous_tier = record.get("previous_tier", "N/A")
+        now = now_ms()
+        current_date = today_cz()
 
-        # 1a) Ticket je zavřený – obnovíme embed panel zprávy (jako Close
-        #     tlačítko), aby byla vidět zavřená kartička.
+        # 2) Automatická role kitu+tieru – po uložení výsledku dostane hráč
+        #    roli nového tieru, staré tiery kitu se odeberou. Role se odvozují
+        #    z tieru podle business logiky; změna je auditovaná přes
+        #    `commit_confirmed_promotion` + `audit_logs`.
+        role_note = ""
+        grant = None
+        try:
+            grant = await auto_grant_kit_role(
+                interaction.guild,
+                target_id,
+                kit_key,
+                stored_tier,
+                session_factory=sf,
+            )
+            role_note = (
+                grant.note if isinstance(grant, TierRoleGrant) else grant
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("Chyba při automatickém udělování role pro %s", target_id)
+
+        # 3) PostgreSQL mirror (Discord-first) – JEDINÝ kanonický zápis
+        #    povýšení (``db.services.commit_confirmed_promotion``): spolu s ním
+        #    se atomicky nastaví cooldowny a zavře ticket. Nepotvrzený/nejistý
+        #    Discord grant se v něm odmítne a NIC se nezapíše (invariant 6).
+        #    Selže-li transakce, událost jde do outboxu a mirror se doplní
+        #    podle Discordu – nikdy naopak.
+        cooldowns = [
+            CooldownSpec(COOLDOWN_WAITLIST, _ms_to_dt(now + PLAYER_COOLDOWN_MS))
+        ]
+        if ticket is not None:
+            cooldowns.append(
+                CooldownSpec(COOLDOWN_HT3, _ms_to_dt(now + HT3_COOLDOWN_MS))
+            )
+        db_note = ""
+        try:
+            from db.services import commit_confirmed_promotion
+
+            wedge = await commit_confirmed_promotion(
+                sf,
+                grant=grant,
+                result_key=f"result:{record['record'].get('id')}",
+                kind="ticket" if ticket is not None else "queue",
+                discord_id=int(target_id),
+                ign=ign_clean,
+                kit_key=kit_key,
+                new_tier_code=stored_tier,
+                previous_tier_code=(
+                    previous_tier if previous_tier not in ("N/A", "") else None
+                ),
+                score=score,
+                outcome=outcome,
+                evaluator_discord_id=interaction.user.id,
+                ticket_channel_id=(
+                    int(ticket["id"]) if ticket is not None else None
+                ),
+                notes=notes_clean or None,
+                eval_flag=is_eval,
+                date=current_date,
+                cooldowns=tuple(cooldowns),
+                close_ticket_channel_id=(
+                    int(ticket["id"]) if ticket is not None else None
+                ),
+                audit_actor_id=interaction.user.id,
+                audit_actor_name=str(interaction.user),
+            )
+            if wedge.message:
+                db_note = f"\n{wedge.message}"
+        except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /result
+            log.exception("PostgreSQL mirror pro %s selhal", target_id)
+
+        if not grant_confirmation(grant)[0]:
+            return await interaction.followup.send(
+                "❌ Výsledek **nebyl potvrzen** – tier roli se nepodařilo udělit "
+                "a ověřit, proto se hráči nenastavil cooldown, ticket zůstal "
+                "otevřený a nic se neoznámilo. Oprav role a zapiš `/result` znovu."
+                + (role_note or "")
+                + db_note,
+                ephemeral=True,
+            )
+
+        # 4) Ticket je zavřený – obnovíme embed panel zprávy (jako Close
+        #    tlačítko), aby byla vidět zavřená kartička.
         if ticket is not None:
             try:
                 fresh_ticket = await get_ticket(ticket["id"], session_factory=sf)
@@ -346,17 +437,19 @@ class Results(commands.Cog):
             except Exception:  # noqa: BLE001
                 log.exception("Nelze obnovit embed ticketu po /result")
 
-        # 2) Odebrání z fronty (atomicky v transakci – viz services; bez
-        #    session_factory leave_queue odmítne, žádný JSON fallback)
+        # 5) Odebrání z fronty a z tester roomek – po výsledku hráč nesmí
+        #    zůstat v žádné roomce. Osobní overwrite se maže jen v kanálech
+        #    hráče (tester roomky, jeho tickety a roomky z fronty).
+        try:
+            access_channels = await player_access_channel_ids(target_id, sf)
+        except Exception:  # noqa: BLE001 – úklid práv nesmí shodit potvrzený výsledek
+            log.exception("Nelze zjistit kanály hráče %s pro odebrání práv", target_id)
+            access_channels = set()
+        if ticket is not None:
+            access_channels.add(int(ticket["id"]))
         removed_from_queue = await leave_queue(target_id, kit_key, session_factory=sf)
         if removed_from_queue and interaction.guild is not None:
             await update_panel(interaction.guild, kit_key, session_factory=sf)
-
-        # 3) Odebrání práv z tester roomek – po výsledku hráč nesmí zůstat
-        #    v žádné roomce. Pokrývá pull tlačítko / /queue pull (záznam
-        #    pulled v DB frontě) i přednastavený přístup přes `/mktesterroom
-        #    hrac:` – vždy odstraníme hráčův osobní overwrite ve VŠECH
-        #    kanálech serveru.
         await remove_pulled_player(target_id, session_factory=sf)
 
         member = interaction.guild.get_member(int(target_id))
@@ -369,6 +462,8 @@ class Results(commands.Cog):
         if member is not None:
             removed_count = 0
             for ch in interaction.guild.channels:
+                if ch.id not in access_channels:
+                    continue
                 try:
                     has_member_ow = any(
                         isinstance(t, discord.Member) and t.id == member.id
@@ -402,7 +497,11 @@ class Results(commands.Cog):
                 vs = member.voice
             except (AttributeError, TypeError):
                 vs = None
-            if vs is not None and vs.channel is not None:
+            if (
+                vs is not None
+                and vs.channel is not None
+                and vs.channel.id in access_channels
+            ):
                 try:
                     await member.move_to(interaction.guild.afk_channel)
                 except (discord.Forbidden, discord.HTTPException) as err:
@@ -412,97 +511,16 @@ class Results(commands.Cog):
                         err,
                     )
 
-        # 4) Statistiky testera se nepočítají – odvozují se za běhu z tabulky
-        #    `results` (viz services.tester_stats). Kdyby se tady agregoval
-        #    počet, šel by mimo `record_result` a o souběžné /result by se
-        #    ztratil. Datum v patičce embeda drží popisek dne.
-        current_date = today_cz()
-
-        # 5) record_result (krok 1) už uložil kanonický záznam do `results`
-        #    (řádek `discord_pending`). previous_tier už je vyřešený, tady jen
-        #    navazující kroky.
-
-        # 5a) „LT3 + eval" → eval flag. Tier/role zůstávají LT3 – hráč ale
+        # 6a) „LT3 + eval" → eval flag. Tier/role zůstávají LT3 – hráč ale
         #     nově může otevírat HT3+ tickety.
         eval_note = ""
-        if is_eval and await set_eval(
-            ign_clean,
-            kit_clean,
-            session_factory=getattr(self.bot, "db_session_factory", None),
-        ):
+        if is_eval and await set_eval(ign_clean, kit_clean, session_factory=sf):
             eval_note = (
                 f"\n🎖️ **{ign_clean}** dostal **LT3 + eval** pro **{kit_clean}** – "
                 "může otevírat HT3+ tickety."
             )
 
-        # 5b) Automatická role kitu+tieru – po uložení výsledku dostane hráč
-        #     roli nového tieru, staré tiery kitu se odeberou. Volitelné
-        #     `add_role` / `remove_role` byly odebrány: role se odvozují z
-        #     tieru podle business logiky a ruční zásah do rolí nebylo
-        #     auditovatelné (roli mohl tester přidat komukoli, bez stop, a
-        #     nešlo to zjistit později). Změna je tu auditovaná přes
-        #     `commit_confirmed_promotion` v kroku 5d + `audit_logs`.
-        #     Poznámka se připojí k potvrzení.
-        role_note = ""
-        grant = None
-        try:
-            grant = await auto_grant_kit_role(
-                interaction.guild,
-                target_id,
-                kit_key,
-                stored_tier,
-                session_factory=getattr(self.bot, "db_session_factory", None),
-            )
-            role_note = (
-                grant.note if isinstance(grant, TierRoleGrant) else grant
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("Chyba při automatickém udělování role pro %s", target_id)
-
-        # 5d) PostgreSQL mirror (Discord-first) – JEDINÝ kanonický zápis
-        #     povýšení (``db.services.commit_confirmed_promotion``). Tenhle
-        #     gate neopakuje: nepotvrzený/nejistý Discord grant se v něm
-        #     odmítne sám a NIC se do DB nezapíše (invariant 6). Selže-li
-        #     transakce, událost jde do outboxu (promotion_commit,
-        #     discord_role_confirmed=True) a mirror se doplní podle Discordu
-        #     – nikdy naopak.
-        db_note = ""
-        try:
-            from db.services import commit_confirmed_promotion
-
-            wedge = await commit_confirmed_promotion(
-                getattr(self.bot, "db_session_factory", None),
-                grant=grant,
-                result_key=f"result:{record['record'].get('id')}",
-                kind="ticket" if ticket is not None else "queue",
-                discord_id=int(target_id),
-                ign=ign_clean,
-                kit_key=kit_key,
-                new_tier_code=stored_tier,
-                previous_tier_code=(
-                    previous_tier if previous_tier not in ("N/A", "") else None
-                ),
-                score=score,
-                outcome=outcome,
-                evaluator_discord_id=interaction.user.id,
-                ticket_channel_id=(
-                    int(ticket["id"]) if ticket is not None else None
-                ),
-                notes=notes_clean or None,
-                eval_flag=is_eval,
-                date=current_date,
-                close_ticket_channel_id=(
-                    int(ticket["id"]) if ticket is not None else None
-                ),
-                audit_actor_id=interaction.user.id,
-                audit_actor_name=str(interaction.user),
-            )
-            if wedge.message:
-                db_note = f"\n{wedge.message}"
-        except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /result
-            log.exception("PostgreSQL mirror pro %s selhal", target_id)
-
-        # 6) Embed s výsledkem
+        # 7) Embed s výsledkem
         avatar_url = f"https://minotar.net/armor/bust/{ign_clean}/100.png"
         embed = (
             discord.Embed(
@@ -532,7 +550,7 @@ class Results(commands.Cog):
             embed.add_field(name="📝 Poznámky", value=notes_clean, inline=False)
         embed.set_footer(text=current_date)
 
-        # 7) Odeslání výsledku do určeného kanálu podle tieru (jako v originále)
+        # 8) Odeslání výsledku do určeného kanálu podle tieru (jako v originále)
         result_channel_id = get_result_channel_id(stored_tier)
         result_channel = self.bot.get_channel(result_channel_id)
         if result_channel is None and interaction.guild is not None:
@@ -548,7 +566,7 @@ class Results(commands.Cog):
         saved_msg = (
             f"✅ Výsledek uložen do PostgreSQL pro hráče **{ign_clean}** — "
             f"mód **{kit_clean}**, tier **{display_tier}**."
-            "\n🌐 Web se aktualizuje samostatně přes **/websync** "
+            "\n🌐 Web se aktualizuje samostatně přes **/sync web** "
             "(PostgreSQL → players.json export → GitHub) – /result už na "
             "GitHub neposílá."
         )
@@ -572,7 +590,13 @@ class Results(commands.Cog):
 
         if result_channel is not None:
             try:
-                await result_channel.send(content=content, embed=embed)
+                await result_channel.send(
+                    content=content,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=[discord.Object(int(target_id)), discord.Object(interaction.user.id)]
+                    ),
+                )
                 await interaction.followup.send(
                     f"{saved_msg} Odesláno do <#{result_channel_id}>.",
                     ephemeral=True,
@@ -675,11 +699,21 @@ class Results(commands.Cog):
         month="Month format (MM.YYYY, e.g. 06.2026)",
     )
     async def addtest(
-        self, interaction: discord.Interaction, tester: discord.User, amount: int, month: str
+        self,
+        interaction: discord.Interaction,
+        tester: discord.User,
+        amount: app_commands.Range[int, 1, 1000],
+        month: str,
     ) -> None:
         if not has_admin_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
+            )
+        month = month.strip()
+        if not MONTH_RE.match(month):
+            return await interaction.response.send_message(
+                "❌ Neplatný měsíc – použij formát **MM.YYYY** (např. 06.2026).",
+                ephemeral=True,
             )
 
         tester_id = str(tester.id)
@@ -702,7 +736,12 @@ class Results(commands.Cog):
     @app_commands.describe(
         user="Tester, kterému chceš odebrat testy", amount="Počet testů k odebrání"
     )
-    async def removetest(self, interaction: discord.Interaction, user: discord.User, amount: int) -> None:
+    async def removetest(
+        self,
+        interaction: discord.Interaction,
+        user: discord.User,
+        amount: app_commands.Range[int, 1, 1000],
+    ) -> None:
         if not has_admin_role(interaction.user):
             return await interaction.response.send_message(
                 "❌ Pouze pro administrátory.", ephemeral=True
@@ -718,39 +757,6 @@ class Results(commands.Cog):
         await interaction.response.send_message(
             f"📉 Uživatel **{user.name}** ztratil **{amount}** test(ů). "
             f"Nyní má celkem **{updated_total}** testů."
-        )
-
-    # ------------------------------------------------------------------
-    # /removeplayertiers (admin)
-    # ------------------------------------------------------------------
-    @app_commands.command(
-        name="removeplayertiers",
-        description="Odebere hráči všechny aktuální tiery (historie zůstává)",
-    )
-    @app_commands.describe(ign="Minecraft jméno hráče (IGN)")
-    async def removeplayertiers(self, interaction: discord.Interaction, ign: str) -> None:
-        """V PostgreSQL režimu tiery mazat nejde — a nejde to omylem, ne chybou.
-
-        `player_current_tiers` je zrcadlo toho, co potvrzuje Discord, a zrcadlo
-        nemá „clear" operaci: chybějící role je anomálie, kterou má odhalit
-        `/sync check`, ne tichý výmaz. Dřív tu byla JSON větev, která tiery
-        skutečně smazala; kdyby zůstala, `/removeplayertiers` by v produkci
-        tiše neudělal nic a admin by si myslel, že ano. Příkaz proto zůstává
-        (aby se nezmenšilo API), ale už nikdy nemění stav — a říká přesně, jak
-        tier opravdu zrušit.
-        """
-        if not has_admin_role(interaction.user):
-            return await interaction.response.send_message(
-                "❌ Pouze pro administrátory.", ephemeral=True
-            )
-        return await interaction.response.send_message(
-            "❌ **V PostgreSQL režimu nelze tiery mazat.**\n"
-            "Current tier je zrcadlo toho, co potvrzuje Discord, a zrcadlo "
-            "nemá clear operaci (viz `MirrorRepository`: chybějící role je "
-            "anomálie, ne smazání). Tier zrušíš tak, že **odstraníš Discord "
-            "tier roli** a pak spustíš `/sync discord` (Discord → "
-            "PostgreSQL). Historie zůstává nedotčená.",
-            ephemeral=True,
         )
 
 

@@ -22,6 +22,8 @@ from db.config import DatabaseConfigError
 
 log = logging.getLogger("dachshundtiers.db")
 
+MIGRATION_LOCK_KEY = 0x44544D49
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
 
@@ -72,9 +74,24 @@ def upgrade_to_head(sync_url: str) -> tuple[str | None, str]:
     cfg.set_main_option("script_location", str(MIGRATIONS_DIR))
     # ConfigParser interpolation: a URL-encoded password contains '%'.
     cfg.set_main_option("sqlalchemy.url", sync_url.replace("%", "%%"))
-    before = _current()
-    command.upgrade(cfg, "head")
-    return before, _current()
+    # Dvě instance startující naráz (překryv při deployi) nesmí migrovat souběžně:
+    # druhá počká na advisory lock a pak už zjistí, že je schéma na head.
+    lock_engine = create_engine(sync_url)
+    try:
+        with lock_engine.connect() as lock_conn:
+            lock_conn.execute(
+                text("SELECT pg_advisory_lock(:key)"), {"key": MIGRATION_LOCK_KEY}
+            )
+            try:
+                before = _current()
+                command.upgrade(cfg, "head")
+                return before, _current()
+            finally:
+                lock_conn.execute(
+                    text("SELECT pg_advisory_unlock(:key)"), {"key": MIGRATION_LOCK_KEY}
+                )
+    finally:
+        lock_engine.dispose()
 
 
 async def validate_database(engine: AsyncEngine) -> dict:

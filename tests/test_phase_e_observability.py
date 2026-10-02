@@ -194,6 +194,7 @@ async def test_github_error_surface_omits_token(monkeypatch):
     import github_sync
 
     monkeypatch.setattr(github_sync, "GITHUB_TOKEN", FAKE_GITHUB_TOKEN)
+    monkeypatch.setattr(github_sync, "GITHUB_OWNER", "owner")
 
     def boom(*args, **kwargs):
         raise requests.RequestException("boom")

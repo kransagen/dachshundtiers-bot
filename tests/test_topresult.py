@@ -262,7 +262,13 @@ class TopResultCogBridgeTests(unittest.TestCase):
         ) as rec_mock, mock.patch.object(
             cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
         ), mock.patch.object(
-            cm, "auto_grant_kit_role", new=mock.AsyncMock(return_value="")
+            cm,
+            "auto_grant_kit_role",
+            new=mock.AsyncMock(
+                return_value=TierRoleGrant(
+                    ok=True, verified=True, tier_role_id=202, note="ok"
+                )
+            ),
         ) as grant_mock, mock.patch.object(
             cm, "get_ticket", new=mock.AsyncMock(return_value=None)
         ):
@@ -530,8 +536,9 @@ class TopResultDbMirrorTests(unittest.TestCase):
         # žádný dohad: služba dostane grant=None (ne ok/verified za hráče)
         commit_mock.assert_awaited_once()
         self.assertIsNone(commit_mock.await_args.kwargs["grant"])
-        channel.send.assert_awaited_once()
+        channel.send.assert_not_awaited()
         reply = inter.followup.send.await_args.args[0]
+        self.assertIn("nebylo potvrzeno", reply)
         self.assertIn("Tier roli se nepodařilo udělit", reply)
 
     def test_pg_unavailable_real_commit_surfaces_loud_message(self):
@@ -585,6 +592,92 @@ class TopResultDbMirrorTests(unittest.TestCase):
         reply = inter.followup.send.await_args.args[0]
         self.assertIn("PostgreSQL není nakonfigurováno", reply)
         self.assertIn("bez DB nelze ani outbox", reply)
+
+
+class TopResultGuardTests(unittest.TestCase):
+    """Self-result a neověřený soupeř se odmítají ještě před zápisem."""
+
+    CHANNEL_ID = 5555
+    ROLE_ID = 6666
+
+    def setUp(self):
+        self.cm = __import__("cogs.topresult", fromlist=["TopResult"])
+        self._patches = [
+            mock.patch.object(self.cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
+            mock.patch.object(self.cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
+            mock.patch.object(self.cm, "validate_topresult_config", return_value=(True, "")),
+            mock.patch.object(self.cm, "is_registered_kit", return_value=True),
+            mock.patch.object(self.cm, "get_kits", new=mock.AsyncMock(return_value=["MolePVP"])),
+            mock.patch.object(self.cm, "get_ticket", new=mock.AsyncMock(return_value=None)),
+        ]
+        self.rec_mock = mock.AsyncMock()
+        self._patches.append(mock.patch.object(self.cm, "record_ht_fight", new=self.rec_mock))
+        for p in self._patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in self._patches])
+
+    def _call(self, *, author_id, player_id, opponent_id, opponent_is_tester, is_admin=False):
+        cm = self.cm
+        inter = mock.MagicMock()
+        inter.user.id = author_id
+        inter.response.defer = mock.AsyncMock()
+        inter.followup.send = mock.AsyncMock()
+        inter.channel_id = 9999
+        inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
+        inter.guild.get_member.return_value = mock.MagicMock(id=opponent_id)
+        bot = mock.MagicMock()
+        bot.get_channel.return_value = mock.MagicMock()
+        cog = cm.TopResult(bot)
+        hrac = mock.MagicMock(id=player_id, display_name="p", name="p")
+        opp = mock.MagicMock(id=opponent_id, display_name="o", name="o")
+        tester_check = lambda m: m is not None and (  # noqa: E731
+            m is inter.user or opponent_is_tester or m.id == author_id
+        )
+        with mock.patch.object(cm, "has_tester_role", side_effect=tester_check), \
+             mock.patch.object(cm, "has_admin_role", return_value=is_admin):
+            asyncio.run(cog.topresult.callback(
+                cog, interaction=inter, fight_tier="HT3", outcome="Won",
+                score="4-1", opponent=opp, tier_status="x", hrac=hrac,
+                ign="mendu__", kit="MolePVP",
+            ))
+        return inter
+
+    def test_tester_cannot_write_result_for_self(self):
+        inter = self._call(author_id=1, player_id=1, opponent_id=2, opponent_is_tester=True)
+        self.assertIn("sám sobě", inter.followup.send.await_args.args[0])
+        self.rec_mock.assert_not_awaited()
+
+    def test_opponent_must_be_a_tester(self):
+        inter = self._call(author_id=5, player_id=1, opponent_id=2, opponent_is_tester=False)
+        self.assertIn("Soupeř musí být tester", inter.followup.send.await_args.args[0])
+        self.rec_mock.assert_not_awaited()
+
+    def test_author_may_be_the_opponent(self):
+        self.rec_mock.return_value = {"result": "invalid_tier", "message": "stop"}
+        self._call(author_id=5, player_id=1, opponent_id=5, opponent_is_tester=False)
+        self.rec_mock.assert_awaited_once()
+
+
+class RetryViewDoubleClickTests(unittest.TestCase):
+    def test_second_click_while_sending_is_ignored(self):
+        cm = __import__("cogs.topresult", fromlist=["HTFightRetryView"])
+
+        async def main():
+            channel = mock.MagicMock()
+            channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=1))
+            view = cm.HTFightRetryView(
+                result_id="x", result_channel=channel, content="c",
+                allowed_mentions=None, session_factory=None,
+            )
+            view._sending = True
+            inter = mock.MagicMock()
+            inter.response.defer = mock.AsyncMock()
+            with mock.patch.object(cm, "has_tester_role", return_value=True):
+                await view.retry.callback(inter)
+            channel.send.assert_not_awaited()
+            inter.response.defer.assert_awaited_once()
+
+        asyncio.run(main())
 
 
 if __name__ == "__main__":

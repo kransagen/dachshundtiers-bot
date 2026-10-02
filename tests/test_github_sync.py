@@ -40,9 +40,10 @@ def _merge(players, ign="adurytak", mode="AnchorPvP", tier="HT5"):
 
 class GithubSyncTests(unittest.TestCase):
     def setUp(self):
-        patch = mock.patch.object(github_sync, "GITHUB_TOKEN", "test-token")
-        patch.start()
-        self.addCleanup(patch.stop)
+        for name, value in (("GITHUB_TOKEN", "test-token"), ("GITHUB_OWNER", "owner")):
+            patch = mock.patch.object(github_sync, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
 
     def test_push_success(self):
         async def main():
@@ -149,6 +150,112 @@ class GithubSyncTests(unittest.TestCase):
                 self.assertIsNone(err)
 
         asyncio.run(main())
+
+    def test_fetch_players_large_file_falls_back_to_raw(self):
+        large = SimpleNamespace(status_code=200, json=lambda: {"content": "", "sha": "s9"})
+        raw = SimpleNamespace(status_code=200, text=json.dumps([{"a": 1}]))
+
+        async def main():
+            with mock.patch.object(
+                github_sync.requests, "get", side_effect=[large, raw]
+            ) as g:
+                players, sha, err = await github_sync.fetch_players()
+                self.assertEqual((players, sha, err), ([{"a": 1}], "s9", None))
+                self.assertEqual(
+                    g.call_args.kwargs["headers"]["Accept"],
+                    "application/vnd.github.raw+json",
+                )
+
+        asyncio.run(main())
+
+    def test_fetch_players_malformed_response_returns_error(self):
+        bad = SimpleNamespace(status_code=200, json=lambda: [])
+
+        async def main():
+            with mock.patch.object(github_sync.requests, "get", return_value=bad):
+                players, sha, err = await github_sync.fetch_players()
+                self.assertIsNone(players)
+                self.assertIn("poškozený", err)
+
+        asyncio.run(main())
+
+    def test_get_retries_on_rate_limit_and_server_error(self):
+        limited = SimpleNamespace(
+            status_code=429, json=lambda: {}, headers={"Retry-After": "2"}
+        )
+        broken = SimpleNamespace(status_code=503, json=lambda: {})
+
+        async def main():
+            with (
+                mock.patch.object(
+                    github_sync.requests, "get",
+                    side_effect=[limited, broken, _get_ok([{"a": 1}], "s1")],
+                ) as g,
+                mock.patch.object(github_sync.time, "sleep") as sleep,
+            ):
+                players, _sha, err = await github_sync.fetch_players()
+                self.assertEqual(players, [{"a": 1}])
+                self.assertIsNone(err)
+                self.assertEqual(g.call_count, 3)
+                self.assertEqual([c.args[0] for c in sleep.call_args_list], [2.0, 2.0])
+
+        asyncio.run(main())
+
+    def test_get_gives_up_after_max_attempts(self):
+        async def main():
+            with (
+                mock.patch.object(
+                    github_sync.requests, "get",
+                    return_value=SimpleNamespace(status_code=502, json=lambda: {}),
+                ) as g,
+                mock.patch.object(github_sync.time, "sleep"),
+            ):
+                players, _sha, err = await github_sync.fetch_players()
+                self.assertIsNone(players)
+                self.assertIn("502", err)
+                self.assertEqual(g.call_count, github_sync.MAX_HTTP_ATTEMPTS)
+
+        asyncio.run(main())
+
+    def test_plain_403_is_not_retried(self):
+        async def main():
+            with mock.patch.object(
+                github_sync.requests, "get",
+                return_value=SimpleNamespace(status_code=403, json=lambda: {}),
+            ) as g:
+                players, _sha, err = await github_sync.fetch_players()
+                self.assertIsNone(players)
+                self.assertEqual(g.call_count, 1)
+
+        asyncio.run(main())
+
+    def test_put_422_without_sha_is_treated_as_conflict(self):
+        async def main():
+            with (
+                mock.patch.object(
+                    github_sync.requests, "get",
+                    side_effect=[_get_404(), _get_ok([], "sha2")],
+                ),
+                mock.patch.object(
+                    github_sync.requests, "put", side_effect=[_put(422), _put(200)]
+                ) as p,
+            ):
+                ok, _msg, _built = await github_sync.push_players("msg", _merge)
+                self.assertTrue(ok)
+                self.assertEqual(p.call_count, 2)
+
+        asyncio.run(main())
+
+    def test_push_without_owner_is_refused(self):
+        with mock.patch.object(github_sync, "GITHUB_OWNER", ""):
+
+            async def main():
+                ok, msg, built = await github_sync.push_players("msg", _merge)
+                self.assertFalse(ok)
+                self.assertIn("GITHUB_OWNER", msg)
+                self.assertIsNone(built)
+
+            asyncio.run(main())
 
     def test_push_applies_merge_to_fresh_data(self):
         """build_fn běží nad čerstvě staženými daty (ne nad starou lokální kopií)."""

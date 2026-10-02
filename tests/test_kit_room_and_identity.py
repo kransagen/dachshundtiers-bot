@@ -33,6 +33,7 @@ from db.models import (
 )
 from db.repositories.evaluations import EvaluationRepository
 from db.repositories.evaluations import TesterRepository as _TesterRepo  # noqa: F401
+from db.repositories.identity import PlayerAlreadyLinked, PlayerIdentityRepository
 from db.repositories.kits import KitRepository, KitTesterRoomRepository
 from db.repositories.queues import (
     QUEUE_ENTRY_PULLED,
@@ -548,6 +549,50 @@ class TestMinecraftLink:
                 with pytest.raises(IntegrityError):
                     second.minecraft_account_id = account.id
                     await s.flush()
+
+    async def test_code_is_case_insensitive(self, session_factory, clean_db):
+        """The code is documented as case-insensitive; lowercase input works."""
+        await self._player(session_factory)
+        code = await start_link(500, session_factory=session_factory)
+        status = await complete_link(
+            f"  {code.lower()} ", UUID_A, session_factory=session_factory
+        )
+        assert status.linked and status.uuid == UUID_A
+
+    async def test_player_linked_elsewhere_is_not_silently_repointed(
+        self, session_factory, clean_db
+    ):
+        """A linked player cannot be moved to another UUID without /unlink."""
+        await self._player(session_factory)
+        first = await start_link(500, session_factory=session_factory)
+        await complete_link(first, UUID_A, session_factory=session_factory)
+
+        second = await start_link(500, session_factory=session_factory)
+        with pytest.raises(LinkError) as err:
+            await complete_link(second, UUID_B, session_factory=session_factory)
+        assert err.value.code == "already_linked"
+
+        status = await link_status(500, session_factory=session_factory)
+        assert status.uuid == UUID_A
+        with pytest.raises(LinkError) as reuse:
+            await complete_link(second, UUID_B, session_factory=session_factory)
+        assert reuse.value.code == "unknown_code"
+
+    async def test_repository_link_refuses_a_different_account(
+        self, session_factory, clean_db
+    ):
+        async with session_factory() as s:
+            async with s.begin():
+                one = MinecraftAccount(uuid=UUID_A, name="One")
+                two = MinecraftAccount(uuid=UUID_C, name="Two")
+                s.add_all([one, two])
+                player = await _player(s, discord_id=900, ign="Linked")
+                await s.flush()
+                repo = PlayerIdentityRepository()
+                await repo.link(s, player_id=player.id, account_id=one.id)
+                await repo.link(s, player_id=player.id, account_id=one.id)
+                with pytest.raises(PlayerAlreadyLinked):
+                    await repo.link(s, player_id=player.id, account_id=two.id)
 
     async def test_link_status_reflects_state(self, session_factory, clean_db):
         await self._player(session_factory)

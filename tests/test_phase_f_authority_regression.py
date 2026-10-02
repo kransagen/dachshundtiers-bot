@@ -3,8 +3,8 @@
 Regresní testy A–F z Phase F review:
   A) players.json má jiný current tier než Discord → "DB" v analýze je PG mirror
   B) players.json je nepřístupný → DB-backed operace fungují dál
-  C) importdiscord / checkweb nemůžou změnit Discord role
-  D) importdiscord / checkweb nemůžou nastavit authoritative PG current tier
+  C) /sync discord / /sync check nemůžou změnit Discord role
+  D) /sync discord zapisuje PG current tier jen z Discordu (ne z JSON)
   E) žádná cesta JSON → Discord
   F) žádná cesta JSON → authoritative PG current tier
 """
@@ -23,17 +23,12 @@ from sqlalchemy import select
 
 import cogs.sync as sync_mod
 import storage
-from cogs.sync import (
-    CheckWebApplyView,
-    SyncImportDiscordConfirmView,
-    _canonical_players,
-    _gather_checkweb,
-)
+from cogs.sync import SyncDiscordConfirmView, _canonical_players
 from db.models import Kit, PlayerCurrentTier, TierDefinition
 from db.repositories.kits import KitRoleRepository, ensure_dimensions
 from db.repositories.players import PlayerRepository
 from db.services.session import transaction
-from services.checkweb import analyze_checkweb, build_discord_import_decisions
+from services.checkweb import analyze_checkweb
 from services.datacheck import perform_repairs
 from services.phase_e.authority_scan import (
     AUTHORIZED_MUTATION_SITES,
@@ -206,9 +201,7 @@ async def test_a_json_tier_never_wins_over_pg_mirror(session_factory, clean_db, 
     assert record["db"] == "T2", "sloupec db musí být PG mirror"
     assert record["discord"] == ["T3"]
 
-    decisions, _ = build_discord_import_decisions(analysis["records"])
-    assert [d["tier"] for d in decisions] == ["T3"]
-    assert decisions[0]["player"] == IGN
+    assert record["status"] == "DATABASE_MISMATCH"
 
     tiers = await _pg_tiers(session_factory, seeded["player"].id, seeded["kit"].id)
     assert tiers == ["t2"]
@@ -243,15 +236,19 @@ async def test_b_checkweb_never_reads_json_in_db_mode(session_factory, clean_db,
     async def _members(_guild):
         return []
 
+    cog = sync_mod.Sync(mock.Mock(db_session_factory=session_factory))
+    inter = _interaction(session_factory)
     with (
-        mock.patch.object(sync_mod, "load_data", _boom),
+        mock.patch.object(storage, "load_data", _boom),
         mock.patch.object(sync_mod, "guild_members", _members),
         mock.patch.object(sync_mod, "_fetch_website", _no_web),
+        mock.patch.object(sync_mod, "log_checkweb_event", _audit_sink()),
+        mock.patch.object(sync_mod, "_db_health_embed", _returns([])),
+        mock.patch.object(sync_mod, "admin_gate_error", lambda _i: None),
     ):
-        analysis = await _gather_checkweb(mock.Mock(id=1), session_factory=session_factory)
+        await cog._run_check(inter)
 
-    assert analysis["kit_display"] == {"ht3": "HT3"}, "role map musí jít z DB"
-    assert "records" in analysis and "summary" in analysis
+    inter.followup.send.assert_awaited()
 
 
 @pytest.mark.asyncio
@@ -280,13 +277,12 @@ async def test_b3_perform_repairs_refuses_tier_normalization(pg_mode):
 
 
 # ---------------------------------------------------------------------------
-# C) importdiscord / checkweb nemůžou změnit Discord role
+# C) /sync discord / /sync check nemůžou změnit Discord role
 # ---------------------------------------------------------------------------
 def test_c_views_have_no_role_mutation():
-    for cls in (SyncImportDiscordConfirmView, CheckWebApplyView):
-        src = inspect.getsource(cls)
-        for token in ROLE_MUTATION_TOKENS:
-            assert token not in src, f"{cls.__name__} nesmí mutovat role ({token})"
+    src = inspect.getsource(SyncDiscordConfirmView)
+    for token in ROLE_MUTATION_TOKENS:
+        assert token not in src, f"SyncDiscordConfirmView nesmí mutovat role ({token})"
 
 
 def test_c2_sync_cog_is_observe_only():
@@ -304,79 +300,37 @@ def test_c3_mutation_surface_still_exactly_authorized():
 
 
 # ---------------------------------------------------------------------------
-# D) importdiscord / checkweb nemůžou nastavit authoritative PG current tier
+# D) /sync discord zapisuje PG current tier jen z Discordu
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
-async def test_d_checkweb_apply_persists_nothing(session_factory, clean_db, pg_mode):
-    _seed_json_shadow("t1")
-    seeded, _canonical, analysis = await _analysis(session_factory)
-    record = _ht3_record(analysis)
-
-    view = CheckWebApplyView(
-        guild=mock.Mock(id=1),
-        records=analysis["records"],
-        fingerprint=analysis["fingerprint"],
-        # Shape must match CheckWebApplyView.on_decision's real decisions
-        # dict: key f"{player}|{kit_key}", value a dict with
-        # player/kit_key/decision/tier/label — a bare string value (as this
-        # fixture previously had) crashes apply_checkweb_decisions with
-        # AttributeError, a pre-existing test bug this never ran far enough
-        # to hit before the M6 fix.
-        decisions={
-            f"{record['player']}|{record['kit_key']}": {
-                "player": record["player"],
-                "kit_key": record["kit_key"],
-                "decision": "use_discord",
-                "tier": (record.get("discord") or [None])[0],
-                "label": "Use Discord",
-            }
-        },
-    )
-    with (
-        mock.patch.object(sync_mod, "_gather_checkweb", _returns(analysis)),
-        mock.patch.object(sync_mod, "log_checkweb_event", _audit_sink()),
-        mock.patch.object(sync_mod, "sync_website", _no_web),
-        mock.patch.object(sync_mod, "admin_gate_error", lambda _i: None),
-    ):
-        # on_apply is a plain method (no button param) — see cogs/sync.py.
-        await view.on_apply(_interaction(session_factory))
-
-    assert _json_shadow()[0]["modes"]["HT3"] == "t1", "JSONB stín se nesměl změnit"
-    tiers = await _pg_tiers(session_factory, seeded["player"].id, seeded["kit"].id)
-    assert tiers == ["t2"], "PG mirror se nesměl změnit"
-    assert view.finished is True
-
-
-@pytest.mark.asyncio
-async def test_d2_importdiscord_confirm_persists_nothing(
+async def test_d_sync_discord_writes_mirror_from_discord_not_json(
     session_factory, clean_db, pg_mode
 ):
     _seed_json_shadow("t1")
-    seeded, _canonical, analysis = await _analysis(session_factory)
+    seeded = await _seed(session_factory)
+    await _add_mirror_row(session_factory, seeded, "t2")
 
-    view = SyncImportDiscordConfirmView(guild=mock.Mock(id=1), analysis=analysis)
+    async def _members(_guild):
+        return [MemberView(id=1111, role_ids=(ROLE_ID,))]
+
+    view = SyncDiscordConfirmView()
     with (
-        mock.patch.object(sync_mod, "_gather_checkweb", _returns(analysis)),
-        mock.patch.object(sync_mod, "log_checkweb_event", _audit_sink()),
-        mock.patch.object(sync_mod, "sync_website", _no_web),
+        mock.patch.object(sync_mod, "guild_members", _members),
         mock.patch.object(sync_mod, "admin_gate_error", lambda _i: None),
     ):
-        # discord.ui.button-decorated method — call via .callback like the
-        # rest of the suite (e.g. tests/test_sync_rollback.py), not directly.
         await view.confirm.callback(_interaction(session_factory))
 
-    assert _json_shadow()[0]["modes"]["HT3"] == "t1"
+    assert _json_shadow()[0]["modes"]["HT3"] == "t1", "JSONB stín se nesměl změnit"
     tiers = await _pg_tiers(session_factory, seeded["player"].id, seeded["kit"].id)
-    assert tiers == ["t2"]
+    assert tiers == ["t3"], "mirror následuje Discord, nikdy JSON"
     assert view.finished is True
 
 
-def test_d3_no_persistence_left_in_views():
-    for cls in (SyncImportDiscordConfirmView, CheckWebApplyView):
-        src = inspect.getsource(cls)
-        assert "save_players" not in src
-        assert "sync_website" not in src
-        assert "tx.set" not in src
+def test_d2_no_persistence_left_in_views():
+    src = inspect.getsource(SyncDiscordConfirmView)
+    assert "save_players" not in src
+    assert "sync_website" not in src
+    assert "tx.set" not in src
 
 
 # ---------------------------------------------------------------------------

@@ -8,9 +8,9 @@ validation failures, aggregate/result_key mismatch, consume_many batching.
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from db.models import AuditLog, Result, TierHistory
+from db.models import AuditLog, OutboxEvent, Result, TierHistory
 from db.repositories.outbox import (
     OUTBOX_DEAD_LETTER,
     OUTBOX_DONE,
@@ -34,6 +34,11 @@ from db.services.promotion import (
     enqueue_promotion_wedge,
 )
 from db.services.session import transaction
+
+
+async def _skip_backoff(session_factory):
+    async with transaction(session_factory) as session:
+        await session.execute(update(OutboxEvent).values(next_attempt_at=None))
 
 
 async def _seed(session_factory):
@@ -200,6 +205,7 @@ async def test_consume_unconfirmed_retries_until_dead_letter(
     consumer = OutboxConsumer()
     outcomes = []
     for _ in range(5):
+        await _skip_backoff(session_factory)
         consumption = await consumer.consume_one(session_factory)
         assert consumption is not None
         outcomes.append(consumption.outcome)
@@ -222,6 +228,7 @@ async def test_consume_dead_letters_after_max_attempts(session_factory, clean_db
     consumer = OutboxConsumer()
     outcomes = []
     for _ in range(5):
+        await _skip_backoff(session_factory)
         consumption = await consumer.consume_one(session_factory)
         assert consumption is not None
         outcomes.append(consumption.outcome)
@@ -421,6 +428,7 @@ async def test_consume_unresolved_payload_retries_then_succeeds_once_dimension_e
         events = await OutboxRepository().list_by_status(session, status=OUTBOX_PENDING)
     assert len(events) == 1 and events[0].attempts == 1
 
+    await _skip_backoff(session_factory)
     # Admin registers the missing dimensions.
     async with transaction(session_factory) as session:
         await ensure_dimensions(
@@ -443,3 +451,54 @@ async def test_consume_unresolved_payload_retries_then_succeeds_once_dimension_e
         )
     assert result.promotion_status == "committed"
     assert mirror is not None and mirror.source == "promotion"
+
+async def test_failed_event_waits_out_backoff_instead_of_burning_all_attempts(
+    session_factory, clean_db
+):
+    await _seed(session_factory)
+    await enqueue_promotion_wedge(
+        session_factory,
+        result_key="promo-backoff",
+        payload={"result_key": "promo-backoff", "kind": "ticket"},
+        discord_role_confirmed=True,
+    )
+    consumed = await OutboxConsumer().consume_many(session_factory, max_events=10)
+    assert [c.outcome for c in consumed] == [CONSUMED_RETRY]
+
+    async with transaction(session_factory) as session:
+        event = (await session.execute(select(OutboxEvent))).scalar_one()
+    assert event.status == OUTBOX_PENDING
+    assert event.attempts == 1
+    assert event.next_attempt_at > datetime.now(timezone.utc)
+
+    await _skip_backoff(session_factory)
+    again = await OutboxConsumer().consume_one(session_factory)
+    assert again is not None and again.attempts == 2
+
+
+async def test_crash_looping_event_is_dead_lettered_on_reclaim(session_factory, clean_db):
+    await _seed(session_factory)
+    await enqueue_promotion_wedge(
+        session_factory,
+        result_key="promo-poison",
+        payload={"result_key": "promo-poison", "kind": "ticket"},
+        discord_role_confirmed=True,
+    )
+    stale = datetime.now(timezone.utc) - timedelta(hours=1)
+    async with transaction(session_factory) as session:
+        await session.execute(
+            update(OutboxEvent).values(
+                status="in_progress", claimed_at=stale, attempts=5
+            )
+        )
+    assert (
+        await OutboxConsumer().consume_one(
+            session_factory, in_progress_before=default_stale_cutoff()
+        )
+        is None
+    )
+    async with transaction(session_factory) as session:
+        dead = await OutboxRepository().list_by_status(
+            session, status=OUTBOX_DEAD_LETTER
+        )
+    assert [e.aggregate_id for e in dead] == ["promo-poison"]

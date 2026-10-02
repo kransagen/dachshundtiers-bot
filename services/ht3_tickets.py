@@ -2,12 +2,10 @@
 
 Why this module exists separately from ``services/tickets.py``
 -------------------------------------------------------------
-``services/tickets.py`` still carries the legacy JSON branch for every
-operation (the ``session_factory is None`` path), and it is the file that gets
-deleted when the JSON backend goes away. New logic that must not be entangled
-with that legacy code lives here, database-only from the start: a feature that
-silently worked in two backends is exactly the thing that makes removing one
-risky.
+``services/tickets.py`` holds the ticket lifecycle (create / claim / close /
+reopen …) and the ladder helpers. The decision "who may open an HT3 ticket and
+with which values" is a separate, read-only concern: it is derived entirely from
+the database and has no write path of its own, so it lives here.
 
 Business rules
 --------------
@@ -34,6 +32,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from datetime import datetime, timezone
+
+from db.repositories.cooldowns import COOLDOWN_HT3, CooldownRepository
 from db.repositories.evaluations import EvaluationRepository
 from db.repositories.identity import PlayerIdentityRepository
 from db.repositories.kits import KitRepository, TierDefinitionRepository
@@ -246,6 +247,7 @@ class EvalTicketRequest:
     current_tier: Optional[str] = None
     target_tier: Optional[str] = None
     open_ticket: Optional[dict] = None
+    remaining_ms: Optional[int] = None
 
 
 async def ensure_eval_ticket(ign: str, kit: str, *, session_factory) -> EvalTicketRequest:
@@ -276,6 +278,8 @@ async def ensure_eval_ticket(ign: str, kit: str, *, session_factory) -> EvalTick
         kit_row = await _resolve_kit(session, kit_key)
         if kit_row is None:
             return EvalTicketRequest(needs_ticket=False, reason="no_kit")
+        if player.discord_id is None:
+            return EvalTicketRequest(needs_ticket=False, reason="no_discord")
 
         open_rows = await TicketRepository().list_open(
             session, player_id=player.id, kit_id=kit_row.id
@@ -286,6 +290,24 @@ async def ensure_eval_ticket(ign: str, kit: str, *, session_factory) -> EvalTick
                 reason="already_open",
                 discord_id=player.discord_id,
                 open_ticket=await _db_ticket_to_dict(session, open_rows[0]),
+            )
+
+        now = datetime.now(timezone.utc)
+        cooldowns = await CooldownRepository().get_active(
+            session,
+            player_id=player.id,
+            cooldown_type=COOLDOWN_HT3,
+            kit_id=kit_row.id,
+            now=now,
+        )
+        if cooldowns:
+            return EvalTicketRequest(
+                needs_ticket=False,
+                reason="cooldown",
+                discord_id=player.discord_id,
+                remaining_ms=int(
+                    (cooldowns[0].expires_at - now).total_seconds() * 1000
+                ),
             )
 
         # An eval lifts the player to at most the HT3 rung (the ladder rule

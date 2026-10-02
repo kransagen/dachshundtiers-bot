@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import and_, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import (
@@ -242,22 +243,23 @@ async def record_peak(
 ) -> bool:
     """Zapíše peak, jen pokud je vyšší než stávající. ``True`` = změna."""
     tier = await session.get(TierDefinition, tier_id)
-    existing = (
-        await session.execute(
-            select(PlayerPeakTier).where(
-                PlayerPeakTier.player_id == player_id, PlayerPeakTier.kit_id == kit_id
-            )
-        )
-    ).scalar_one_or_none()
+    stmt = select(PlayerPeakTier).where(
+        PlayerPeakTier.player_id == player_id, PlayerPeakTier.kit_id == kit_id
+    )
+    existing = (await session.execute(stmt)).scalar_one_or_none()
     if existing is None:
-        session.add(
-            PlayerPeakTier(
-                player_id=player_id, kit_id=kit_id, tier_id=tier_id,
-                reason=reason, achieved_at=now,
-            )
-        )
-        await session.flush()
-        return True
+        try:
+            async with session.begin_nested():
+                session.add(
+                    PlayerPeakTier(
+                        player_id=player_id, kit_id=kit_id, tier_id=tier_id,
+                        reason=reason, achieved_at=now,
+                    )
+                )
+                await session.flush()
+            return True
+        except IntegrityError:
+            existing = (await session.execute(stmt)).scalar_one()
     current = await session.get(TierDefinition, existing.tier_id)
     if (tier.rank or 0) <= (current.rank or 0):
         return False
@@ -366,6 +368,21 @@ async def commit_retire(session_factory, plan: RetirePlan, *, actor_name: str) -
     """Zapíše retire do zrcadla + historie a peak. Volat PO změně rolí na Discordu."""
     now = _utcnow()
     async with transaction(session_factory) as session:
+        mirror = (
+            await session.execute(
+                select(PlayerCurrentTier)
+                .where(
+                    PlayerCurrentTier.player_id == plan.player_id,
+                    PlayerCurrentTier.kit_id == plan.kit_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if mirror is None or mirror.tier_id != plan.tier_id:
+            raise RetireRefused(
+                f"❌ Tvůj tier v kitu **{plan.kit_name}** se mezitím změnil – "
+                "zopakuj `/retire`."
+            )
         await MirrorServiceRepository().apply_observation(
             session, player_id=plan.player_id, kit_id=plan.kit_id,
             tier_id=plan.retired_tier_id, observed_at=now, source=SOURCE_RETIRE,

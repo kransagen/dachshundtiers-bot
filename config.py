@@ -94,8 +94,19 @@ def _dict_env(name: str, default: dict) -> dict:
 # --- Discord -------------------------------------------------------------
 DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
 
+def _guild_id_env() -> Optional[int]:
+    raw = os.getenv("GUILD_ID", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw) or None
+    except ValueError:
+        raise SystemExit(f"❌ GUILD_ID musí být číslo (ID serveru), nyní: {raw!r}.")
+
+
 # Pokud je zadáno, příkazy se registrují jen na tomto serveru (rychlejší vývoj).
-GUILD_ID: Optional[int] = _int_env("GUILD_ID", 0) or None
+# Neplatná (nečíselná) hodnota ukončí start místo tichého globálního režimu.
+GUILD_ID: Optional[int] = _guild_id_env()
 
 # --- Cooldowny (v ms, stejně jako v originále) ----------------------------
 PLAYER_COOLDOWN_MS: int = 4 * 24 * 60 * 60 * 1000  # 4 dny mezi tier testy hráče
@@ -168,7 +179,8 @@ _DEFAULT_QUEUE_CHANNELS = {
 QUEUE_CHANNELS: dict[str, int] = _dict_env("QUEUE_CHANNELS_JSON", _DEFAULT_QUEUE_CHANNELS)
 
 # --- Role testera ---------------------------------------------------------
-# Stačí, aby název role OBSAHOVAL tento řetězec (case-insensitive).
+# Záložní režim bez TESTER_ROLE_IDS: stačí, aby název role OBSAHOVAL tento
+# řetězec (case-insensitive). Bot při startu varuje – nastav raději TESTER_ROLE_IDS.
 TESTER_ROLE_FRAGMENT: str = os.getenv("TESTER_ROLE_FRAGMENT", "tester")
 
 # Bezpečnější allowlist testerů podle ID role (např. "111111,222222").
@@ -183,7 +195,7 @@ ADMIN_ROLE_IDS: list = _int_list_env("ADMIN_ROLE_IDS")
 
 # --- GitHub synchronizace (volitelné) --------------------------------------
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
-GITHUB_OWNER: str = os.getenv("GITHUB_OWNER", "adrison99")
+GITHUB_OWNER: str = os.getenv("GITHUB_OWNER", "")
 GITHUB_REPO: str = os.getenv("GITHUB_REPO", "DachshundTiers")
 GITHUB_FILE_PATH: str = os.getenv("GITHUB_FILE_PATH", "players.json")
 

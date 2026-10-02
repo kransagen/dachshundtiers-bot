@@ -646,6 +646,15 @@ async def test_case5_identity_conflict_after_discord_wedges_unresolved(
     ]
 
 
+async def _skip_backoff(session_factory):
+    from sqlalchemy import update
+
+    from db.models import OutboxEvent
+
+    async with db_transaction(session_factory) as session:
+        await session.execute(update(OutboxEvent).values(next_attempt_at=None))
+
+
 async def test_case5_unresolved_wedge_still_needs_a_human_fix(
     session_factory, clean_db
 ):
@@ -668,6 +677,7 @@ async def test_case5_unresolved_wedge_still_needs_a_human_fix(
 
     seen = []
     for _ in range(12):
+        await _skip_backoff(session_factory)
         consumed = await OutboxConsumer().consume_one(session_factory)
         if consumed is None:
             break
@@ -996,6 +1006,7 @@ async def test_repeated_replay_failure_dead_letters(session_factory, clean_db):
             session_factory, grant=_grant(), **_commit_kwargs()
         )
         for _ in range(12):
+            await _skip_backoff(session_factory)
             consumed = await OutboxConsumer().consume_one(session_factory)
             if consumed is None:
                 break

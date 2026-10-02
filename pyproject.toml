@@ -1,16 +1,26 @@
 # Lokální i CI konfigurace nástrojů (ruff). Projekt nemá balíčkový build –
 # sekce slouží jen nástrojům, ne instalaci.
 #
-# select = E4,E7,E9,F (pyflakes + parciální pycodestyle), protože ruff 0.16+
-# mění VÝCHOZÍ sadu pravidel mezi verzemi. Explicitní select drží CI
-# deterministické. E501 (délka řádku) se záměrně nepoužívá – kód má řádky
-# až 131 znaků (embed zprávy) a line-length je čistě kosmetika.
+# select je explicitní, protože ruff 0.16+ mění VÝCHOZÍ sadu pravidel mezi
+# verzemi. Explicitní select drží CI deterministické. E501 (délka řádku) se
+# záměrně nepoužívá – kód má řádky až 131 znaků (embed zprávy).
+#   E4/E7/E9/F  pyflakes + parciální pycodestyle
+#   B           flake8-bugbear (chytá reálné chyby)
+#   ASYNC       blokující volání v async funkcích
+# Ignorované B pravidla mají v kódu existující výskyty (styl, ne chyby);
+# lze je postupně odstranit a z ignore vyřadit.
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "B", "ASYNC"]
+ignore = ["B904", "B007", "B008", "B017", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# Testy a jednorázové CLI nástroje smí v async kódu blokovat (soubory, subprocess).
+"tests/*" = ["ASYNC", "B033"]
+"tools/*" = ["ASYNC"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["bot", "panel", "storage", "utils", "views", "config", "github_sync", "main", "db"]

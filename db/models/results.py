@@ -72,6 +72,7 @@ class Result(Base):
             desc("recorded_at"),
         ),
         Index("ix_results_ticket", "ticket_channel_id"),
+        Index("ix_results_evaluator", "evaluator_id"),
         Index(
             "ix_results_promo",
             "promotion_status",

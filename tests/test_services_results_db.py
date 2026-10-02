@@ -10,14 +10,18 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from db.models import AuditLog, TierDefinition
+from db.models import AuditLog, Result, TierDefinition
 from db.repositories.cooldowns import COOLDOWN_HT3, COOLDOWN_WAITLIST, CooldownRepository
 from db.repositories.kits import KitRepository, ensure_dimensions
 from db.repositories.players import PlayerRepository
 from db.repositories.results import PROMOTION_COMMITTED, PROMOTION_DISCORD_PENDING
 from db.repositories.results import ResultRepository
 from db.repositories.tiers import MirrorServiceRepository
-from db.services.promotion import PromotionCommitService
+from db.services.promotion import (
+    CooldownSpec,
+    PromotionCommitService,
+    commit_promotion_with_wedge,
+)
 from db.services.session import transaction
 from services import results as rsvc
 from services import tickets as tsvc
@@ -87,7 +91,6 @@ async def _record(session_factory, **kw):
         now=NOW_MS,
         date="2025-11-15",
         queue_cooldown_ms=QUEUE_COOLDOWN_MS,
-        ht3_cooldown_ms=HT3_COOLDOWN_MS,
         session_factory=session_factory,
     )
     defaults.update(kw)
@@ -108,9 +111,57 @@ async def _ht3_active(session, player_id: int, kit_id: int):
     )
 
 
+async def _commit(session_factory, record, *, ticket_id=None, tier="LT4", kit_key="ht3"):
+    """Simuluje potvrzený Discord grant: commit + cooldowny + zavření ticketu."""
+    cooldowns = [CooldownSpec(COOLDOWN_WAITLIST, _dt(NOW_MS + QUEUE_COOLDOWN_MS))]
+    if ticket_id is not None:
+        cooldowns.append(CooldownSpec(COOLDOWN_HT3, _dt(NOW_MS + HT3_COOLDOWN_MS)))
+    outcome = await commit_promotion_with_wedge(
+        session_factory,
+        result_key=f"result:{record['id']}",
+        kind="ticket" if ticket_id is not None else "queue",
+        discord_id=int(record["playerId"]),
+        ign=record["ign"],
+        kit_key=kit_key,
+        new_tier_code=tier,
+        discord_role_id=1,
+        previous_tier_code=None,
+        evaluator_discord_id=200,
+        ticket_channel_id=ticket_id,
+        close_ticket_channel_id=ticket_id,
+        recorded_at=_dt(NOW_MS),
+        cooldowns=tuple(cooldowns),
+        audit_actor_id=200,
+        audit_actor_name="Tester",
+    )
+    assert outcome.committed
+    return outcome
+
+
+async def _seed_mirror(session_factory, code, *, discord_id=100):
+    async with transaction(session_factory) as session:
+        kit = await KitRepository().get_by_key(session, "ht3")
+        _o, player = await PlayerRepository().claim_discord_id(
+            session, discord_id=discord_id, ign=f"Owner{discord_id}"
+        )
+        tier = (
+            await session.execute(
+                select(TierDefinition).where(TierDefinition.code == code)
+            )
+        ).scalar_one()
+        await MirrorServiceRepository().apply_observation(
+            session,
+            player_id=player.id,
+            kit_id=kit.id,
+            tier_id=tier.id,
+            observed_at=_dt(NOW_MS - 60_000),
+            source="discord_sync",
+        )
+
+
 # --- /result (results.py) ---------------------------------------------------
 
-async def test_record_result_ticket_created_closes_and_cooldowns(
+async def test_record_result_ticket_created_defers_close_and_cooldowns_to_commit(
     session_factory, clean_db
 ):
     await _seed(session_factory)
@@ -138,6 +189,17 @@ async def test_record_result_ticket_created_closes_and_cooldowns(
     assert rec["resultType"] == "normal"
     assert rec["timestamp"] == NOW_MS
     assert rec["date"] == "2025-11-15"
+
+    t = await tsvc.get_ticket(111, session_factory=session_factory)
+    assert t["status"] == "open"
+    async with transaction(session_factory) as session:
+        player = await PlayerRepository().get_by_discord_id(session, 100)
+        assert not await CooldownRepository().get_active(
+            session, player_id=player.id, cooldown_type=COOLDOWN_WAITLIST,
+            now=_dt(NOW_MS),
+        )
+
+    await _commit(session_factory, rec, ticket_id=111)
 
     t = await tsvc.get_ticket(111, session_factory=session_factory)
     assert t["status"] == "closed"
@@ -239,6 +301,7 @@ async def test_record_result_queue_created_and_duplicate_via_cooldown(
     assert r["record"]["id"].startswith("queue-")
     assert r["record"]["kind"] == "queue"
     assert r["record"]["ticketId"] is None
+    await _commit(session_factory, r["record"])
     r2 = await _record(session_factory, ticket_id=None)
     assert r2["result"] == "duplicate"
     assert r2["existing"]["id"] == r["record"]["id"]
@@ -275,6 +338,7 @@ async def test_queue_cooldown_on_one_kit_never_blocks_another_kit(
     await _seed(session_factory)
     ht3 = await _record(session_factory, ticket_id=None, kit="HT3")
     assert ht3["result"] == "created"
+    await _commit(session_factory, ht3["record"])
 
     # Same player, same kit again — blocked (real per-kit cooldown).
     ht3_again = await _record(session_factory, ticket_id=None, kit="HT3")
@@ -289,6 +353,7 @@ async def test_queue_cooldown_on_one_kit_never_blocks_another_kit(
         now=NOW_MS + 1,
     )
     assert tourney["result"] == "created"
+    await _commit(session_factory, tourney["record"], kit_key="tourney")
 
     async with transaction(session_factory) as session:
         player = await PlayerRepository().get_by_discord_id(session, 100)
@@ -454,23 +519,68 @@ async def test_ht_fight_win_ticket_no_close_no_cooldown(session_factory, clean_d
         row = await ResultRepository().get_by_key(
             session, "ht_fight:211:ht_fight"
         )
-        assert row.promotion_status == PROMOTION_DISCORD_PENDING
+        assert row.promotion_status == PROMOTION_COMMITTED
         assert row.subtype == "HT3"
 
-    # H2 audit fix: while still discord_pending, a retry must NOT be told
-    # "already recorded" — only a COMMITTED row blocks retry.
     r2 = await _ht_fight(session_factory, ticket_id=211)
-    assert r2["result"] != "duplicate"
+    assert r2["result"] == "duplicate"
+    assert r2["existing"]["id"] == "211:ht_fight"
+
+
+async def test_ht_fight_pending_promotion_retry_is_allowed(session_factory, clean_db):
+    """Výhra s povýšením čeká na Discord grant; neúspěšný grant nesmí blokovat retry."""
+    await _seed(session_factory)
+    await _seed_mirror(session_factory, "LT5")
+    await _ticket(
+        session_factory, channel_id=217, owner_id=100, ticket_type="fight"
+    )
+    r = await _ht_fight(session_factory, ticket_id=217, fight_tier="HT5")
+    assert r["result"] == "created"
+    assert r["record"]["newTier"] == "HT5"
+    assert r["record"]["tierStatus"] == "Povýšen na HT5"
+    async with transaction(session_factory) as session:
+        row = await ResultRepository().get_by_key(session, "ht_fight:217:ht_fight")
+        assert row.promotion_status == PROMOTION_DISCORD_PENDING
+
+    r2 = await _ht_fight(session_factory, ticket_id=217, fight_tier="HT5")
+    assert r2["result"] == "created"
 
     async with transaction(session_factory) as session:
         await ResultRepository().set_promotion_status(
             session,
-            result_key="ht_fight:211:ht_fight",
+            result_key="ht_fight:217:ht_fight",
             promotion_status=PROMOTION_COMMITTED,
         )
-    r3 = await _ht_fight(session_factory, ticket_id=211)
+    r3 = await _ht_fight(session_factory, ticket_id=217, fight_tier="HT5")
     assert r3["result"] == "duplicate"
-    assert r3["existing"]["id"] == "211:ht_fight"
+
+
+async def test_ht_fight_win_fight_tier_must_match_promotion(session_factory, clean_db):
+    await _seed(session_factory)
+    await _seed_mirror(session_factory, "LT3")
+    r = await _ht_fight(session_factory, ticket_id=None, fight_tier="LT2")
+    assert r["result"] == "invalid_tier"
+    assert "HT3" in r["message"]
+    r = await _ht_fight(
+        session_factory, ticket_id=None, fight_tier="LT2", outcome="Lost", score="1-3"
+    )
+    assert r["result"] == "created"
+
+
+async def test_ht_fight_win_without_promotion_is_never_deleted(session_factory, clean_db):
+    await _seed(session_factory)
+    await _ticket(
+        session_factory, channel_id=218, owner_id=100, ticket_type="fight"
+    )
+    r = await _ht_fight(session_factory, ticket_id=218, tier_status="Zůstává")
+    assert r["result"] == "created"
+    r2 = await _ht_fight(session_factory, ticket_id=218, tier_status="Zůstává")
+    assert r2["result"] == "duplicate"
+    async with transaction(session_factory) as session:
+        rows = (
+            await session.execute(select(Result))
+        ).scalars().all()
+        assert len(rows) == 1
 
 
 async def test_ht_fight_loss_ticket_closes_and_cooldowns(session_factory, clean_db):
@@ -558,14 +668,22 @@ async def test_ht_fight_free_win_promotes_and_bridge(session_factory, clean_db):
             observed_at=_dt(NOW_MS - 60_000),
             source="discord_sync",
         )
-    r = await _ht_fight(session_factory, ticket_id=None)
+    r = await _ht_fight(session_factory, ticket_id=None, fight_tier="HT5")
     assert r["result"] == "created"
     assert r["previous_tier"] == "LT5"
     assert r["record"]["previousTier"] == "LT5"
     assert r["record"]["newTier"] == "HT5"
     assert r["record"]["id"].startswith("htfight-")
 
-    r2 = await _ht_fight(session_factory, ticket_id=None)
+    r_retry = await _ht_fight(session_factory, ticket_id=None, fight_tier="HT5")
+    assert r_retry["result"] == "created"  # discord_pending se smí zopakovat
+    async with transaction(session_factory) as session:
+        await ResultRepository().set_promotion_status(
+            session,
+            result_key=f"ht_fight:{r['record']['id']}",
+            promotion_status=PROMOTION_COMMITTED,
+        )
+    r2 = await _ht_fight(session_factory, ticket_id=None, fight_tier="HT5")
     assert r2["result"] == "duplicate"  # stejný fingerprint v 2h okně
 
     r3 = await _ht_fight(
@@ -582,6 +700,7 @@ async def test_ht_fight_free_win_promotes_and_bridge(session_factory, clean_db):
         ticket_id=None,
         now=NOW_MS + 60_000,
         score="4-1",
+        fight_tier="HT5",
         bridge="LT5",
     )
     assert r4["result"] == "invalid_bridge"  # bridge musí být strictly vyšší
@@ -663,11 +782,12 @@ async def test_ht_fight_commit_preserves_subtype_and_ticket_channel(
     session_factory, clean_db
 ):
     await _seed(session_factory)
+    await _seed_mirror(session_factory, "LT5")
     await _ticket(
         session_factory, channel_id=216, owner_id=100, ticket_type="fight"
     )
     r = await _ht_fight(
-        session_factory, ticket_id=216, notes="Fight poznámka"
+        session_factory, ticket_id=216, fight_tier="HT5", notes="Fight poznámka"
     )
     rec = r["record"]
     assert rec["id"] == "216:ht_fight"
@@ -702,18 +822,17 @@ async def test_ht_fight_commit_preserves_subtype_and_ticket_channel(
             session, f"ht_fight:{rec['id']}"
         )
         assert row.promotion_status == PROMOTION_COMMITTED
-        assert row.subtype == "HT3"
+        assert row.subtype == "HT5"
         assert row.ticket_channel_id == 216
         assert row.opponent_id == 300
         assert row.notes == "Fight poznámka"
 
 
 async def test_record_result_same_ticket_concurrent_dedup(session_factory, clean_db):
-    """Souběžné ``record_result`` pro stejný ticket → max. 1 řádek a 1 zavření.
+    """Souběžné ``record_result`` pro stejný ticket → max. 1 řádek.
 
     Unikátní ``result_key`` v PostgreSQL (``result:{ticketId}``) zaručuje, že
-    se souběžné odeslání nerozběhne do dvou záznamů, dvojitého zavření ani
-    dvojitého cooldownu. Nahrazuje JSON concurrency testy
+    se souběžné odeslání nerozběhne do dvou záznamů. Nahrazuje JSON concurrency testy
     (``RecordResultConcurrencyTests``) – invariant je „nikdy 2 záznamy",
     ne přesný tvar odpovědi druhé transakce.
     """
@@ -745,7 +864,8 @@ async def test_record_result_same_ticket_concurrent_dedup(session_factory, clean
         if not (isinstance(o, dict) and o.get("result") == "created")
     ]
     assert len(others) == 1
-    assert isinstance(others[0], dict) or isinstance(others[0], BaseException)
+    assert isinstance(others[0], dict), others[0]
+    assert others[0]["result"] == "duplicate"
 
     async with transaction(session_factory) as session:
         rows = (
@@ -761,7 +881,7 @@ async def test_record_result_same_ticket_concurrent_dedup(session_factory, clean
             )
         ).scalars().first()
         assert ticket is not None
-        assert ticket.status == "closed"
+        assert ticket.status == "open"
 
 
 async def test_record_result_queue_concurrent_dedup(session_factory, clean_db):
@@ -810,3 +930,60 @@ async def test_record_result_queue_concurrent_dedup(session_factory, clean_db):
             )
         ).scalars().all()
     assert len(rows) == 1
+
+async def test_queue_result_never_degrades_current_tier(session_factory, clean_db):
+    await _seed(session_factory)
+    await _seed_mirror(session_factory, "HT3")
+    r = await _record(session_factory, ticket_id=None, new_tier="LT4")
+    assert r["result"] == "invalid_tier"
+    assert "nedegraduje" in r["message"]
+    r = await _record(session_factory, ticket_id=None, new_tier="LT3")
+    assert r["result"] == "invalid_tier"
+    await _seed_mirror(session_factory, "LT3", discord_id=101)
+    r = await _record(
+        session_factory,
+        ticket_id=None,
+        player_id="101",
+        ign="Owner101",
+        new_tier="LT3",
+    )
+    assert r["result"] == "created"
+
+
+async def test_queue_pending_result_is_replaced_on_retry(session_factory, clean_db):
+    """Nepotvrzený grant (discord_pending) nesmí blokovat opakování /result."""
+    await _seed(session_factory)
+    r1 = await _record(session_factory, ticket_id=None)
+    r2 = await _record(session_factory, ticket_id=None)
+    assert r1["result"] == r2["result"] == "created"
+    assert r1["record"]["id"] == r2["record"]["id"]
+    async with transaction(session_factory) as session:
+        rows = (await session.execute(select(Result))).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].promotion_status == PROMOTION_DISCORD_PENDING
+
+
+async def test_player_access_channel_ids_only_player_scoped_channels(
+    session_factory, clean_db
+):
+    from db.repositories.kits import KitTesterRoomRepository
+
+    await _seed(session_factory)
+    await _ticket(session_factory, channel_id=301, owner_id=100)
+    await _ticket(session_factory, channel_id=302, owner_id=101)
+    async with transaction(session_factory) as session:
+        kit = await KitRepository().get_by_key(session, "ht3")
+        await KitTesterRoomRepository().set_room(
+            session, kit_id=kit.id, channel_id=900
+        )
+    channels = await rsvc.player_access_channel_ids("100", session_factory)
+    assert channels == {900, 301}
+
+
+def test_validate_result_inputs():
+    assert rsvc.validate_result_inputs("Alice_1", "5-2", None)[0]
+    assert rsvc.validate_result_inputs("Alice_1", "3:1", "ok")[0]
+    assert not rsvc.validate_result_inputs("ab", "5-2", None)[0]
+    assert not rsvc.validate_result_inputs("Al ice", "5-2", None)[0]
+    assert not rsvc.validate_result_inputs("Alice_1", "abc", None)[0]
+    assert not rsvc.validate_result_inputs("Alice_1", "5-2", "x" * 501)[0]

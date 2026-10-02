@@ -91,3 +91,39 @@ def test_engine_error_message_contains_no_credentials(monkeypatch):
         create_async_engine_from_url("")
     assert "postgresql" not in str(exc.value).lower()
     assert "heslo" in str(exc.value).lower() or "DATABASE_URL" in str(exc.value)
+
+def test_build_async_url_translates_sslmode_for_asyncpg():
+    assert (
+        build_async_database_url("postgresql://u:p@host/db?sslmode=require")
+        == "postgresql+asyncpg://u:p@host/db?ssl=require"
+    )
+    assert (
+        build_async_database_url(
+            "postgres://u:p@host/db?sslmode=verify-full&channel_binding=require&application_name=x"
+        )
+        == "postgresql+asyncpg://u:p@host/db?ssl=verify-full&application_name=x"
+    )
+    assert (
+        build_async_database_url("postgresql+asyncpg://u:p@host/db?sslmode=require")
+        == "postgresql+asyncpg://u:p@host/db?ssl=require"
+    )
+
+
+def test_sync_url_keeps_sslmode():
+    url = "postgresql://u:p@host/db?sslmode=require"
+    assert build_sync_database_url(url) == url
+
+
+def test_db_parts_url_includes_sslmode(monkeypatch):
+    for name, value in (
+        ("DATABASE_URL", ""),
+        ("DB_HOST", "h"),
+        ("DB_NAME", "n"),
+        ("DB_USER", "u"),
+        ("DB_PASSWORD", "p"),
+        ("DB_SSLMODE", "require"),
+    ):
+        monkeypatch.setenv(name, value)
+    assert database_url() == "postgresql://u:p@h:5432/n?sslmode=require"
+    monkeypatch.delenv("DB_SSLMODE")
+    assert database_url() == "postgresql://u:p@h:5432/n"

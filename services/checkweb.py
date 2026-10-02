@@ -1,40 +1,27 @@
-"""Bezpečná synchronizace webu – /checkweb (čistá logika, bez discord.py).
+"""Diagnostika Discord × PostgreSQL × web – podklad pro /sync check (čistá logika, bez discord.py).
 
-Nová verze /checkweb NIKDY nic nezapisuje automaticky (původní verze brala
-Discord tier role jako autoritativní zdroj a sama přepisovala players.json
-i historii – toto chování je zrušené). Pro každého hráče a kit porovnává tři
-zdroje:
+Analýza NIKDY nic nezapisuje. Pro každého hráče a kit porovnává tři zdroje:
 
-  - Discord tier role (``data/kit_roles.json`` + členové serveru),
-  - kanonická databáze (``data/players.json``),
+  - Discord tier role (kit_roles + členové serveru),
+  - kanonická databáze (PostgreSQL mirror, export ``services.player_export``),
   - web / GitHub (``players.json`` v repozitáři DachshundTiers).
 
-Detekované statusy (názvy podle požadavku):
+Detekované statusy:
   - ``MATCH``                – Discord role = DB = web
   - ``MISSING_DISCORD_ROLE`` – hráč má tier v DB/webu, ale roli nemá
-  - ``DATABASE_MISMATCH``    – Discord role ≠ DB (DB se smí opravit jen
-                               po explicitním potvrzení)
-  - ``WEBSITE_MISMATCH``     – web ≠ DB (Discord = DB; opraví ``/websync``)
+  - ``DATABASE_MISMATCH``    – Discord role ≠ DB (mirror srovná ``/sync discord``)
+  - ``WEBSITE_MISMATCH``     – web ≠ DB (Discord = DB; srovná ``/sync web``)
   - ``MULTIPLE_TIER_ROLES``  – hráč drží víc tier rolí stejného kitu = KONFLIKT,
                                nikdy se nevybírá automaticky
-  - ``UNKNOWN_ROLE``         – role namapovaná v kit_roles.json na
-                               neregistrovaný kit
-  - ``UNKNOWN_PLAYER``       – člen drží tier roli, ale v players.json není
+  - ``UNKNOWN_ROLE``         – role namapovaná na neregistrovaný kit
+  - ``UNKNOWN_PLAYER``       – člen drží tier roli, ale v DB není
   - ``DUPLICATE_PLAYER``     – stejný hráč (username) víc krát v DB / na webu
 
-Opravit databázi lze JEN v ``/checkweb apply`` a JEN po explicitním
-per-záznamovém rozhodnutí (akce ``use_discord`` / ``keep_database`` /
-``ignore``):
-  - Use Discord    → tier v DB := Discord tier (BEZ záznamu do historie!),
-  - Keep Database  → ponechat tier v DB,
-  - Ignore         → nechat být.
+Každý běh /sync check se zapisuje do ``data/checkweb_log.json`` (append-only,
+restart-safe, posledních ``AUDIT_LOG_LIMIT`` záznamů).
 
-Každé rozhodnutí (i „keep" / „ignore") se zapisuje do ``data/checkweb_log.json``
-(append-only, restart-safe) s: actor, player, kit, old tier, new tier, reason,
-timestamp a source.
-
-Zdroj pravdy zůstává hodnocení (``/result``). Discord role jsou projekce DB,
-ne naopak. Web se tímto příkazem nemění (slouží na to ``/websync``).
+Zdroj pravdy zůstává hodnocení (``/result``) a Discord role. Web se tímto
+modulem nemění (slouží na to ``/sync web``).
 """
 
 import logging
@@ -46,6 +33,7 @@ from services.store import read as store_read, transaction
 log = logging.getLogger("dachshundtiers")
 
 CHECKWEB_LOG_FILE = "checkweb_log.json"
+AUDIT_LOG_LIMIT = 1000
 
 # Statusy v pořadí pro souhrn / zobrazení
 STATUSES = (
@@ -69,9 +57,6 @@ STATUS_LABELS = {
     "UNKNOWN_PLAYER": "👤 Neznámý hráč",
     "DUPLICATE_PLAYER": "👥 Duplicitní hráč",
 }
-
-# Statusy, které může admin vyřešit v /checkweb apply
-RESOLVABLE_STATUSES = ("DATABASE_MISMATCH", "MULTIPLE_TIER_ROLES")
 
 
 def _now_ms() -> int:
@@ -114,21 +99,6 @@ def _render(player, kit, db, web, discord, status) -> str:
     return "\n".join(lines)
 
 
-def _decision_options(db, discord) -> list:
-    """Možná rozhodnutí pro záznam ([Use Discord] / [Keep Database] / [Ignore]).
-
-    U KONFLIKTU (víc rolí) se nabídne jeden „Use Discord" na každou roli –
-    nikdy se nevybírá automaticky.
-    """
-    options = []
-    for t in sorted({t for t in (discord or []) if t}):
-        options.append({"key": f"use_discord:{t}", "label": f"✅ Use Discord ({t})"})
-    if db:
-        options.append({"key": "keep_database", "label": f"🏛️ Keep Database ({db})"})
-    options.append({"key": "ignore", "label": "🚫 Ignore"})
-    return options
-
-
 def _record(
     *,
     player,
@@ -161,8 +131,6 @@ def _record(
         "member_id": str(member_id) if member_id not in (None, "") else None,
         "member_name": member_name or "",
         "message": message or _render(player, kit, db, web, discord, status),
-        "resolvable": status in RESOLVABLE_STATUSES,
-        "options": _decision_options(db, discord) if status in RESOLVABLE_STATUSES else [],
     }
 
 
@@ -185,8 +153,6 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
           "summary":     {status: počet},             # všechny kategorie, i 0
           "checked":     počet záznamů,
           "has_issues":  True, když existuje záznam ≠ MATCH,
-          "resolvable":  [záznamy řešitelné v /checkweb apply],
-          "fingerprint": otisk řešitelných záznamů (preview vs potvrzení),
         }
     """
     kit_display = {str(k).strip().lower(): v for k, v in (kit_display or {}).items()}
@@ -311,20 +277,13 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                 scope="website",
                 message=(
                     f"👥 **{_username(group[0])}** je na webu **{len(group)}×** "
-                    "– sjednotí se při `/websync apply`."
+                    "– sjednotí se při `/sync web`."
                 ),
             )
 
     skip_players = {key for key, group in db_index.items() if len(group) > 1}
 
     # ---- párování člen ↔ hráč ----------------------------------------------
-    members_by_name: dict[str, dict] = {}
-    for m in members:
-        for n in m.get("names") or []:
-            nkey = str(n).strip().lower()
-            if nkey and nkey not in members_by_name:
-                members_by_name[nkey] = m
-
     matched: dict[str, list] = {}
     unknown_members: list = []
     for m in members:
@@ -383,7 +342,7 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                     member_name=_member_names(mlist) or None,
                     message=(
                         _render(username, kit_name, db, web, (), "MISSING_DISCORD_ROLE")
-                        + "\n💡 Role chybí – doplní ji `/playersync apply` (Discord role je projekce DB)."
+                        + "\n💡 Role chybí – doplň ji přes `/result` (Discord role se z DB nerozdávají hromadně)."
                     ),
                 )
                 continue
@@ -400,7 +359,7 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                     member_name=_member_names(mlist) or None,
                     message=(
                         _render(username, kit_name, db, web, discord_tiers, "MULTIPLE_TIER_ROLES")
-                        + "\n⚠️ Hráč drží víc tier rolí najednou – žádná se NEvybírá automaticky, rozhodni v `/checkweb apply`."
+                        + "\n⚠️ Hráč drží víc tier rolí najednou – žádná se NEvybírá automaticky, nech jen jednu."
                     ),
                 )
                 continue
@@ -419,7 +378,7 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                         member_name=_member_names(mlist) or None,
                         message=(
                             _render(username, kit_name, db, web, discord_tiers, "WEBSITE_MISMATCH")
-                            + "\n🌐 DB a Discord souhlasí, web je zastaralý – srovná ho `/websync apply`."
+                            + "\n🌐 DB a Discord souhlasí, web je zastaralý – srovná ho `/sync web`."
                         ),
                     )
                 else:
@@ -445,7 +404,7 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                     member_name=_member_names(mlist) or None,
                     message=(
                         _render(username, kit_name, db, web, discord_tiers, "DATABASE_MISMATCH")
-                        + "\n✏️ Discord role se liší od DB – opravu povolíš jen svým rozhodnutím."
+                        + "\n✏️ Discord role se liší od DB – mirror srovná `/sync discord`."
                     ),
                 )
 
@@ -472,7 +431,7 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                     member_name=alias,
                     message=(
                         f"❓ **{alias}** drží roli namapovanou na **neregistrovaný kit** "
-                        f"`{kk}` – zkontroluj `/setkitrole`/`kits.json` ručně."
+                        f"`{kk}` – zkontroluj `/setkitrole` ručně."
                     ),
                 )
         for kk in sorted(held):
@@ -508,16 +467,15 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
                 member_name=alias,
                 message=(
                     _render(alias, kit_name, None, web, tiers, "UNKNOWN_PLAYER")
-                    + f"\n👤 V players.json žádný takový hráč není{note} – "
+                    + f"\n👤 V databázi žádný takový hráč není{note} – "
                     "doplň ho přes `/result` (zdroj pravdy), role je projekce DB."
                 ),
             )
 
-    # deterministické pořadí: k řešení první, pak status, pak abeceda
+    # deterministické pořadí: status, pak abeceda
     order = {s: i for i, s in enumerate(STATUSES)}
     records.sort(
         key=lambda r: (
-            0 if r.get("resolvable") else 1,
             order.get(r.get("status"), 99),
             str(r.get("player", "")).lower(),
             str(r.get("kit_key", "")),
@@ -529,152 +487,7 @@ def analyze_checkweb(*, players, website=None, members=None, roles_map=None, kit
         "summary": summary,
         "checked": len(records),
         "has_issues": any(r.get("status") != "MATCH" for r in records),
-        "resolvable": [r for r in records if r.get("resolvable")],
-        "fingerprint": fingerprint_resolvable(records),
     }
-
-
-def fingerprint_resolvable(records) -> str:
-    """Deterministický otisk řešitelných záznamů – porovnání preview vs potvrzení.
-
-    Změní-li se mezi náhledem a potvrzením role, DB nebo web u některého
-    záznamu, otisk se liší a nic se neaplikuje.
-    """
-    lines = []
-    for r in (records or []):
-        if not r.get("resolvable"):
-            continue
-        lines.append(
-            "|".join(
-                [
-                    str(r.get("player", "")).lower(),
-                    str(r.get("kit_key", "")).lower(),
-                    str(r.get("db") or ""),
-                    ",".join(r.get("discord") or []),
-                    str(r.get("web") or ""),
-                    str(r.get("status", "")),
-                ]
-            )
-        )
-    return "|".join(sorted(lines))
-
-
-def build_discord_import_decisions(records) -> tuple[list, list]:
-    """Připraví hromadný, ale bezpečný import Discord tierů do DB.
-
-    Do importu jdou pouze záznamy ``DATABASE_MISMATCH`` s *právě jedním*
-    platným Discord tierem. Více tier rolí je konflikt a neznámý hráč nemá
-    spolehlivě zjistitelný Minecraft IGN, proto se obojí nikdy nevytváří ani
-    nevybírá automaticky.
-
-    Vrací ``(decisions, skipped)``. Rozhodnutí lze beze změny předat do
-    :func:`apply_checkweb_decisions`; ``skipped`` jsou záznamy pro report UI.
-    """
-    decisions = []
-    skipped = []
-    for record in records or []:
-        if record.get("status") != "DATABASE_MISMATCH":
-            if record.get("status") != "MATCH":
-                skipped.append(record)
-            continue
-        tiers = sorted({str(t).strip().upper() for t in record.get("discord") or [] if t})
-        if len(tiers) != 1:
-            skipped.append(record)
-            continue
-        decisions.append(
-            {
-                "player": record.get("player"),
-                "kit_key": record.get("kit_key"),
-                "decision": "use_discord",
-                "tier": tiers[0],
-            }
-        )
-    return decisions, skipped
-
-
-# ---------------------------------------------------------------------------
-# Aplikace rozhodnutí (pouze po explicitním potvrzení)
-# ---------------------------------------------------------------------------
-def apply_checkweb_decisions(*, players, records, decisions, kit_display=None) -> tuple:
-    """Spočítá per-záznamová rozhodnutí; NIC nezapisuje (F-FIX).
-
-    Čistá funkce: vrací ``(new_players, applied)``, kde každý prvek ``applied``
-    má ``player, kit, kit_key, oldTier, newTier, reason, source, ok, error``.
-
-    F-FIX: žádný produkční caller už výsledek nepersistuje – ``/checkweb apply``
-    a ``/sync importdiscord`` ho použijí jen jako návrh k promítnutí přes
-    ``/sync discord`` (Discord → PostgreSQL mirror). Zápis ``new_players`` do
-    players.json/JSONB by znamenal JSON → current tier, což je zakázané.
-    """
-    kit_display = kit_display or {}
-    index = {}
-    for r in (records or []):
-        if r.get("resolvable"):
-            index[
-                (str(r.get("player", "")).strip().lower(), str(r.get("kit_key", "")).strip().lower())
-            ] = r
-
-    new_players = [dict(p) for p in (players or []) if isinstance(p, dict)]
-    by_name: dict[str, list] = {}
-    for p in new_players:
-        uname = str(p.get("username", "") or "").strip().lower()
-        if uname:
-            by_name.setdefault(uname, []).append(p)
-
-    applied = []
-    for dec in (decisions or []):
-        player = str(dec.get("player", "") or "").strip()
-        kit_key = str(dec.get("kit_key", "") or "").strip().lower()
-        rec = index.get((player.lower(), kit_key))
-        reason = str(dec.get("decision") or "ignore")
-        old_tier = rec.get("db") if rec else None
-        entry = {
-            "player": player,
-            "kit": rec.get("kit", "") if rec else kit_key,
-            "kit_key": kit_key,
-            "oldTier": old_tier,
-            "newTier": old_tier,
-            "reason": reason,
-            "source": "discord" if reason == "use_discord" else "database",
-            "ok": False,
-            "error": None,
-        }
-        if rec is None:
-            entry["error"] = "záznam už neexistuje"
-            applied.append(entry)
-            continue
-
-        if reason == "use_discord":
-            tier = _tier_clean(dec.get("tier"))
-            if tier is None or tier not in (rec.get("discord") or []):
-                entry["error"] = "neplatný Discord tier"
-                applied.append(entry)
-                continue
-            targets = by_name.get(player.lower())
-            if not targets:
-                entry["error"] = "hráč v players.json není"
-                applied.append(entry)
-                continue
-            p = targets[0]
-            modes = p.setdefault("modes", {})
-            if not isinstance(modes, dict):
-                modes = {}
-                p["modes"] = modes
-            mode_key, _existing = _mode_value(modes, kit_key)
-            if mode_key is None:
-                mode_key = kit_display.get(kit_key) or kit_key.capitalize()
-            # oldTier se bere z DB před zápisem (rec.db = stav před změnou)
-            modes[mode_key] = tier
-            entry["newTier"] = tier
-            entry["source"] = "discord"
-            entry["ok"] = True
-        elif reason in ("keep_database", "ignore"):
-            entry["newTier"] = old_tier
-            entry["ok"] = True
-        else:
-            entry["error"] = f"neznámé rozhodnutí {reason}"
-        applied.append(entry)
-    return new_players, applied
 
 
 # ---------------------------------------------------------------------------
@@ -689,19 +502,14 @@ async def log_checkweb_event(
     summary=None,
     website=None,
     errors=None,
-    repairs=None,
     ts: int = None,
 ) -> dict:
-    """Přidá záznam o použití /checkweb do auditu.
-
-    Každé opravené rozhodnutí (repair) dostane kompletní auditní stopu:
-    actor, player, kit, old tier, new tier, reason, timestamp a source.
-    """
+    """Přidá záznam o běhu /sync check do auditu."""
     if ts is None:
         ts = _now_ms()
     entry: dict = {
         "ts": ts,
-        "mode": mode,          # "preview" | "apply"
+        "mode": mode,          # "preview"
         "status": status,
         "summary": dict(summary or {}),
         "website": website,    # "GitHub" | "nedostupný..." | None
@@ -711,24 +519,12 @@ async def log_checkweb_event(
         entry["actorId"] = str(actor_id)
         entry["actorName"] = actor_name or ""
 
-    repairs = list(repairs or [])
-    if repairs:
-        stamped = []
-        for r in repairs:
-            r = dict(r)
-            r.setdefault("actor", actor_name or "")
-            r.setdefault("actorId", str(actor_id) if actor_id is not None else None)
-            r.setdefault("timestamp", ts)
-            r.setdefault("source", r.get("source") or "database")
-            stamped.append(r)
-        entry["repairs"] = stamped
-
     async def _run(tx):
         entries = tx.get(CHECKWEB_LOG_FILE, [])
         if not isinstance(entries, list):
             entries = []
         entries.append(entry)
-        tx.set(CHECKWEB_LOG_FILE, entries)
+        tx.set(CHECKWEB_LOG_FILE, entries[-AUDIT_LOG_LIMIT:])
         return entry
 
     return await transaction((CHECKWEB_LOG_FILE,), _run)

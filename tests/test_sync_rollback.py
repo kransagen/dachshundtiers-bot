@@ -4,7 +4,7 @@ Pokrývají požadavky safe-rollback specifikace na úrovni discord.py mocks:
 - apply_rollback_actions: ADD-inverze zavolá remove_roles / REMOVE-inverze
   zavolá add_roles; idempotentní stavy (already_correct) bez volání API;
   člen/role nenalezen a Forbidden → failed (nikdy se nešíří dál),
-- /sync discord-rollback: dry run nic nemění; apply → potvrzovací view;
+- /sync rollback: dry run nic nemění; apply → potvrzovací view;
   potvrzení provede inverzi a zapíše rollback audit; stale → nic,
 - chybějící memberId/roleId v cílovém auditu → bezpečný abort,
 - adminský gate u příkazu i u potvrzovacího tlačítka.
@@ -272,7 +272,7 @@ class ApplyRollbackActionsTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Příkaz /sync discord-rollback (cogs/sync)
+# Příkaz /sync rollback (cogs/sync)
 # ---------------------------------------------------------------------------
 class SyncDiscordRollbackCommandTests(unittest.TestCase):
     def setUp(self):
@@ -298,11 +298,11 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         inter = _interaction(user=_admin_member(), guild=guild)
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "preview")
+            await Sync.sync_rollback.callback(cog, inter, "preview")
 
         asyncio.run(main())
         embed, _ = _sent(inter)
-        self.assertIn("🔄 /sync discord-rollback", embed.title)
+        self.assertIn("🔄 /sync rollback", embed.title)
         self.assertIn("Dry run", embed.footer.text)
         self.assertIn("Celkem: **2**", embed.description)
         # Finální bezpečnostní kontrola: souhrn dle PŮVODNÍ operace + X + Y.
@@ -329,7 +329,7 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         inter = _interaction(user=_admin_member(), guild=guild)
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "apply")
+            await Sync.sync_rollback.callback(cog, inter, "apply")
 
         asyncio.run(main())
         embed, kwargs = _sent(inter)
@@ -370,7 +370,7 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
             with mock.patch(
                 "cogs.sync.verify_rollback_plan", return_value=failing
             ):
-                await Sync.sync_discord_rollback.callback(cog, inter, "apply")
+                await Sync.sync_rollback.callback(cog, inter, "apply")
 
         asyncio.run(main())
         embed, kwargs = _sent(inter)
@@ -388,7 +388,7 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         inter = _interaction(user=_admin_member(), guild=guild)
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "apply")
+            await Sync.sync_rollback.callback(cog, inter, "apply")
             view = inter.followup.send.call_args.kwargs["view"]
             await view.confirm.callback(
                 _interaction(user=_admin_member(), guild=guild)
@@ -419,7 +419,7 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         holder = {}
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "apply")
+            await Sync.sync_rollback.callback(cog, inter, "apply")
             view = inter.followup.send.call_args.kwargs["view"]
             holder["confirm"] = _interaction(user=_admin_member(), guild=guild)
             # audit se mezitím změnil
@@ -445,7 +445,7 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         holder = {}
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "apply")
+            await Sync.sync_rollback.callback(cog, inter, "apply")
             view = inter.followup.send.call_args.kwargs["view"]
             holder["confirm"] = _interaction(user=_admin_member(), guild=guild)
             await view.confirm.callback(holder["confirm"])
@@ -475,11 +475,11 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         inter = _interaction(user=_admin_member(), guild=guild)
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "preview")
+            await Sync.sync_rollback.callback(cog, inter, "preview")
 
         asyncio.run(main())
         embed, _ = _sent(inter)
-        self.assertIn("❌ /sync discord-rollback – chybí informace", embed.title)
+        self.assertIn("❌ /sync rollback – chybí informace", embed.title)
         alice.add_roles.assert_not_awaited()
         alice.remove_roles.assert_not_awaited()
 
@@ -493,11 +493,11 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         inter = _interaction(user=_admin_member(), guild=_guild([]))
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "preview")
+            await Sync.sync_rollback.callback(cog, inter, "preview")
 
         asyncio.run(main())
         embed, _ = _sent(inter)
-        self.assertIn("❌ /sync discord-rollback – chybí informace", embed.title)
+        self.assertIn("❌ /sync rollback – chybí informace", embed.title)
 
     def test_no_applied_sync_in_log(self):
         storage.save_data(PLAYERSYNC_LOG_FILE, [])
@@ -505,18 +505,18 @@ class SyncDiscordRollbackCommandTests(unittest.TestCase):
         inter = _interaction(user=_admin_member(), guild=_guild([]))
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "preview")
+            await Sync.sync_rollback.callback(cog, inter, "preview")
 
         asyncio.run(main())
         embed, _ = _sent(inter)
-        self.assertIn("❌ /sync discord-rollback – nelze", embed.title)
+        self.assertIn("❌ /sync rollback – nelze", embed.title)
 
     def test_permission_denied(self):
         cog = Sync.__new__(Sync)
         inter = _interaction(user=_plain_member())
 
         async def main():
-            await Sync.sync_discord_rollback.callback(cog, inter, "preview")
+            await Sync.sync_rollback.callback(cog, inter, "preview")
 
         asyncio.run(main())
         inter.response.send_message.assert_awaited_once_with(

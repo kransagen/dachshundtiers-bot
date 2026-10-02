@@ -21,12 +21,13 @@ Vlastnosti:
   - idempotence: jeden HT ticket = maximálně jeden výsledek. Opakované
     odeslání nic nepřepíše a vrátí stejný uložený záznam,
   - ochrana před duplicitami: queue výsledek se nezapíše, dokud má hráč
-    aktivní cooldown (4 dny) PRO DANÝ KIT,
+    aktivní cooldown (4 dny) PRO DANÝ KIT (cooldown vzniká až po potvrzeném
+    grantu),
   - historie se nikdy nemaže – tabulka `results` je append-only (jedna větev
     na ticket / queue / ht_fight),
-  - potvrzení výsledku atomicky založí řádek do `results`, nastaví waitlist
-    cooldown a uzavře HT ticket včetně HT3+ cooldownu a zápisu do logu
-    ticketu – v jedné transakci.
+  - zápis výsledku jen založí řádek do `results` (`discord_pending`);
+    waitlist/HT3+ cooldown, zavření HT ticketu a log ticketu se provedou až
+    v `commit_after_discord_success`, tedy po potvrzeném Discord grantu role.
 
 DRUHÝ REŽIM TU UŽ NENÍ. ``players.json`` / ``ht_results.json`` /
 ``cooldowns.json`` se nečtou ani nezapisují; každá funkce vyžaduje
@@ -43,22 +44,31 @@ protože je čtou cogy a view modaly. Je to jen projekce z DB řádku
 """
 
 import logging
+import re
 import time
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db.models import Result
-from db.repositories.cooldowns import COOLDOWN_HT3, COOLDOWN_WAITLIST, CooldownRepository
-from db.repositories.kits import KitRepository, TierDefinitionRepository
+from db.tier_catalog import ladder_rank
+from db.repositories.cooldowns import CooldownRepository
+from db.repositories.kits import (
+    KitRepository,
+    KitTesterRoomRepository,
+    TierDefinitionRepository,
+)
 from db.repositories.players import PlayerIdentityError, PlayerRepository
+from db.repositories.queues import (
+    QUEUE_ENTRY_PULLED,
+    QUEUE_ENTRY_WAITING,
+    QueueEntryRepository,
+)
 from db.repositories.results import (
     ANNOUNCEMENT_PENDING,
-    PROMOTION_COMMITTED,
     PROMOTION_DISCORD_PENDING,
     ResultRepository,
 )
-from db.repositories.sync_audit import AuditRepository
 from db.repositories.tickets import TICKET_OPEN, TicketRepository
 from db.repositories.tiers import MirrorRepository
 from db.services.session import transaction as db_transaction
@@ -85,6 +95,10 @@ EVAL_TIER = "LT3E"
 # rozlišuje se podle sloupce ``kind``, viz ``_db_result_to_dict``.
 QUEUE_RESULT_PREFIX = "queue-"
 
+IGN_RE = re.compile(r"^\w{3,16}$")
+SCORE_RE = re.compile(r"^\d{1,3}[-:]\d{1,3}$")
+MAX_NOTES_LEN = 500
+
 _QUEUE_TIERS_MESSAGE = (
     "❌ Neplatný tier! V `/result` lze zadat pouze: "
     "**LT5, HT5, LT4, HT4, LT3, LT3 + eval**."
@@ -101,6 +115,19 @@ def _now_ms() -> int:
 def normalize_tier(value: str) -> str:
     """Normalizace tieru (velikost písmen + whitespace)."""
     return (value or "").strip().upper()
+
+
+def validate_result_inputs(
+    ign: str, score: str, notes: str | None
+) -> tuple[bool, str]:
+    """Validace volného textu /result (IGN, skóre, poznámky) před zápisem."""
+    if not IGN_RE.match((ign or "").strip()):
+        return False, "❌ Neplatné IGN – 3–16 znaků: písmena, čísla a podtržítko."
+    if not SCORE_RE.match((score or "").strip()):
+        return False, "❌ Neplatné skóre – použij formát např. **5-2**."
+    if len((notes or "").strip()) > MAX_NOTES_LEN:
+        return False, f"❌ Poznámky jsou příliš dlouhé (max. {MAX_NOTES_LEN} znaků)."
+    return True, ""
 
 
 def validate_result_tier(
@@ -173,7 +200,6 @@ async def record_result(
     now: int = None,
     date: str = "",
     queue_cooldown_ms: int = 0,
-    ht3_cooldown_ms: int = 0,
     session_factory: async_sessionmaker[AsyncSession],
 ) -> dict:
     """Zapíše výsledek evaluace atomicky (validace + idempotence + zápis).
@@ -182,7 +208,7 @@ async def record_result(
     - ticket musí existovat a být otevřený,
     - hráč musí být vlastníkem ticketu, kit musí sedět,
     - tier musí projít ``validate_result_tier`` proti cíli ticketu,
-    - ticket se po potvrzení zavře + nastaví se HT3+ cooldown + event log.
+    - ticket zůstává otevřený – zavře ho až potvrzený Discord grant.
 
     ``ticket_id=None`` → queue výsledek:
     - tier musí být z RESULT_TIERS,
@@ -221,13 +247,37 @@ async def record_result(
         now=now,
         date=date,
         queue_cooldown_ms=queue_cooldown_ms,
-        ht3_cooldown_ms=ht3_cooldown_ms,
     )
 
 
 # ---------------------------------------------------------------------------
 # Čtení historie (restart-safe)
 # ---------------------------------------------------------------------------
+async def player_access_channel_ids(
+    player_id, session_factory: async_sessionmaker[AsyncSession]
+) -> set[int]:
+    """Kanály, kde hráč může mít osobní overwrite (tester roomky, jeho tickety
+    a roomky z jeho záznamů ve frontě) – jen z nich se mu po /result odebírají práva."""
+    async with db_transaction(session_factory) as session:
+        channels = {
+            room.channel_id
+            for room in await KitTesterRoomRepository().list_all(session)
+        }
+        player = await PlayerRepository().get_by_discord_id(session, int(player_id))
+        if player is None:
+            return channels
+        for ticket in await TicketRepository().list_open(session, player_id=player.id):
+            channels.add(ticket.channel_id)
+        queue_entries = QueueEntryRepository()
+        for status in (QUEUE_ENTRY_WAITING, QUEUE_ENTRY_PULLED):
+            for entry in await queue_entries.list_by_status(
+                session, player_id=player.id, status=status
+            ):
+                if entry.room_channel_id is not None:
+                    channels.add(entry.room_channel_id)
+        return channels
+
+
 async def get_result_by_ticket(
     ticket_id, session_factory: async_sessionmaker[AsyncSession]
 ) -> dict | None:
@@ -284,7 +334,6 @@ async def _db_record_result(
     now: int = None,
     date: str = "",
     queue_cooldown_ms: int = 0,
-    ht3_cooldown_ms: int = 0,
 ) -> dict:
     if now is None:
         now = _now_ms()
@@ -301,7 +350,7 @@ async def _db_record_result(
             tid = str(ticket_id)
             existing = await results.get_by_key(session, f"result:{tid}")
             if existing is not None:
-                if existing.promotion_status == PROMOTION_COMMITTED:
+                if existing.promotion_status != PROMOTION_DISCORD_PENDING:
                     return {
                         "result": "duplicate",
                         "existing": await _db_result_to_dict(session, existing),
@@ -360,6 +409,15 @@ async def _db_record_result(
                 )
             kind = "queue"
             ticket_key = f"result:{result_id}"
+            stale = await results.get_by_key(session, ticket_key)
+            if stale is not None:
+                if stale.promotion_status != PROMOTION_DISCORD_PENDING:
+                    return {
+                        "result": "duplicate",
+                        "existing": await _db_result_to_dict(session, stale),
+                    }
+                await session.delete(stale)
+                await session.flush()
 
         # --- Validace ---
         if ticket_id is not None:
@@ -431,6 +489,17 @@ async def _db_record_result(
             )
             if prev_tier is not None:
                 previous = prev_tier.code
+        if ticket_id is None:
+            prev_rank = ladder_rank(previous)
+            new_rank = ladder_rank(stored_tier)
+            if prev_rank is not None and new_rank is not None and new_rank < prev_rank:
+                return {
+                    "result": "invalid_tier",
+                    "message": (
+                        f"❌ Nový tier `{stored_tier}` je horší než aktuální tier "
+                        f"hráče `{previous}` – /result hráče nedegraduje."
+                    ),
+                }
         prev_tier_row = (
             await _db_resolve_tier(session, previous) if previous != "N/A" else None
         )
@@ -460,65 +529,17 @@ async def _db_record_result(
             recorded_at=_ms_to_dt(now),
             promotion_status=PROMOTION_DISCORD_PENDING,
         )
-        if ticket_id is None:
-            # H11 audit fix: souběžné queue odeslání pro stejného hráče+kit ve
-            # stejném okně sdílí deterministický result_key — unikátní
-            # ``uq_results_result_key`` pustí jen vítěze; poražený narazí na
-            # IntegrityError, které SAVEPOINT vrátí zpět (bez poškození
-            # transakce) a převede na klasické ``duplicate`` s vítězným
-            # záznamem. Dřív obě transakce vložily každá svůj řádek.
-            try:
-                async with session.begin_nested():
-                    row = await results.insert(session, **insert_kwargs)
-            except IntegrityError:
-                winner = await results.get_by_key(session, ticket_key)
-                if winner is None:
-                    raise
-                return {
-                    "result": "duplicate",
-                    "existing": await _db_result_to_dict(session, winner),
-                }
-        else:
-            row = await results.insert(session, **insert_kwargs)
-
-        # --- Cooldown hráče (queue, 4 dny per kit; i ticket výsledek ho
-        #     prodlužuje – ale jen pro TENTO kit, ne ostatní) ---
-        if queue_cooldown_ms > 0:
-            await CooldownRepository().upsert(
-                session,
-                player_id=player.id,
-                cooldown_type=COOLDOWN_WAITLIST,
-                kit_id=kit_row.id,
-                expires_at=_ms_to_dt(now + int(queue_cooldown_ms)),
-                source="result",
-            )
-
-        # --- Ticket: zavření + HT3+ cooldown + event log (atomicky) ---
-        if ticket_id is not None:
-            await TicketRepository().close_by_channel(
-                session, channel_id=int(tid), closed_at=_ms_to_dt(now)
-            )
-            if ht3_cooldown_ms > 0:
-                await CooldownRepository().upsert(
-                    session,
-                    player_id=player.id,
-                    cooldown_type=COOLDOWN_HT3,
-                    kit_id=kit_row.id,
-                    expires_at=_ms_to_dt(now + int(ht3_cooldown_ms)),
-                    source="ticket_close",
-                )
-            await AuditRepository().append(
-                session,
-                action="result",
-                actor_id=int(evaluator_id) if evaluator_id.isdigit() else None,
-                actor_name=evaluator_name or "",
-                entity_type="ticket",
-                entity_id=str(tid),
-                details={
-                    "details": f"{previous} → {normalize_tier(new_tier)}",
-                    "ts": int(now),
-                },
-            )
+        try:
+            async with session.begin_nested():
+                row = await results.insert(session, **insert_kwargs)
+        except IntegrityError:
+            winner = await results.get_by_key(session, ticket_key)
+            if winner is None:
+                raise
+            return {
+                "result": "duplicate",
+                "existing": await _db_result_to_dict(session, winner),
+            }
 
         record = await _db_result_to_dict(session, row)
         return {"result": "created", "record": record, "previous_tier": previous}

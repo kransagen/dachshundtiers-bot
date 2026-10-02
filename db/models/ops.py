@@ -127,10 +127,12 @@ class QueueEntry(Base):
             postgresql_where=text("status = 'waiting'"),
         ),
         Index("ix_queue_position", "queue_id", "position"),
+        Index("ix_queue_entries_player", "player_id"),
         CheckConstraint(
             "status IN ('waiting', 'pulled', 'left', 'tested')",
             name="status",
         ),
+        CheckConstraint("position >= 0", name="position"),
     )
 
 

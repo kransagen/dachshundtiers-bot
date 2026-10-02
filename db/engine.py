@@ -10,6 +10,7 @@ No global session is leaked: sessions are created per operation via an
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Union
 
 from sqlalchemy.ext.asyncio import (
@@ -29,6 +30,16 @@ DEFAULT_MAX_OVERFLOW = 10
 DEFAULT_POOL_TIMEOUT = 30.0
 DEFAULT_POOL_RECYCLE = 1800  # seconds; remote PG closes idle conns sooner
 DEFAULT_POOL_PRE_PING = True
+DEFAULT_STATEMENT_TIMEOUT_MS = 120_000
+DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS = 300_000
+
+
+def _timeout_ms(env_name: str, default: int) -> int:
+    """Timeout z prostředí v ms; ``0`` ho vypne (např. za pgbouncerem)."""
+    try:
+        return max(0, int(os.getenv(env_name, "").strip() or default))
+    except ValueError:
+        return default
 
 
 def create_async_engine_from_url(
@@ -59,11 +70,28 @@ def create_async_engine_from_url(
         "pool_recycle": pool_recycle,
         "pool_pre_ping": pool_pre_ping,
     }
+    connect_args = dict(kwargs.pop("connect_args", None) or {})
+    server_settings = dict(connect_args.get("server_settings") or {})
+    for setting, env_name, default in (
+        ("statement_timeout", "DB_STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS),
+        (
+            "idle_in_transaction_session_timeout",
+            "DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+            DEFAULT_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+        ),
+    ):
+        timeout = _timeout_ms(env_name, default)
+        if timeout:
+            server_settings.setdefault(setting, str(timeout))
+    if server_settings:
+        connect_args["server_settings"] = server_settings
     poolclass = kwargs.get("poolclass")
     if poolclass is not None and not issubclass(poolclass, QueuePool):
         for key in ("pool_size", "max_overflow", "pool_timeout", "pool_recycle"):
             pool_kwargs.pop(key, None)
-    return create_async_engine(async_url, echo=echo, **pool_kwargs, **kwargs)
+    return create_async_engine(
+        async_url, echo=echo, connect_args=connect_args, **pool_kwargs, **kwargs
+    )
 
 
 def make_session_factory(

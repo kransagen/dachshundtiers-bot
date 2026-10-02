@@ -1,7 +1,9 @@
 """Diagnostický cog – /verze ukáže, na jaké verzi bot reálně běží."""
 
+import asyncio
 import logging
 import subprocess
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -9,7 +11,9 @@ from discord.ext import commands
 
 from cogs._shared import admin_gate_error
 from config import GUILD_ID
-from storage import backend_name, database_status
+from db.config import DatabaseConfigError
+from db.validation import validate_database
+from storage import backend_name
 
 log = logging.getLogger("dachshundtiers")
 
@@ -22,6 +26,7 @@ def git_commit() -> str:
             capture_output=True,
             text=True,
             timeout=5,
+            cwd=Path(__file__).resolve().parents[1],
         ).stdout.strip()
         return output or "??"
     except Exception:  # noqa: BLE001
@@ -37,7 +42,8 @@ class Info(commands.Cog):
         description="Zobrazí commit a stav /result (diagnostika)",
     )
     async def verze(self, interaction: discord.Interaction) -> None:
-        commit = git_commit()
+        await interaction.response.defer(ephemeral=True)
+        commit = await asyncio.to_thread(git_commit)
 
         tree = self.bot.tree
         commands_list = tree.get_commands()
@@ -94,7 +100,7 @@ class Info(commands.Cog):
                 f"**Duplicitní jména (global ∩ guild):** {dup_text}"
             ),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(
         name="dbstatus",
@@ -104,20 +110,25 @@ class Info(commands.Cog):
         """Bezpečně ověří PostgreSQL bez výpisu URL nebo hesla."""
         if (msg := admin_gate_error(interaction)) is not None:
             return await interaction.response.send_message(msg, ephemeral=True)
-        status = database_status()
-        records = (
-            f"\n**Datové záznamy:** {status['records']}"
-            if status["records"] is not None
-            else ""
-        )
+        await interaction.response.defer(ephemeral=True)
+        engine = getattr(self.bot, "db_engine", None)
+        if engine is None:
+            ok, message = False, "PostgreSQL engine bota není inicializovaný."
+        else:
+            try:
+                info = await asyncio.wait_for(validate_database(engine), timeout=10)
+                ok = True
+                message = f"PostgreSQL je dostupná, schéma `{info['schema_revision']}`."
+            except DatabaseConfigError as err:
+                ok, message = False, str(err)
+            except asyncio.TimeoutError:
+                ok, message = False, "PostgreSQL neodpověděla do 10 s."
         embed = discord.Embed(
-            title="✅ Databáze je připravená" if status["ok"] else "❌ Databáze není dostupná",
-            description=(
-                f"**Backend:** `{status['backend']}`\n{status['message']}{records}"
-            ),
-            color=0x10B981 if status["ok"] else 0xEF4444,
+            title="✅ Databáze je připravená" if ok else "❌ Databáze není dostupná",
+            description=f"**Backend:** `postgresql`\n{message}",
+            color=0x10B981 if ok else 0xEF4444,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

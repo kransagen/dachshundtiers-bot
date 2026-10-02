@@ -13,6 +13,7 @@ Bez dostupné DB se operace zastaví s jasnou chybou – žádný JSON fallback.
 """
 
 import asyncio
+import logging
 import random
 import time
 from datetime import datetime, timezone
@@ -27,10 +28,14 @@ from db.repositories.kits import KitRepository
 from db.repositories.tournaments import TournamentRepository
 from db.services.session import transaction
 from services.kit_catalog import get_kits
+from services.tickets import HT3_TIER_LADDER
 from utils import has_tester_role, kit_autocomplete, spawn
 from views import TournamentSignupView
 
+log = logging.getLogger("dachshundtiers")
+
 TOURNAMENT_TIERS = ["LT3", "HT3", "LT2", "HT2", "LT1", "HT1"]
+RESULT_TIER_CODES = {t for t in HT3_TIER_LADDER if t != "LT3E"}
 
 
 async def end_tournament_signup(
@@ -46,12 +51,13 @@ async def end_tournament_signup(
         tournament = await TournamentRepository().get_by_kit(session, kit_id=kit.id)
         if tournament is None or tournament.ended:
             return
+        tournament_id = tournament.id
         kit_name = kit.name
         tier = tournament.tier
         num_groups = max(1, tournament.groups_count)
         signup_channel_id = tournament.signup_channel_id
         category_id = tournament.category_id
-        players = await TournamentRepository().list_participant_ids(
+        players = await TournamentRepository().list_participant_discord_ids(
             session, tournament.id
         )
         await TournamentRepository().mark_ended(session, tournament.id)
@@ -89,58 +95,79 @@ async def end_tournament_signup(
     for index, player_id in enumerate(shuffled):
         groups[index % num_groups].append(player_id)
 
-    everyone = guild.default_role
+    created_channels: list[discord.abc.GuildChannel] = []
+    try:
+        everyone = guild.default_role
 
-    for group_index, group_players in enumerate(groups, 1):
-        if not group_players:
-            continue
+        for group_index, group_players in enumerate(groups, 1):
+            if not group_players:
+                continue
 
-        # Permice: jen hráči skupiny (+ admini) vidí roomku
-        overwrites = {everyone: discord.PermissionOverwrite(view_channel=False)}
-        for player_id in group_players:
-            member = guild.get_member(player_id)
-            if member is not None:
-                overwrites[member] = discord.PermissionOverwrite(
-                    view_channel=True, send_messages=True
+            # Permice: jen hráči skupiny (+ admini) vidí roomku
+            overwrites = {everyone: discord.PermissionOverwrite(view_channel=False)}
+            for player_id in group_players:
+                member = guild.get_member(player_id)
+                if member is not None:
+                    overwrites[member] = discord.PermissionOverwrite(
+                        view_channel=True, send_messages=True
+                    )
+
+            group_channel = await guild.create_text_channel(
+                name=f"{kit_key.lower()}-skupina-{group_index}",
+                category=category,
+                overwrites=overwrites,
+            )
+            created_channels.append(group_channel)
+
+            # Zápasy 1v1 (každý zápas na vlastní řádek s koncem řádku jako v originále)
+            matches_text = ""
+            for j in range(0, len(group_players), 2):
+                if j + 1 < len(group_players):
+                    matches_text += f"<@{group_players[j]}> vs <@{group_players[j + 1]}>\n"
+                else:
+                    matches_text += (
+                        f"<@{group_players[j]}> — *čeká na soupeře (lichý počet)*\n"
+                    )
+
+            players_list = "\n".join(
+                f"{i}. <@{p}>" for i, p in enumerate(group_players, 1)
+            )
+            mentions = " ".join(f"<@{p}>" for p in group_players)
+
+            embed = discord.Embed(
+                title=f"🏆 Skupina {group_index} — {kit_name} ({tier})",
+                description=(
+                    f"**Tier:** {tier}\n"
+                    f"**Hráči:**\n{players_list}\n\n"
+                    f"**Zápasy (1v1):**\n{matches_text}\n"
+                    f"*Tester zapíše výsledky po dokončení zápasů pomocí* `/turnajresult`."
+                ),
+                color=0x2ECC71,
+                timestamp=discord.utils.utcnow(),
+            )
+
+            try:
+                await group_channel.send(
+                    content=mentions,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=[discord.Object(p) for p in group_players]
+                    ),
                 )
-
-        group_channel = await guild.create_text_channel(
-            name=f"{kit_key.lower()}-skupina-{group_index}",
-            category=category,
-            overwrites=overwrites,
-        )
-
-        # Zápasy 1v1 (každý zápas na vlastní řádek s koncem řádku jako v originále)
-        matches_text = ""
-        for j in range(0, len(group_players), 2):
-            if j + 1 < len(group_players):
-                matches_text += f"<@{group_players[j]}> vs <@{group_players[j + 1]}>\n"
-            else:
-                matches_text += (
-                    f"<@{group_players[j]}> — *čeká na soupeře (lichý počet)*\n"
-                )
-
-        players_list = "\n".join(
-            f"{i}. <@{p}>" for i, p in enumerate(group_players, 1)
-        )
-        mentions = " ".join(f"<@{p}>" for p in group_players)
-
-        embed = discord.Embed(
-            title=f"🏆 Skupina {group_index} — {kit_name} ({tier})",
-            description=(
-                f"**Tier:** {tier}\n"
-                f"**Hráči:**\n{players_list}\n\n"
-                f"**Zápasy (1v1):**\n{matches_text}\n"
-                f"*Tester zapíše výsledky po dokončení zápasů pomocí* `/turnajresult`."
-            ),
-            color=0x2ECC71,
-            timestamp=discord.utils.utcnow(),
-        )
-
-        try:
-            await group_channel.send(content=mentions, embed=embed)
-        except discord.HTTPException:
-            pass
+            except discord.HTTPException:
+                pass
+    except Exception:
+        log.exception("Vytvoření skupin turnaje %s selhalo – vracím stav", kit_key)
+        for channel in created_channels:
+            try:
+                await channel.delete()
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        async with transaction(session_factory) as session:
+            await TournamentRepository().mark_ended(
+                session, tournament_id, ended=False
+            )
+        raise
 
 
 class Tournaments(commands.Cog):
@@ -183,8 +210,8 @@ class Tournaments(commands.Cog):
         self,
         interaction: discord.Interaction,
         role: discord.Role,
-        skupiny: int,
-        hodiny: float,
+        skupiny: app_commands.Range[int, 1, 25],
+        hodiny: app_commands.Range[float, 0.05, 720.0],
         kit: str,
         tier: str,
     ) -> None:
@@ -231,61 +258,80 @@ class Tournaments(commands.Cog):
 
         await interaction.response.defer(ephemeral=True)
 
-        everyone = interaction.guild.default_role
-        category = await interaction.guild.create_category(
-            name=f"🏆 {kit} {tier} Turnaj",
-            overwrites={
-                everyone: discord.PermissionOverwrite(view_channel=False),
-                role: discord.PermissionOverwrite(view_channel=True),
-            },
-        )
+        category = None
+        signup_channel = None
+        try:
+            everyone = interaction.guild.default_role
+            category = await interaction.guild.create_category(
+                name=f"🏆 {kit} {tier} Turnaj",
+                overwrites={
+                    everyone: discord.PermissionOverwrite(view_channel=False),
+                    role: discord.PermissionOverwrite(view_channel=True),
+                },
+            )
 
-        signup_channel = await interaction.guild.create_text_channel(
-            name=f"{kit_key}-{tier.lower()}-turnaj-a-sign-up",
-            category=category,
-            overwrites={
-                everyone: discord.PermissionOverwrite(view_channel=False),
-                role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
-            },
-        )
+            signup_channel = await interaction.guild.create_text_channel(
+                name=f"{kit_key}-{tier.lower()}-turnaj-a-sign-up",
+                category=category,
+                overwrites={
+                    everyone: discord.PermissionOverwrite(view_channel=False),
+                    role: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                },
+            )
 
-        deadline_ms = time.time() * 1000 + hodiny * 3600 * 1000
-        unix_time = int(deadline_ms / 1000)
+            deadline_ms = time.time() * 1000 + hodiny * 3600 * 1000
+            unix_time = int(deadline_ms / 1000)
 
-        embed = discord.Embed(
-            title=f"🏆 {kit.upper()} TURNAJ — {tier}",
-            description=(
-                "Klikni na tlačítko ✅ pro přihlášení do turnaje!\n\n"
-                f"**Kit:** {kit}\n"
-                f"**Tier:** {tier}\n"
-                f"**Skupin:** {skupiny}\n"
-                f"**Deadline:** <t:{unix_time}:F> (<t:{unix_time}:R>)"
-            ),
-            color=0xF1C40F,
-            timestamp=discord.utils.utcnow(),
-        )
-        embed.set_footer(text=f"Vytvořil: {interaction.user.name}")
-
-        view = TournamentSignupView(kit_key)
-        message = await signup_channel.send(
-            content=f"{role.mention}", embed=embed, view=view
-        )
-
-        async with transaction(session_factory) as session:
-            await TournamentRepository().create(
-                session,
-                kit_id=kit_row.id,
-                name=kit_name,
-                tier=tier,
-                groups_count=skupiny,
-                category_id=category.id,
-                signup_channel_id=signup_channel.id,
-                signup_message_id=message.id,
-                role_id=role.id,
-                guild_id=interaction.guild.id,
-                deadline=datetime.fromtimestamp(
-                    deadline_ms / 1000, tz=timezone.utc
+            embed = discord.Embed(
+                title=f"🏆 {kit.upper()} TURNAJ — {tier}",
+                description=(
+                    "Klikni na tlačítko ✅ pro přihlášení do turnaje!\n\n"
+                    f"**Kit:** {kit}\n"
+                    f"**Tier:** {tier}\n"
+                    f"**Skupin:** {skupiny}\n"
+                    f"**Deadline:** <t:{unix_time}:F> (<t:{unix_time}:R>)"
                 ),
+                color=0xF1C40F,
+                timestamp=discord.utils.utcnow(),
+            )
+            embed.set_footer(text=f"Vytvořil: {interaction.user.name}")
+
+            view = TournamentSignupView(kit_key)
+            message = await signup_channel.send(
+                content=f"{role.mention}",
+                embed=embed,
+                view=view,
+                allowed_mentions=discord.AllowedMentions(roles=[role]),
+            )
+
+            async with transaction(session_factory) as session:
+                await TournamentRepository().create(
+                    session,
+                    kit_id=kit_row.id,
+                    name=kit_name,
+                    tier=tier,
+                    groups_count=skupiny,
+                    category_id=category.id,
+                    signup_channel_id=signup_channel.id,
+                    signup_message_id=message.id,
+                    role_id=role.id,
+                    guild_id=interaction.guild.id,
+                    deadline=datetime.fromtimestamp(
+                        deadline_ms / 1000, tz=timezone.utc
+                    ),
+                )
+        except Exception:
+            log.exception("Vytvoření turnaje %s selhalo – mažu vytvořené kanály", kit)
+            for channel in (signup_channel, category):
+                if channel is None:
+                    continue
+                try:
+                    await channel.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+            return await interaction.followup.send(
+                "❌ Turnaj se nepodařilo vytvořit – vytvořené kanály byly smazány.",
+                ephemeral=True,
             )
 
         self.bot.add_view(view, message_id=message.id)
@@ -324,6 +370,17 @@ class Tournaments(commands.Cog):
                 "❌ Pouze na serveru.", ephemeral=True
             )
 
+        z_clean = z_tieru.strip().upper()
+        na_clean = na_tier.strip().upper()
+        if z_clean != "N/A" and z_clean not in RESULT_TIER_CODES:
+            return await interaction.response.send_message(
+                f"❌ Neplatný současný tier `{z_tieru}`.", ephemeral=True
+            )
+        if na_clean not in RESULT_TIER_CODES:
+            return await interaction.response.send_message(
+                f"❌ Neplatný nový tier `{na_tier}`.", ephemeral=True
+            )
+
         target_channel = interaction.guild.get_channel(TOURNAMENT_RESULT_CHANNEL_ID)
         if target_channel is None:
             try:
@@ -355,16 +412,25 @@ class Tournaments(commands.Cog):
 
         embed = discord.Embed(
             title=f"🏆 {kit.upper()} TURNAJ",
-            description=f"**Získává:**\n> <@{hrac.id}> — {z_tieru} ➔ **{na_tier}**",
+            description=f"**Získává:**\n> <@{hrac.id}> — {z_clean} ➔ **{na_clean}**",
             color=0x2ECC71,
             timestamp=discord.utils.utcnow(),
         )
         embed.set_footer(text=f"Zapisovatel: {interaction.user.name}")
 
-        allowed = discord.AllowedMentions(everyone=False, users=True, roles=[target_role])
-        await target_channel.send(
-            content=f"<@&{TOP_RESULT_ROLE_ID}>", embed=embed, allowed_mentions=allowed
+        allowed = discord.AllowedMentions(
+            everyone=False, users=[discord.Object(hrac.id)], roles=[target_role]
         )
+        try:
+            await target_channel.send(
+                content=f"<@&{TOP_RESULT_ROLE_ID}>", embed=embed, allowed_mentions=allowed
+            )
+        except (discord.Forbidden, discord.HTTPException) as err:
+            log.warning("Nelze poslat turnajový výsledek: %s", err)
+            return await interaction.response.send_message(
+                f"❌ Výsledek se nepodařilo odeslat do <#{TOURNAMENT_RESULT_CHANNEL_ID}>.",
+                ephemeral=True,
+            )
         await interaction.response.send_message(
             f"Výsledek byl úspěšně odeslán do <#{TOURNAMENT_RESULT_CHANNEL_ID}>.",
             ephemeral=True,

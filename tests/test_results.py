@@ -249,6 +249,9 @@ class ResultDbMirrorTests(unittest.TestCase):
              mock.patch.object(
                  cm, "remove_pulled_player", new=mock.AsyncMock(return_value=False)
              ), \
+             mock.patch.object(
+                 cm, "player_access_channel_ids", new=mock.AsyncMock(return_value=set())
+             ), \
              mock.patch(
                  "db.services.commit_confirmed_promotion",
                  new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
@@ -297,6 +300,20 @@ class ResultDbMirrorTests(unittest.TestCase):
         self.assertIsNone(kw["close_ticket_channel_id"])
         self.assertEqual(kw["audit_actor_id"], 777)
         self.assertEqual(kw["audit_actor_name"], str(inter.user))
+        self.assertEqual(
+            [spec.cooldown_type for spec in kw["cooldowns"]], ["waitlist"]
+        )
+
+    def test_unconfirmed_grant_sends_no_public_result_and_keeps_player_in_rooms(self):
+        cog = Results.__new__(Results)
+        cog.bot = mock.MagicMock()
+        cog.bot.db_session_factory = _FAKE_SESSION_FACTORY
+        inter = self._interaction(user_id=777)
+        failed = TierRoleGrant(ok=False, note="nelze", tier_role_id=None)
+        self._call(cog, inter, grant_result=failed)
+        cog.bot.get_channel.return_value.send.assert_not_awaited()
+        reply = inter.followup.send.await_args.args[0]
+        self.assertIn("nebyl potvrzen", reply)
 
     def test_grant_failed_is_handed_to_the_canonical_service(self):
         """Cog už NEMÁ vlastní gate – nepotvrzený grant se předá službě, která

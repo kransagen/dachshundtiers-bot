@@ -47,6 +47,8 @@ from config import (
     TOP_RESULT_ROLE_ID,
 )
 from cogs.roles import TierRoleGrant, auto_grant_kit_role
+from db.services.promotion import grant_confirmation
+from services.permissions import has_admin_role
 from services.kit_catalog import get_kits
 from db.repositories.results import ANNOUNCEMENT_FAILED, ANNOUNCEMENT_SENT
 from services.tickets import get_ticket, is_ht_fight_ticket
@@ -98,6 +100,7 @@ class HTFightRetryView(discord.ui.View):
         # G0: stav oznámení se zapisuje do PostgreSQL, ne do
         # `ht_results.json` – retry nikdy nesahá na JSON.
         self.session_factory = session_factory
+        self._sending = False
 
     @discord.ui.button(label="🔄 Zkusit odeslat znovu", style=discord.ButtonStyle.primary)
     async def retry(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -105,11 +108,15 @@ class HTFightRetryView(discord.ui.View):
             return await interaction.response.send_message(
                 "❌ Pouze pro testery.", ephemeral=True
             )
+        if self._sending:
+            return await interaction.response.defer()
+        self._sending = True
         try:
             sent = await self.result_channel.send(
                 content=self.content, allowed_mentions=self.allowed_mentions
             )
         except (discord.Forbidden, discord.HTTPException) as err:
+            self._sending = False
             log.warning("Retry HT Fight oznámení selhalo: %s", err)
             return await interaction.response.send_message(
                 "❌ Odeslání stále selhává – zkontroluj `TOP_RESULT_CHANNEL_ID`.",
@@ -295,6 +302,25 @@ class TopResult(commands.Cog):
             return await interaction.followup.send(
                 "❌ Soupeř nemůže být stejný hráč jako testovaný.", ephemeral=True
             )
+        if player_id == str(interaction.user.id) and not has_admin_role(interaction.user):
+            return await interaction.followup.send(
+                "❌ Nemůžeš zapisovat výsledek sám sobě.", ephemeral=True
+            )
+        if opponent.id != interaction.user.id:
+            opponent_member = (
+                interaction.guild.get_member(opponent.id)
+                if interaction.guild is not None
+                else None
+            )
+            if opponent_member is None and interaction.guild is not None:
+                try:
+                    opponent_member = await interaction.guild.fetch_member(opponent.id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    opponent_member = None
+            if opponent_member is None or not has_tester_role(opponent_member):
+                return await interaction.followup.send(
+                    "❌ Soupeř musí být tester (nebo ty sám).", ephemeral=True
+                )
 
         # 1) Zápis do kanonické historie – výhradně PostgreSQL (Result,
         #    promotion_status=discord_pending); players.json se NEpíše a
@@ -438,7 +464,7 @@ class TopResult(commands.Cog):
                         previous_tier if previous_tier not in ("N/A", "") else None
                     ),
                     bridge_tier_code=(rec.get("bridgeTier") or None),
-                    tier_status=tier_status.strip() or None,
+                    tier_status=(rec.get("tierStatus") or tier_status.strip() or None),
                     score=score.strip(),
                     outcome=outcome,
                     opponent_id=(
@@ -453,6 +479,16 @@ class TopResult(commands.Cog):
                     db_note = f"\n{wedge.message}"
             except Exception:  # noqa: BLE001 – mirror nesmí zablokovat /topresult
                 log.exception("PostgreSQL mirror pro HT Fight %s selhal", kit_clean)
+
+            if not grant_confirmation(grant)[0]:
+                return await interaction.followup.send(
+                    "❌ Povýšení **nebylo potvrzeno** – tier roli se nepodařilo udělit "
+                    "a ověřit, proto se nic neoznámilo ani nezapsalo do mirroru. "
+                    "Oprav role a zapiš `/topresult` znovu."
+                    + (f"\n{grant_note}" if grant_note else "")
+                    + db_note,
+                    ephemeral=True,
+                )
 
         # 1b) Prohra v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
         if ticket is not None:
@@ -474,7 +510,7 @@ class TopResult(commands.Cog):
         message = format_topresult_message(
             player_id=player_id,
             ign=ign_clean,
-            tier_status=tier_status.strip(),
+            tier_status=rec.get("tierStatus") or tier_status.strip(),
             kit=kit_clean,
             fight_tier=fight_tier,
             outcome=outcome,
@@ -484,7 +520,11 @@ class TopResult(commands.Cog):
             new_tier=new_tier,
             role_id=TOP_RESULT_ROLE_ID,
         )
-        allowed = discord.AllowedMentions(everyone=False, users=True, roles=[target_role])
+        allowed = discord.AllowedMentions(
+            everyone=False,
+            users=[discord.Object(int(player_id)), discord.Object(opponent.id)],
+            roles=[target_role],
+        )
         announce_result_id = rec.get("id")
         # Historie žije v PostgreSQL (G0 – HT fight záznam i jeho announcement).
         history_label = "PostgreSQL"

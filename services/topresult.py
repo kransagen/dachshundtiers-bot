@@ -41,10 +41,12 @@ DRUHÝ REŽIM TU UŽ NENÍ. ``players.json`` / ``ht_results.json`` /
 Žádná závislost na discord.py → snadné testy.
 """
 
+import hashlib
 import logging
 import re
 import time
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from db.repositories.cooldowns import COOLDOWN_HT3, CooldownRepository
@@ -84,11 +86,12 @@ HT_FIGHT_TIERS = tuple(t for t in HT3_TIER_LADDER if t != "LT3E")
 
 # Idempotentní klíč HT Fight výsledku uvnitř ticketu: ticketId + result_type.
 HT_FIGHT_TICKET_KEY_SUFFIX = ":ht_fight"
-# Klíč HT Fight výsledku mimo ticket (unikatní podle času zápisu).
+# Klíč HT Fight výsledku mimo ticket: otisk zápasu + okno dedupe, takže
+# souběžné identické odeslání narazí na unikátní ``result_key``.
 HT_FIGHT_RESULT_PREFIX = "htfight-"
 
 # Ochrana před duplicitou VOLNÝCH HT Fight výsledků: identický záznam
-# (stejný hráč + kit + fight tier + status + skóre + outcome + soupeř) v tomto
+# (stejný hráč + kit + fight tier + skóre + outcome + soupeř) v tomto
 # okně se považuje za duplicitní odeslání (dvojklik / dvakrát odeslaný zápas)
 # a NEPOŠLE se dvakrát. Každý jiný zápas (jiné skóre/soupeř/status) projde.
 HT_FIGHT_DEDUP_WINDOW_MS = 2 * 60 * 60 * 1000  # 2 hodiny
@@ -118,6 +121,11 @@ _MSG_BAD_BRIDGE = (
 _MSG_BRIDGE_ONLY_ON_WIN = (
     "❌ Bridge se zadává jen při **výhře** – při prohře hráč nepostupuje "
     "a žádný bridge tier se nepoužije."
+)
+_MSG_FIGHT_TIER_MISMATCH = (
+    "❌ Fight tier `{fight_tier}` neodpovídá postupu: hráč je na `{current}` "
+    "a výhra ho povýší na `{expected}`. Zadej fight tier `{expected}` "
+    "(nebo použij bridge)."
 )
 _MSG_BRIDGE_NOT_HIGHER = (
     "❌ Bridge tier `{bridge}` není **vyšší** než aktuální tier hráče "
@@ -300,8 +308,11 @@ async def record_ht_fight(
     ``ticket_id`` → propojí výsledek s ticketem, idempotentně klíčuje jako
     ``ht_fight:{ticketId}:ht_fight``; ticket musí existovat, být otevřený a
     TYPEM HT Fight. ``ticket_id=None`` → volný výsledek
-    (``ht_fight:htfight-{hráč}-{čas}``); identické opakované odeslání se
-    dedupuje (2h okno).
+    (``ht_fight:htfight-{hráč}-{otisk zápasu}-{okno}``); identické opakované
+    odeslání se dedupuje (2h okno). Výhra s povýšením zůstává
+    ``discord_pending`` do potvrzeného grantu (a smí se znovu zapsat), výhra
+    bez povýšení je rovnou ``committed``. Při povýšení se ``tier_status``
+    generuje z výsledku (``Povýšen na X``).
 
     ``session_factory`` (povinný) → zápis do PostgreSQL (HT Fight tier jde do
     ``Result.subtype``; výhra se vloží se stavem ``discord_pending`` – po
@@ -466,7 +477,7 @@ async def _db_record_ht_fight(
                 session, f"ht_fight:{result_id}"
             )
             if existing is not None:
-                if existing.promotion_status == PROMOTION_COMMITTED:
+                if existing.promotion_status != PROMOTION_DISCORD_PENDING:
                     return {
                         "result": "duplicate",
                         "existing": await _db_result_to_dict(session, existing),
@@ -493,7 +504,6 @@ async def _db_record_ht_fight(
                 score=score_clean,
                 outcome=outcome_clean,
                 opponent_id=opponent_id,
-                tier_status=status_clean,
                 now=now,
             )
             if dup is not None:
@@ -501,7 +511,24 @@ async def _db_record_ht_fight(
                     "result": "duplicate",
                     "existing": await _db_result_to_dict(session, dup),
                 }
-            result_id = f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{now}"
+            result_id = _free_fight_result_id(
+                player_id,
+                kit_row.id if kit_row is not None else None,
+                fight_tier=fight_tier,
+                score=score_clean,
+                outcome=outcome_clean,
+                opponent_id=opponent_id,
+                now=now,
+            )
+            stale = await results.get_by_key(session, f"ht_fight:{result_id}")
+            if stale is not None:
+                if stale.promotion_status != PROMOTION_DISCORD_PENDING:
+                    return {
+                        "result": "duplicate",
+                        "existing": await _db_result_to_dict(session, stale),
+                    }
+                await session.delete(stale)
+                await session.flush()
 
         kit_row = await _db_resolve_kit(session, kit)
         if ticket_id is not None:
@@ -570,6 +597,17 @@ async def _db_record_ht_fight(
             promoted = bridge_clean
         elif outcome_clean == "Won" and current:
             promoted = next_ticket_tier(current)
+            if promoted and normalize_tier(fight_tier) != promoted:
+                return {
+                    "result": "invalid_tier",
+                    "message": _MSG_FIGHT_TIER_MISMATCH.format(
+                        fight_tier=normalize_tier(fight_tier),
+                        current=current,
+                        expected=promoted,
+                    ),
+                }
+        if promoted:
+            status_clean = f"Povýšen na {promoted}"
 
         prev_tier_row = (
             await _db_resolve_tier(session, previous) if previous != "N/A" else None
@@ -586,31 +624,52 @@ async def _db_record_ht_fight(
             else None
         )
 
-        row = await results.insert(
-            session,
-            result_key=f"ht_fight:{result_id}",
-            kind="ht_fight",
-            subtype=normalize_tier(fight_tier),
-            player_id=player.id,
-            evaluator_id=evaluator.id if evaluator is not None else None,
-            kit_id=kit_row.id,
-            ticket_channel_id=int(tid) if ticket_id is not None else None,
-            previous_tier_id=prev_tier_row.id if prev_tier_row is not None else None,
-            new_tier_id=new_tier_row.id if new_tier_row is not None else None,
-            bridge_tier_id=bridge_tier_row.id if bridge_tier_row is not None else None,
-            tier_status=status_clean,
-            score=score_clean,
-            outcome=outcome_clean,
-            opponent_id=int(opponent_id) if str(opponent_id or "").isdigit() else None,
-            opponent_name=opponent_name,
-            notes=(notes or "").strip() or None,
-            eval_flag=False,
-            date=date or "",
-            recorded_at=_ms_to_dt(now),
-            promotion_status=(
-                PROMOTION_DISCORD_PENDING if outcome_clean == "Won" else None
-            ),
-        )
+        if outcome_clean != "Won":
+            promotion_status = None
+        elif promoted:
+            promotion_status = PROMOTION_DISCORD_PENDING
+        else:
+            promotion_status = PROMOTION_COMMITTED
+        try:
+            async with session.begin_nested():
+                row = await results.insert(
+                    session,
+                    result_key=f"ht_fight:{result_id}",
+                    kind="ht_fight",
+                    subtype=normalize_tier(fight_tier),
+                    player_id=player.id,
+                    evaluator_id=evaluator.id if evaluator is not None else None,
+                    kit_id=kit_row.id,
+                    ticket_channel_id=int(tid) if ticket_id is not None else None,
+                    previous_tier_id=(
+                        prev_tier_row.id if prev_tier_row is not None else None
+                    ),
+                    new_tier_id=new_tier_row.id if new_tier_row is not None else None,
+                    bridge_tier_id=(
+                        bridge_tier_row.id if bridge_tier_row is not None else None
+                    ),
+                    tier_status=status_clean,
+                    score=score_clean,
+                    outcome=outcome_clean,
+                    opponent_id=(
+                        int(opponent_id) if str(opponent_id or "").isdigit() else None
+                    ),
+                    opponent_name=opponent_name,
+                    notes=(notes or "").strip() or None,
+                    eval_flag=False,
+                    date=date or "",
+                    recorded_at=_ms_to_dt(now),
+                    promotion_status=promotion_status,
+                )
+        except IntegrityError:
+            winner = await results.get_by_key(session, f"ht_fight:{result_id}")
+            if winner is None:
+                raise
+            return {
+                "result": "duplicate",
+                "existing": await _db_result_to_dict(session, winner),
+            }
+
 
         if ticket_id is not None and outcome_clean == "Lost":
             await TicketRepository().close_by_channel(
@@ -654,6 +713,31 @@ async def _db_current_tier_code(
     return tier.code if tier is not None else "N/A"
 
 
+def _free_fight_result_id(
+    player_id,
+    kit_id,
+    *,
+    fight_tier: str,
+    score: str,
+    outcome: str,
+    opponent_id,
+    now: int,
+) -> str:
+    fingerprint = "|".join(
+        (
+            str(player_id),
+            str(kit_id),
+            (fight_tier or "").strip().upper(),
+            (score or "").strip().lower(),
+            (outcome or "").strip(),
+            str(opponent_id or "").strip(),
+        )
+    )
+    digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:16]
+    window = now // HT_FIGHT_DEDUP_WINDOW_MS
+    return f"{HT_FIGHT_RESULT_PREFIX}{player_id}-{digest}-{window}"
+
+
 async def _db_find_recent_ht_fight_duplicate(
     session: AsyncSession,
     player_id: int,
@@ -663,7 +747,6 @@ async def _db_find_recent_ht_fight_duplicate(
     score: str,
     outcome: str,
     opponent_id,
-    tier_status: str,
     now: int,
 ):
     """Volný HT Fight záznam identický s tímto odesláním (dedup), nebo None.
@@ -678,12 +761,13 @@ async def _db_find_recent_ht_fight_duplicate(
     sc = (score or "").strip().lower()
     oc = (outcome or "").strip()
     op = str(opponent_id or "").strip()
-    ts = (tier_status or "").strip().upper()
     since = _ms_to_dt(now - HT_FIGHT_DEDUP_WINDOW_MS)
     recent = await ResultRepository().list_free_ht_fights(
         session, player_id=player_id, since=since
     )
     for row in recent:
+        if row.promotion_status == PROMOTION_DISCORD_PENDING:
+            continue
         if str(row.subtype or "").strip().upper() != ft:
             continue
         if str(row.score or "").strip().lower() != sc:
@@ -691,8 +775,6 @@ async def _db_find_recent_ht_fight_duplicate(
         if str(row.outcome or "").strip() != oc:
             continue
         if str(row.opponent_id or "").strip() != op:
-            continue
-        if str(row.tier_status or "").strip().upper() != ts:
             continue
         return row
     return None

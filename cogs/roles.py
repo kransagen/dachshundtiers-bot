@@ -9,9 +9,7 @@ ID, viz db.validation)::
 Krátký slovník:
 - /setkitrole  – namapuje roli tieru pro kit,
 - /unsetkitrole– zruší mapování,
-- /kitrole     – vypíše všechna mapování,
-- /checkweb    – bezpečná synchronizace webu (preview / apply), viz
-                 ``cogs/checkweb.py`` (tato verze NIKDY nepíše automaticky).
+- /kitrole     – vypíše všechna mapování.
 
 Po `/result` se hráči automaticky dá role nového tieru a odeberou se ostatní
 tier role stejného kitu.
@@ -117,6 +115,8 @@ async def auto_grant_kit_role(
 
     Discord je jedinou autoritou aktuálních tierů – role se mění JEDNÍM
     API voláním (žádné add_roles + remove_roles zvlášť, žádný mezistav).
+    Cílová množina rolí se skládá z čerstvě načteného člena (ne z cache),
+    takže souběžná změna jiných rolí se nepřepíše.
     Vrací :class:`TierRoleGrant` – ``ok=False`` znamená, že se role
     NEzměnila (volající pak nesmí zapisovat DB mirror jako potvrzený).
 
@@ -168,13 +168,17 @@ async def auto_grant_kit_role(
     kit_other_tier_ids = {
         int(rid) for tier, rid in kit_map.items() if tier != tier_up
     }
-    target = [r for r in member.roles if r.id not in kit_other_tier_ids]
+    try:
+        base = await guild.fetch_member(int(member_id))
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        base = member
+    target = [r for r in base.roles if r.id not in kit_other_tier_ids]
     if role_obj not in target:
         target.append(role_obj)
     target_ids = {r.id for r in target}
     role_mention = role_obj.mention
 
-    if _role_ids(member) == target_ids:
+    if _role_ids(base) == target_ids:
         # Cached state already matches — nothing to mutate. But the cache can
         # be stale and Discord is the authority, so confirm against a live
         # read before reporting a CONFIRMED state the PG mirror may store.
@@ -334,6 +338,16 @@ class Roles(commands.Cog):
                 "❌ Zadej platný název kitu a tieru.", ephemeral=True
             )
 
+        me = interaction.guild.me if interaction.guild else None
+        if role.is_default() or role.managed or (
+            me is not None and role >= me.top_role
+        ):
+            return await interaction.response.send_message(
+                f"❌ Roli {role.mention} bot nemůže přidělovat (@everyone, "
+                "role spravovaná integrací nebo role nad rolí bota).",
+                ephemeral=True,
+            )
+
         ok = await set_kit_role(
             kit_key,
             tier_up,
@@ -430,7 +444,7 @@ class Roles(commands.Cog):
             description="\n".join(lines),
             color=0xF59E0B,
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

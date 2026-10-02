@@ -77,6 +77,14 @@ OUTCOME_UNCHANGED = "unchanged"
 # (datacheck.KNOWN_TIERS) – select editoru nabízí žebříček + retired varianty.
 RETIRED_PREFIX = "R"
 
+MAX_DISCORD_ID = 2**63 - 1
+
+
+def valid_discord_id(value) -> bool:
+    """Discord ID: číslo o 15–19 číslicích, které se vejde do bigintu."""
+    raw = str(value or "").strip()
+    return raw.isdigit() and 15 <= len(raw) <= 19 and int(raw) <= MAX_DISCORD_ID
+
 
 class InvalidTierEdit(ValueError):
     """Neplatná / zakázaná změna tieru (např. retired přes aktuální tier)."""
@@ -239,7 +247,7 @@ def change_player_discord(players, ref, new_discord_id: str):
         raise PlayerIdentityConflict(
             "Nové Discord ID musí být číslo (Discord ID uživatele)."
         )
-    if not did_clean.isdigit() or len(did_clean) < 15:
+    if not valid_discord_id(did_clean):
         raise PlayerIdentityConflict(
             "Nové Discord ID vypadá podezřele (Discord ID má ~17–19 číslic)."
         )
@@ -476,10 +484,16 @@ async def _apply_player_edit_db(
     from db.repositories.players import PlayerRepository
     from db.repositories.sync_audit import AuditRepository
     from db.repositories.tiers import MirrorRepository, MirrorServiceRepository
+    from db.services.retire_peak import PEAK_RETIRE, record_peak
     from db.services.session import transaction as db_transaction
+    from db.tier_catalog import ensure_tier
 
     field = edit.get("field")
-    discord_id = int(player_id) if str(player_id).isdigit() else None
+    discord_id = (
+        int(player_id)
+        if str(player_id).isdigit() and int(player_id) <= MAX_DISCORD_ID
+        else None
+    )
     if discord_id is None:
         return _db_not_found(player_id)
     async with db_transaction(session_factory) as session:
@@ -539,14 +553,7 @@ async def _apply_player_edit_db(
             return await KitRepository().get_by_name(session, kit_key)
 
         async def _resolve_tier(code: str):
-            tier = await TierDefinitionRepository().get_by_code(session, code)
-            if tier is not None:
-                return tier
-            retired = code.startswith(RETIRED_PREFIX)
-            kind = "virtual" if code == "LT3E" or retired else "ladder"
-            return await TierDefinitionRepository().get_or_create(
-                session, code=code, kind=kind, display_name=code
-            )
+            return await ensure_tier(session, code)
 
         if field == "cooldown":
             action = edit.get("action")
@@ -674,7 +681,7 @@ async def _apply_player_edit_db(
         if field == "discord_id":
             old_id = str(player.discord_id or "")
             new_id = str(edit.get("new_value") or "").strip()
-            if not new_id.isdigit() or len(new_id) < 15:
+            if not valid_discord_id(new_id):
                 return _db_error("Nové Discord ID vypadá podezřele (Discord ID má ~17–19 číslic).")
             if old_id == new_id:
                 return {
@@ -770,6 +777,15 @@ async def _apply_player_edit_db(
                     )
 
             tier_row = await _resolve_tier(stored)
+            if retired and old_tier is not None and not is_retired_tier(old_tier):
+                await record_peak(
+                    session,
+                    player_id=player.id,
+                    kit_id=kit.id,
+                    tier_id=current.tier_id,
+                    reason=PEAK_RETIRE,
+                    now=ts_dt,
+                )
             await MirrorServiceRepository().apply_observation(
                 session,
                 player_id=player.id,
@@ -918,6 +934,18 @@ async def execute_player_edit(
                 )
                 web_result["errors"] = [msg] if msg else ["web sync selhal"]
 
+    warnings = []
+    if db["field"] == "tier" and not db["new_value"].startswith(RETIRED_PREFIX):
+        role_ok = (
+            not roles_result["skipped"]
+            and roles_result["actions"] is not None
+            and not roles_result["errors"]
+        )
+        if not role_ok:
+            warnings.append(
+                "⚠️ Discord role neodpovídají novému tieru – příští `/sync discord` "
+                "změnu přepíše podle Discordu. Uprav roli ručně."
+            )
     errors = roles_result["errors"] + web_result["errors"]
     status = STATUS_PARTIAL if errors else STATUS_SUCCESS
     summary = []
@@ -927,16 +955,24 @@ async def execute_player_edit(
     if not web_result["skipped"]:
         summary.append(f"Web: {'OK' if web_result['ok'] else 'SELHAL'}")
     message = ", ".join(filter(None, summary)) or "DB změna aplikována."
-    return _report(status, db=db, roles=roles_result, web=web_result, message=message)
+    return _report(
+        status,
+        db=db,
+        roles=roles_result,
+        web=web_result,
+        message=message,
+        warnings=warnings,
+    )
 
 
-def _report(status, *, db, roles, web, message=""):
+def _report(status, *, db, roles, web, message="", warnings=None):
     return {
         "status": status,
         "db": db,
         "roles": roles,
         "web": web,
         "message": message,
+        "warnings": list(warnings or []),
     }
 
 

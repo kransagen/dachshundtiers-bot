@@ -43,6 +43,20 @@ class QueueRepository:
     async def get_by_id(self, session: AsyncSession, queue_id: int) -> Optional[Queue]:
         return await session.get(Queue, queue_id)
 
+    async def lock(self, session: AsyncSession, *, queue_id: int) -> Optional[Queue]:
+        """Row lock (``FOR UPDATE``) with a fresh ``closed_at``.
+
+        Join and close both take it, so a join can never insert a ``waiting``
+        entry into a queue that a concurrent close has already emptied.
+        """
+        result = await session.execute(
+            select(Queue)
+            .where(Queue.id == queue_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
     async def get_active(self, session: AsyncSession, *, kit_id: int) -> Optional[Queue]:
         result = await session.execute(
             select(Queue)
@@ -145,12 +159,14 @@ class QueueEntryRepository:
     async def list_waiting_for_player(
         self, session: AsyncSession, *, player_id: int
     ) -> list[QueueEntry]:
-        """Player waiting in any active queue (JSON queue.json is global)."""
+        """Player waiting in any open queue (entries of closed queues are ignored)."""
         result = await session.execute(
             select(QueueEntry)
+            .join(Queue, Queue.id == QueueEntry.queue_id)
             .where(
                 QueueEntry.player_id == player_id,
                 QueueEntry.status == QUEUE_ENTRY_WAITING,
+                Queue.closed_at.is_(None),
             )
             .order_by(QueueEntry.position)
         )

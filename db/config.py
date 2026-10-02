@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 
 class DatabaseConfigError(RuntimeError):
@@ -32,14 +32,29 @@ def _database_url_from_environment() -> str:
     user = os.getenv("DB_USER", "").strip()
     password = os.getenv("DB_PASSWORD", "")
     port = os.getenv("DB_PORT", "5432").strip() or "5432"
+    sslmode = os.getenv("DB_SSLMODE", "").strip()
     if not all((host, name, user, password)):
         return ""
     # Passwords may contain @, : or / — without URL encoding part of the
     # password would be parsed as the host.
-    return (
+    url = (
         f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
         f"@{host}:{quote(port, safe='')}/{quote(name, safe='')}"
     )
+    return f"{url}?sslmode={quote(sslmode, safe='')}" if sslmode else url
+
+
+def _asyncpg_query(url: str) -> str:
+    """psycopg/libpq query → asyncpg: ``sslmode`` je tam ``ssl``, ``channel_binding`` neexistuje."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = []
+    for key, value in parse_qsl(parts.query, keep_blank_values=True):
+        if key == "channel_binding":
+            continue
+        pairs.append(("ssl" if key == "sslmode" else key, value))
+    return urlunsplit(parts._replace(query=urlencode(pairs)))
 
 
 def database_url() -> str:
@@ -67,9 +82,9 @@ def build_async_database_url(raw: Optional[str] = None) -> str:
     if not url:
         return ""
     if url.startswith(("postgresql+asyncpg://", "postgres+asyncpg://")):
-        return url
+        return _asyncpg_query(url)
     if url.startswith(("postgresql://", "postgres://")):
-        return "postgresql+asyncpg://" + url.split("://", 1)[1]
+        return _asyncpg_query("postgresql+asyncpg://" + url.split("://", 1)[1])
     raise DatabaseConfigError(
         "Nepodporované schéma v DB připojení (podporováno: postgresql://, postgres://)."
     )

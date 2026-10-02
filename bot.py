@@ -96,10 +96,12 @@ async def _remove_obsolete_guild_commands(
             continue
         try:
             await http.delete_guild_command(app_id, guild.id, cmd.id)
-            removed.append(cmd.name)
         except (discord.Forbidden, discord.HTTPException) as err:
+            # Mimo `removed` – tento seznam feeds startup log „odstraněno N
+            # obsolete", takže zapsat neúspěch jako úspěch by lhalo o command setu.
             log.warning("Nelze smazat obsolete guild příkaz %s: %s", cmd.name, err)
-            removed.append(cmd.name)
+            continue
+        removed.append(cmd.name)
     return removed
 
 
@@ -232,12 +234,30 @@ class DachshundTiersBot(commands.Bot):
             "cogs.link",
             "cogs.retire",
         ]
+        failed: list[tuple[str, str]] = []
         for extension in extensions:
             try:
                 await self.load_extension(extension)
                 log.info("Načten cog %s", extension)
             except Exception as err:  # noqa: BLE001
-                log.error("Chyba při načítání cogy %s: %s", extension, err)
+                log.exception("Chyba při načítání cogy %s", extension)
+                failed.append((extension, type(err).__name__))
+
+        # Fail-fast: poloviční bot je horší než žádný. Kdyby se chyba jen
+        # zalogovala, ``on_ready`` by zaregistroval persistentní ``QueueView``/
+        # ``HTTicketView``, jejichž příkazové ekvivalenty (``/openq``, ``/pull``)
+        # by neexistovaly → živé panely bez obsluhy a „úspěšný" start.
+        if failed:
+            details = ", ".join(f"{name} ({err})" for name, err in failed)
+            log.critical(
+                "Nepodařilo se načíst %d z %d cogů: %s. Bot se nespustí.",
+                len(failed),
+                len(extensions),
+                details,
+            )
+            raise RuntimeError(
+                f"Nepodařilo se načíst cogy: {details}. Bot se nespustí."
+            )
 
     async def close(self) -> None:
         """Zavře client i PostgreSQL pool; disposuje se až po client close."""
@@ -464,6 +484,7 @@ class DachshundTiersBot(commands.Bot):
                     remaining_s = max(
                         0.0, tournament.deadline.timestamp() - now_ts
                     )
+
                     log.info("Turnaj %s: plánuji ukončení za %d s", kit_key, remaining_s)
 
                     async def _auto_end(guild_id: int, key: str, delay: float) -> None:
@@ -605,6 +626,10 @@ async def _init_database():
 async def main() -> None:
     ensure_data_dir()
     log.info("Úložiště dat: %s", backend_name())
+    log.info(
+        "Scope registrace slash příkazů: %s",
+        f"guild {GUILD_ID}" if GUILD_ID else "GLOBÁLNÍ",
+    )
     engine, session_factory = await _init_database()
     bot = DachshundTiersBot()
     bot.db_engine, bot.db_session_factory = engine, session_factory

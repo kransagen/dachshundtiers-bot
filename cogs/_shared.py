@@ -35,8 +35,14 @@ async def guild_members(guild: discord.Guild) -> list:
         fetched = await guild.fetch_members().flatten()
         if fetched:
             members = [m for m in fetched if not m.bot]
-    except Exception:  # noqa: BLE001 – bez members intentu fallback na cache
-        pass
+    except Exception as err:  # noqa: BLE001 – bez members intentu fallback na cache
+        log.warning(
+            "fetch_members() selhalo (%s: %s) – používám cache (%d členů). "
+            "Výsledek analýzy může být neúplný.",
+            type(err).__name__,
+            err,
+            len(members),
+        )
     return members
 
 

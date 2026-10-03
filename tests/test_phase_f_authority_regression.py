@@ -395,6 +395,7 @@ def _interaction(db_session_factory=None):
     inter.user = mock.Mock(id=42)
     inter.guild = mock.Mock(id=1)
     inter.message = mock.AsyncMock()
+    inter.edit_original_response = mock.AsyncMock()
     inter.response = mock.AsyncMock()
     inter.followup = mock.AsyncMock()
     inter.client = mock.Mock(db_session_factory=db_session_factory)

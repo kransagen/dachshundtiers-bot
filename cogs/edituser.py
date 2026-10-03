@@ -476,7 +476,7 @@ class PlayerEditorView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=view)
+                await interaction.edit_original_response(embed=embed, view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser: %s", err)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -552,12 +552,12 @@ class PlayerEditorView(SafeView):
         if not await self._admin(interaction):
             return
         self.stop()
+        await interaction.response.defer(ephemeral=True)
         try:
-            if interaction.message is not None:
-                await interaction.message.edit(view=None)
+            await interaction.edit_original_response(view=None)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze odebrat view /edituser: %s", err)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             "✖ Editor zavřen – nic se nezměnilo.", ephemeral=True
         )
 
@@ -621,7 +621,7 @@ class TierKitSelectView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=view)
+                await interaction.edit_original_response(embed=embed, view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (kit): %s", err)
 
@@ -642,7 +642,7 @@ class TierKitSelectView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(
+                await interaction.edit_original_response(
                     embed=_editor_embed(player), view=view
                 )
         except (discord.HTTPException, discord.Forbidden) as err:
@@ -736,7 +736,7 @@ class TierSelectView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=view)
+                await interaction.edit_original_response(embed=embed, view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (tier): %s", err)
 
@@ -757,7 +757,7 @@ class TierSelectView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(
+                await interaction.edit_original_response(
                     embed=_editor_embed(player), view=view
                 )
         except (discord.HTTPException, discord.Forbidden) as err:
@@ -819,7 +819,7 @@ class CooldownEditView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=await view._embed(), view=view)
+                await interaction.edit_original_response(embed=await view._embed(), view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (cooldown kit): %s", err)
 
@@ -866,7 +866,7 @@ class CooldownEditView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=view)
+                await interaction.edit_original_response(embed=embed, view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (cooldown): %s", err)
 
@@ -943,7 +943,7 @@ class CooldownEditView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=_editor_embed(player), view=view)
+                await interaction.edit_original_response(embed=_editor_embed(player), view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (zpět cd): %s", err)
 
@@ -973,7 +973,7 @@ class HistoryView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=_editor_embed(player), view=view)
+                await interaction.edit_original_response(embed=_editor_embed(player), view=view)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze překreslit view /edituser (zpět hist): %s", err)
 
@@ -1108,7 +1108,7 @@ class ConfirmEditView(SafeView):
                 self.stop()
                 try:
                     if interaction.message is not None:
-                        await interaction.message.edit(
+                        await interaction.edit_original_response(
                             embed=_editor_embed(player), view=view
                         )
                 except (discord.HTTPException, discord.Forbidden) as err:
@@ -1123,7 +1123,7 @@ class ConfirmEditView(SafeView):
         self.stop()
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=None)
+                await interaction.edit_original_response(embed=embed, view=None)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze upravit zrušenou zprávu /edituser: %s", err)
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1131,7 +1131,7 @@ class ConfirmEditView(SafeView):
     async def _finish_message(self, interaction, embed) -> None:
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=None)
+                await interaction.edit_original_response(embed=embed, view=None)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze upravit report /edituser: %s", err)
 

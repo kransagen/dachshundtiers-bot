@@ -541,7 +541,7 @@ class ConfirmViewMechanicsTests(unittest.TestCase):
         inter = _interaction(user=_admin_member())
         inter.user.id = 999
         inter.message = mock.MagicMock()
-        inter.message.edit = mock.AsyncMock()
+        inter.edit_original_response = mock.AsyncMock()
         return inter
 
     def _payload(self, **overrides):
@@ -586,7 +586,7 @@ class ConfirmViewMechanicsTests(unittest.TestCase):
         self.assertEqual(call_kwargs["edit"], self._payload()["edit"])
         self.assertTrue(view.finished)
         # report se přepíše místo konfirmace + duplikát jako ephemeral message
-        inter.message.edit.assert_awaited_once()
+        inter.edit_original_response.assert_awaited_once()
         inter.followup.send.assert_awaited_once()
         embed = inter.followup.send.await_args.kwargs["embed"]
         self.assertIn(eu.STATUS_SUCCESS, embed.title)
@@ -657,8 +657,8 @@ class ConfirmViewMechanicsTests(unittest.TestCase):
         asyncio.run(main())
         self.assertTrue(view.finished)
         # vrátilo se do hlavního menu (překreslení) – ne zavření
-        inter.message.edit.assert_awaited_once()
-        _, kwargs = inter.message.edit.await_args
+        inter.edit_original_response.assert_awaited_once()
+        _, kwargs = inter.edit_original_response.await_args
         self.assertIsInstance(kwargs["view"], PlayerEditorView)
 
 
@@ -668,7 +668,7 @@ class EditViewMechanicsTests(unittest.TestCase):
     def _inter(self):
         inter = _interaction(user=_admin_member())
         inter.message = mock.MagicMock()
-        inter.message.edit = mock.AsyncMock()
+        inter.edit_original_response = mock.AsyncMock()
         return inter
 
     def test_close_button_removes_view(self):
@@ -681,9 +681,10 @@ class EditViewMechanicsTests(unittest.TestCase):
                 await PlayerEditorView.on_close(view, inter, None)
 
         asyncio.run(main())
-        inter.message.edit.assert_awaited_once()
-        self.assertEqual(inter.message.edit.await_args.kwargs["view"], None)
-        inter.response.send_message.assert_awaited_once()
+        inter.edit_original_response.assert_awaited_once()
+        self.assertEqual(inter.edit_original_response.await_args.kwargs["view"], None)
+        inter.response.defer.assert_awaited_once()
+        inter.followup.send.assert_awaited_once()
 
     def test_tiers_button_swaps_to_kit_select(self):
         cog = EditUser.__new__(EditUser)
@@ -702,9 +703,9 @@ class EditViewMechanicsTests(unittest.TestCase):
                 await PlayerEditorView.on_tiers(view, inter, None)
 
         asyncio.run(main())
-        inter.message.edit.assert_awaited_once()
+        inter.edit_original_response.assert_awaited_once()
         self.assertIsInstance(
-            inter.message.edit.await_args.kwargs["view"], TierKitSelectView
+            inter.edit_original_response.await_args.kwargs["view"], TierKitSelectView
         )
 
     def test_history_button_swaps_to_history(self):
@@ -721,9 +722,9 @@ class EditViewMechanicsTests(unittest.TestCase):
                 await PlayerEditorView.on_history(view, inter, None)
 
         asyncio.run(main())
-        inter.message.edit.assert_awaited_once()
+        inter.edit_original_response.assert_awaited_once()
         self.assertIsInstance(
-            inter.message.edit.await_args.kwargs["view"], HistoryView
+            inter.edit_original_response.await_args.kwargs["view"], HistoryView
         )
 
     def test_swap_followup_when_edit_fails(self):
@@ -731,7 +732,7 @@ class EditViewMechanicsTests(unittest.TestCase):
         cog = EditUser.__new__(EditUser)
         view = PlayerEditorView(cog=cog, player_id=PLAYER_ID)
         inter = self._inter()
-        inter.message.edit = mock.AsyncMock(
+        inter.edit_original_response = mock.AsyncMock(
             side_effect=discord.HTTPException(mock.MagicMock(), "boom")
         )
 

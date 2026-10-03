@@ -59,7 +59,8 @@ def _interaction(user=None, guild=None):
     inter.response.defer = mock.AsyncMock()
     inter.followup = mock.MagicMock()
     inter.followup.send = mock.AsyncMock()
-    inter.message = SimpleNamespace(edit=mock.AsyncMock())
+    inter.message = SimpleNamespace()
+    inter.edit_original_response = mock.AsyncMock()
     # This test suite exercises the legacy/no-Postgres rollback path — a
     # bare MagicMock would auto-vivify `.client.db_session_factory` as a
     # truthy Mock, which apply_rollback_actions' H3 later-promotion guard

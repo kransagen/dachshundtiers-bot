@@ -378,7 +378,7 @@ async def _edit_embed_pack(interaction, embeds) -> None:
     """
     try:
         if interaction.message is not None:
-            await interaction.message.edit(embeds=embeds[:10], view=None)
+            await interaction.edit_original_response(embeds=embeds[:10], view=None)
     except (discord.HTTPException, discord.Forbidden) as err:
         log.warning("Nelze upravit potvrzovací zprávu: %s", err)
 
@@ -808,7 +808,7 @@ class SyncDiscordConfirmView(SafeView):
         embeds = _discord_embeds(outcome, preview=False)
         try:
             if interaction.message is not None:
-                await interaction.message.edit(view=None)
+                await interaction.edit_original_response(view=None)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze upravit potvrzovací zprávu: %s", err)
         await _send_embed_pack(interaction.followup, embeds)
@@ -969,7 +969,7 @@ class SyncDiscordRollbackView(SafeView):
 
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=None)
+                await interaction.edit_original_response(embed=embed, view=None)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze upravit potvrzovací zprávu: %s", err)
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -1062,7 +1062,7 @@ class SyncWebConfirmView(SafeView):
 
         try:
             if interaction.message is not None:
-                await interaction.message.edit(embed=embed, view=None)
+                await interaction.edit_original_response(embed=embed, view=None)
         except (discord.HTTPException, discord.Forbidden) as err:
             log.warning("Nelze upravit potvrzovací zprávu: %s", err)
         await interaction.followup.send(embed=embed, ephemeral=True)

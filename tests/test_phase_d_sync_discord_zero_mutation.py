@@ -92,7 +92,7 @@ async def _run_cog(session_factory, members):
         click.user.id = 1
         click.response.defer = mock.AsyncMock()
         click.followup.send = mock.AsyncMock()
-        click.message.edit = mock.AsyncMock()
+        click.edit_original_response = mock.AsyncMock()
         await view.confirm.callback(click)
     return inter, load_mock
 

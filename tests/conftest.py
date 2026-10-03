@@ -56,7 +56,7 @@ ALL_TABLES = (
     "tester_credits",
     "minecraft_accounts",
     "player_link_tokens",
-    "kit_tester_rooms",
+    "tester_rooms",
     "player_peak_tiers",
 )
 

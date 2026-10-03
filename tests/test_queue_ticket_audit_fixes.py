@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from db.models import Player, QueueEntry
 from db.repositories.cooldowns import COOLDOWN_HT3, CooldownRepository
-from db.repositories.kits import KitRepository, KitTesterRoomRepository, ensure_dimensions
+from db.repositories.kits import KitRepository, TesterRoomRepository, ensure_dimensions
 from db.repositories.queues import (
     QUEUE_ENTRY_WAITING,
     QueueRepository,
@@ -20,6 +20,7 @@ from services import queue_service as qsvc
 from services.ht3_tickets import ensure_eval_ticket
 
 NOW_MS = 1_700_000_000_000
+TESTER = 9
 COOLDOWN_MS = 4 * 24 * 60 * 60 * 1000
 KITS = (("anchorpvp", "AnchorPvP"), ("molepvp", "MolePVP"))
 TIERS = (("LT5", "ladder", "LT5", 1),)
@@ -54,10 +55,11 @@ async def test_requeue_pulled_player_keeps_position(session_factory, clean_db):
     await _join(session_factory, 1, "AliceMC", at=NOW_MS)
     await _join(session_factory, 2, "BobMC", at=NOW_MS + 1)
     async with transaction(session_factory) as session:
-        kit = await KitRepository().get_by_key(session, "anchorpvp")
-        await KitTesterRoomRepository().set_room(session, kit_id=kit.id, channel_id=555)
+        await TesterRoomRepository().set_room(
+            session, tester_discord_id=TESTER, channel_id=555
+        )
 
-    pulled = await qsvc.pull_for_kit("anchorpvp", session_factory=session_factory)
+    pulled = await qsvc.pull_for_kit("anchorpvp", TESTER, session_factory=session_factory)
     assert pulled.player["id"] == "1"
 
     assert await qsvc.requeue_pulled_player(
@@ -67,7 +69,7 @@ async def test_requeue_pulled_player_keeps_position(session_factory, clean_db):
     assert [e.status for e in entries] == [QUEUE_ENTRY_WAITING, QUEUE_ENTRY_WAITING]
     assert entries[0].pulled_at is None
 
-    again = await qsvc.pull_for_kit("anchorpvp", session_factory=session_factory)
+    again = await qsvc.pull_for_kit("anchorpvp", TESTER, session_factory=session_factory)
     assert again.player["id"] == "1"
 
 
@@ -75,9 +77,10 @@ async def test_requeue_skips_player_who_rejoined(session_factory, clean_db):
     await _seed(session_factory)
     await _join(session_factory, 1, "AliceMC")
     async with transaction(session_factory) as session:
-        kit = await KitRepository().get_by_key(session, "anchorpvp")
-        await KitTesterRoomRepository().set_room(session, kit_id=kit.id, channel_id=555)
-    pulled = await qsvc.pull_for_kit("anchorpvp", session_factory=session_factory)
+        await TesterRoomRepository().set_room(
+            session, tester_discord_id=TESTER, channel_id=555
+        )
+    pulled = await qsvc.pull_for_kit("anchorpvp", TESTER, session_factory=session_factory)
     await _join(session_factory, 1, "AliceMC", at=NOW_MS + 5)
 
     assert not await qsvc.requeue_pulled_player(
@@ -90,10 +93,10 @@ async def test_requeue_skips_player_who_rejoined(session_factory, clean_db):
 async def test_tester_room_helpers(session_factory, clean_db):
     await _seed(session_factory)
     assert not await qsvc.is_tester_room(555, session_factory=session_factory)
-    await qsvc.set_tester_room("anchorpvp", 555, session_factory=session_factory)
+    await qsvc.set_tester_room(TESTER, 555, session_factory=session_factory)
     assert await qsvc.is_tester_room(555, session_factory=session_factory)
     assert await qsvc.clear_tester_room_for_channel(555, session_factory=session_factory)
-    assert await qsvc.resolve_tester_room("anchorpvp", session_factory=session_factory) is None
+    assert await qsvc.resolve_tester_room(TESTER, session_factory=session_factory) is None
     assert not await qsvc.clear_tester_room_for_channel(555, session_factory=session_factory)
 
 
@@ -138,13 +141,15 @@ async def test_inactive_kit_cannot_open_join_or_pull(session_factory, clean_db):
     await _join(session_factory, 1, "AliceMC")
     async with transaction(session_factory) as session:
         kit = await KitRepository().get_by_key(session, "anchorpvp")
-        await KitTesterRoomRepository().set_room(session, kit_id=kit.id, channel_id=555)
+        await TesterRoomRepository().set_room(
+            session, tester_discord_id=TESTER, channel_id=555
+        )
         kit.active = False
         mole = await KitRepository().get_by_key(session, "molepvp")
         mole.active = False
 
     assert (await _join(session_factory, 2, "BobMC"))["result"] == "closed"
-    assert (await qsvc.pull_for_kit("anchorpvp", session_factory=session_factory)).status == (
+    assert (await qsvc.pull_for_kit("anchorpvp", TESTER, session_factory=session_factory)).status == (
         qsvc.PULL_NO_KIT
     )
     status, _ = await qsvc.open_queue(

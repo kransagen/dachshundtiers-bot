@@ -148,9 +148,11 @@ class TestOpenQueuePanelFailure:
 
         interaction = mock.Mock()
         interaction.user = SimpleNamespace(id=1, display_name="tester")
-        interaction.response.send_message = mock.AsyncMock()
+        interaction.response.defer = mock.AsyncMock()
+        interaction.followup.send = mock.AsyncMock()
 
         kit_channel = mock.Mock()
+        kit_channel.purge = mock.AsyncMock()
         kit_channel.history = mock.Mock(return_value=_NoMessages())
         kit_channel.send = mock.AsyncMock(
             side_effect=discord.Forbidden(mock.MagicMock(), "no perms")
@@ -174,11 +176,12 @@ class TestOpenQueuePanelFailure:
             ),
             mock.patch.object(cogs.queues, "create_queue_embed", mock.Mock(return_value=mock.Mock())),
             mock.patch.object(cogs.queues, "set_queue_panel", set_panel),
+            mock.patch.object(cogs.queues, "close_queue", mock.AsyncMock()),
         ):
             asyncio.run(cog.openq.callback(cog, interaction, kit="randompot"))
 
-        interaction.response.send_message.assert_awaited_once()
-        assert "nepodařilo poslat" in interaction.response.send_message.await_args.args[0]
+        interaction.followup.send.assert_awaited_once()
+        assert "nepodařilo odeslat" in interaction.followup.send.await_args.args[0]
         set_panel.assert_not_awaited()
 
 

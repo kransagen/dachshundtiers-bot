@@ -6,7 +6,7 @@ from db.models.identity import (
 from db.models.ops import (
     Cooldown,
     Evaluation,
-    KitTesterRoom,
+    TesterRoom,
     Queue,
     QueueEntry,
     QueueTester,
@@ -41,7 +41,7 @@ __all__ = [
     "Evaluation",
     "Kit",
     "KitRole",
-    "KitTesterRoom",
+    "TesterRoom",
     "MinecraftAccount",
     "MigrationImportIssue",
     "OutboxEvent",

@@ -55,7 +55,7 @@ from db.tier_catalog import ladder_rank
 from db.repositories.cooldowns import CooldownRepository
 from db.repositories.kits import (
     KitRepository,
-    KitTesterRoomRepository,
+    TesterRoomRepository,
     TierDefinitionRepository,
 )
 from db.repositories.players import PlayerIdentityError, PlayerRepository
@@ -261,7 +261,7 @@ async def player_access_channel_ids(
     async with db_transaction(session_factory) as session:
         channels = {
             room.channel_id
-            for room in await KitTesterRoomRepository().list_all(session)
+            for room in await TesterRoomRepository().list_all(session)
         }
         player = await PlayerRepository().get_by_discord_id(session, int(player_id))
         if player is None:

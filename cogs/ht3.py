@@ -37,7 +37,6 @@ from services.tickets import (
     remove_member,
     unclaim_ticket,
 )
-from services.permissions import has_admin_role
 from utils import has_tester_role, kit_autocomplete
 from views import (
     HT3PanelView,

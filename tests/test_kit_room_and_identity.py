@@ -1,4 +1,4 @@
-"""Feature tests: kit -> tester room, queue pull by kit, Minecraft linking,
+"""Feature tests: tester -> tester room, queue pull by kit, Minecraft linking,
 eval -> HT3, and HT3 auto IGN/tier.
 
 These are the pieces the brief added on top of the existing relational core.
@@ -20,12 +20,12 @@ from db.base import utcnow
 from db.models import (
     Cooldown,
     Kit,
-    KitTesterRoom,
     MinecraftAccount,
     Player,
     PlayerLinkToken,
     QueueEntry,
     Result,
+    TesterRoom,
     Ticket,
     TierDefinition,
     TierHistory,
@@ -34,7 +34,7 @@ from db.models import (
 from db.repositories.evaluations import EvaluationRepository
 from db.repositories.evaluations import TesterRepository as _TesterRepo  # noqa: F401
 from db.repositories.identity import PlayerAlreadyLinked, PlayerIdentityRepository
-from db.repositories.kits import KitRepository, KitTesterRoomRepository
+from db.repositories.kits import KitRepository, TesterRoomRepository
 from db.repositories.queues import (
     QUEUE_ENTRY_PULLED,
     QUEUE_ENTRY_WAITING,
@@ -130,97 +130,70 @@ from db.repositories.tickets import TicketRepository  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# kit -> tester room
+# tester -> tester room
 # ---------------------------------------------------------------------------
 
+TESTER = 7
+OTHER_TESTER = 8
 
-class TestKitTesterRoom:
+
+class TestTesterRoom:
     async def test_set_and_resolve_roundtrip(self, session_factory, clean_db):
-        async with session_factory() as s:
-            async with s.begin():
-                await _kit(s)
-
-        kit_id = await queue_service.set_tester_room(
-            "boxing", 4242, created_by=7, session_factory=session_factory
-        )
-        assert kit_id is not None
+        await queue_service.set_tester_room(TESTER, 4242, session_factory=session_factory)
         assert (
-            await queue_service.resolve_tester_room("boxing", session_factory=session_factory)
+            await queue_service.resolve_tester_room(TESTER, session_factory=session_factory)
             == 4242
         )
 
-    async def test_unknown_kit_is_refused(self, session_factory, clean_db):
+    async def test_tester_without_room_resolves_to_none(self, session_factory, clean_db):
         assert (
-            await queue_service.set_tester_room("nope", 1, session_factory=session_factory)
-            is None
-        )
-        assert (
-            await queue_service.resolve_tester_room("nope", session_factory=session_factory)
+            await queue_service.resolve_tester_room(TESTER, session_factory=session_factory)
             is None
         )
 
     async def test_setting_again_replaces_rather_than_duplicates(
         self, session_factory, clean_db
     ):
-        """One room per kit: re-running /mktesterroom updates, never duplicates."""
-        async with session_factory() as s:
-            async with s.begin():
-                await _kit(s)
-
-        await queue_service.set_tester_room("boxing", 1, session_factory=session_factory)
-        await queue_service.set_tester_room("boxing", 2, session_factory=session_factory)
+        """One room per tester: re-running /mktesterroom updates, never duplicates."""
+        await queue_service.set_tester_room(TESTER, 1, session_factory=session_factory)
+        await queue_service.set_tester_room(TESTER, 2, session_factory=session_factory)
 
         async with session_factory() as s:
-            rows = list((await s.execute(select(KitTesterRoom))).scalars())
+            rows = list((await s.execute(select(TesterRoom))).scalars())
         assert len(rows) == 1
         assert rows[0].channel_id == 2
 
-    async def test_one_channel_cannot_belong_to_two_kits(self, session_factory, clean_db):
-        """UNIQUE on channel_id: otherwise /queue pull would be ambiguous."""
-        async with session_factory() as s:
-            async with s.begin():
-                await _kit(s, "boxing", "Boxing")
-                await _kit(s, "anchorpvp", "AnchorPvP")
-
-        await queue_service.set_tester_room("boxing", 555, session_factory=session_factory)
+    async def test_one_channel_cannot_belong_to_two_testers(self, session_factory, clean_db):
+        """UNIQUE on channel_id: a room has exactly one owner."""
+        await queue_service.set_tester_room(TESTER, 555, session_factory=session_factory)
         with pytest.raises(IntegrityError):
             await queue_service.set_tester_room(
-                "anchorpvp", 555, session_factory=session_factory
+                OTHER_TESTER, 555, session_factory=session_factory
             )
 
-    async def test_clear_removes_the_mapping(self, session_factory, clean_db):
-        async with session_factory() as s:
-            async with s.begin():
-                await _kit(s)
-        await queue_service.set_tester_room("boxing", 1, session_factory=session_factory)
-        assert await queue_service.clear_tester_room("boxing", session_factory=session_factory)
+    async def test_each_tester_has_their_own_room(self, session_factory, clean_db):
+        await queue_service.set_tester_room(TESTER, 1, session_factory=session_factory)
+        await queue_service.set_tester_room(OTHER_TESTER, 2, session_factory=session_factory)
+        assert await queue_service.resolve_tester_room(TESTER, session_factory=session_factory) == 1
         assert (
-            await queue_service.resolve_tester_room("boxing", session_factory=session_factory)
+            await queue_service.resolve_tester_room(OTHER_TESTER, session_factory=session_factory)
+            == 2
+        )
+
+    async def test_clear_removes_the_mapping(self, session_factory, clean_db):
+        await queue_service.set_tester_room(TESTER, 1, session_factory=session_factory)
+        assert await queue_service.clear_tester_room(TESTER, session_factory=session_factory)
+        assert (
+            await queue_service.resolve_tester_room(TESTER, session_factory=session_factory)
             is None
         )
 
-    async def test_lookup_by_channel_finds_the_kit(self, session_factory, clean_db):
+    async def test_lookup_by_channel_finds_the_tester(self, session_factory, clean_db):
+        await queue_service.set_tester_room(TESTER, 808, session_factory=session_factory)
         async with session_factory() as s:
-            async with s.begin():
-                await _kit(s)
-        await queue_service.set_tester_room("boxing", 808, session_factory=session_factory)
-        async with session_factory() as s:
-            row = await KitTesterRoomRepository().get_for_channel(s, channel_id=808)
+            row = await TesterRoomRepository().get_for_channel(s, channel_id=808)
         assert row is not None
-        assert row.channel_id == 808
-
-    async def test_display_name_also_resolves(self, session_factory, clean_db):
-        """Testers paste display names as often as keys."""
-        async with session_factory() as s:
-            async with s.begin():
-                await _kit(s, "anchorpvp", "AnchorPvP")
-        await queue_service.set_tester_room(
-            "AnchorPvP", 9, session_factory=session_factory
-        )
-        assert (
-            await queue_service.resolve_tester_room("anchorpvp", session_factory=session_factory)
-            == 9
-        )
+        assert row.tester_discord_id == TESTER
 
 
 # ---------------------------------------------------------------------------
@@ -240,22 +213,48 @@ class TestPullByKit:
                 await _open_queue(s, kit=kit, players=players)
         if room is not None:
             await queue_service.set_tester_room(
-                "boxing", room, session_factory=session_factory
+                TESTER, room, session_factory=session_factory
             )
 
     async def test_pull_returns_the_first_player_and_the_kits_room(
         self, session_factory, clean_db
     ):
         await self._seed(session_factory, room=4242)
-        result = await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        result = await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
         assert result.ok
         assert result.channel_id == 4242
         assert result.player["ign"] == "player0"
 
+    async def test_one_room_serves_every_kit_of_the_tester(self, session_factory, clean_db):
+        """Regression: a tester used to need a separate room for every kit."""
+        await self._seed(session_factory, room=4242)
+        async with session_factory() as s:
+            async with s.begin():
+                kit = await _kit(s, "anchorpvp", "AnchorPvP")
+                player = await _player(s, discord_id=900, ign="anchorplayer")
+                await _open_queue(s, kit=kit, players=[player])
+
+        boxing = await queue_service.pull_for_kit(
+            "boxing", TESTER, session_factory=session_factory
+        )
+        anchor = await queue_service.pull_for_kit(
+            "anchorpvp", TESTER, session_factory=session_factory
+        )
+        assert boxing.ok and anchor.ok
+        assert boxing.channel_id == anchor.channel_id == 4242
+
+    async def test_another_testers_room_is_not_used(self, session_factory, clean_db):
+        """The room comes from the pulling tester, never from someone else."""
+        await self._seed(session_factory, room=4242)
+        result = await queue_service.pull_for_kit(
+            "boxing", OTHER_TESTER, session_factory=session_factory
+        )
+        assert result.status == queue_service.PULL_NO_ROOM
+
     async def test_pull_is_fifo(self, session_factory, clean_db):
         await self._seed(session_factory, room=1)
         pulled = [
-            (await queue_service.pull_for_kit("boxing", session_factory=session_factory)).player[
+            (await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)).player[
                 "ign"
             ]
             for _ in range(3)
@@ -266,7 +265,7 @@ class TestPullByKit:
         self, session_factory, clean_db
     ):
         await self._seed(session_factory, room=1)
-        await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
         async with session_factory() as s:
             statuses = [
                 e.status
@@ -283,7 +282,7 @@ class TestPullByKit:
     ):
         """The important one: no room must never mean 'player silently lost'."""
         await self._seed(session_factory, room=None)
-        result = await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        result = await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
         assert result.status == queue_service.PULL_NO_ROOM
         assert result.player is None
         async with session_factory() as s:
@@ -301,12 +300,12 @@ class TestPullByKit:
         async with session_factory() as s:
             async with s.begin():
                 await _kit(s)
-        await queue_service.set_tester_room("boxing", 1, session_factory=session_factory)
-        result = await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        await queue_service.set_tester_room(TESTER, 1, session_factory=session_factory)
+        result = await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
         assert result.status == queue_service.PULL_EMPTY
 
     async def test_unknown_kit(self, session_factory, clean_db):
-        result = await queue_service.pull_for_kit("nope", session_factory=session_factory)
+        result = await queue_service.pull_for_kit("nope", TESTER, session_factory=session_factory)
         assert result.status == queue_service.PULL_NO_KIT
 
     async def test_concurrent_pulls_never_hand_out_the_same_player_twice(
@@ -316,7 +315,7 @@ class TestPullByKit:
         await self._seed(session_factory, room=1, count=4)
         results = await asyncio.gather(
             *[
-                queue_service.pull_for_kit("boxing", session_factory=session_factory)
+                queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
                 for _ in range(4)
             ]
         )
@@ -334,13 +333,13 @@ class TestPullByKit:
                     s, entry_id=entry.id, status="left"
                 )
 
-        result = await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        result = await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
         assert result.ok
         assert result.player["ign"] == "player1"
 
     async def test_room_belongs_to_exactly_one_pull_result(self, session_factory, clean_db):
         await self._seed(session_factory, room=77)
-        result = await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        result = await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
         assert result.channel_id == 77
         async with session_factory() as s:
             entry = (await s.execute(select(QueueEntry))).scalars().first()
@@ -1045,8 +1044,8 @@ class TestCooldownScopeStillHolds:
                     await _player(s, discord_id=200 + i, ign=f"p{i}") for i in range(2)
                 ]
                 await _open_queue(s, kit=kit, players=players)
-        await queue_service.set_tester_room("boxing", 1, session_factory=session_factory)
-        await queue_service.pull_for_kit("boxing", session_factory=session_factory)
+        await queue_service.set_tester_room(TESTER, 1, session_factory=session_factory)
+        await queue_service.pull_for_kit("boxing", TESTER, session_factory=session_factory)
 
         async with session_factory() as s:
             rows = list((await s.execute(select(Cooldown))).scalars())

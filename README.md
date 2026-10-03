@@ -48,8 +48,8 @@ může je použít kdokoli, kdo vidí příkaz (pokud jde o ne-guild registraci)
 | `/closeq kit` | kdokoli může zavřít frontu testerům |
 | `/addqchannel kit` | mění konfiguraci bota (kam chodí panely) |
 | `/sendht3` | spam panelu do kanálu |
-| `/pull kit` | vytáhne hráče z fronty do roomky |
-| `/mktesterroom` | vytvoří tester roomku |
+| `/pull kit` | vytáhne hráče z fronty do tvé tester roomky |
+| `/mktesterroom` | vytvoří tester roomku (jedna na testera, platí pro všechny kity) |
 
 Pokud to chceš omezit, je to chyba, kterou je potřeba opravit v kódu –
 `has_admin_role()` jako první věc v callbacku (viz `/addkit`). Do té doby
@@ -367,10 +367,10 @@ Unretire zatím v botovi není.
 | `/joinasqueue kit` | Tester se přidá do fronty jako další tester. |
 | `/leaveq kit` | Tester opustí frontu. |
 | `/list` | Přehled front a aktivních testerů. |
-| `/pull kit` | Vytáhne prvního hráče z fronty do vybrané roomky. |
+| `/pull kit` | Vytáhne prvního hráče z fronty do tvé tester roomky. |
 | `/removeq hrac` | Ručně odstraní hráče z fronty. |
 | `/skip hrac` | Skipne AFK hráče – vyhodí ho z roomky i z fronty. |
-| `/mktesterroom kit [hrac] [kategorie]` | Soukromá tester roomka pro pullnutí hráče. |
+| `/mktesterroom [hrac] [kategorie]` | Tvoje soukromá tester roomka pro pullnutí hráče – jedna na testera, použije se pro všechny kity. |
 
 Tlačítka panelu: **Join Queue** (modál s Minecraft IGN), **Leave Queue**,
 **Pull Player ⚔️** (výběr roomky). Panel se aktualizuje automaticky.

@@ -8,7 +8,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Kit, KitRole, KitTesterRoom, TierDefinition
+from db.models import Kit, KitRole, TesterRoom, TierDefinition
 
 
 class KitRepository:
@@ -172,65 +172,62 @@ class KitRoleRepository:
         return list(result.scalars())
 
 
-class KitTesterRoomRepository:
-    """The authoritative ``kit -> tester channel`` map.
+class TesterRoomRepository:
+    """The authoritative ``tester -> room channel`` map.
 
-    ``channel_id`` is UNIQUE, so "find the tester room for this kit" has at
-    most one answer and "which kit owns this room" has at most one answer.
-    :meth:`set_room` is an upsert keyed on the kit, which is what makes
-    ``/mktesterroom`` idempotent: running it twice for the same kit replaces
-    the channel rather than failing or creating a second mapping.
+    ``tester_discord_id`` is the primary key, so a tester has at most one room
+    regardless of how many kits they pull from. ``channel_id`` is UNIQUE, so
+    "whose room is this channel" has at most one answer. :meth:`set_room` is an
+    upsert keyed on the tester: running ``/mktesterroom`` again replaces the
+    channel rather than creating a second mapping.
     """
 
     async def set_room(
         self,
         session: AsyncSession,
         *,
-        kit_id: int,
+        tester_discord_id: int,
         channel_id: int,
-        created_by: Optional[int] = None,
-    ) -> KitTesterRoom:
+    ) -> TesterRoom:
         stmt = (
-            pg_insert(KitTesterRoom)
-            .values(kit_id=kit_id, channel_id=int(channel_id), created_by=created_by)
+            pg_insert(TesterRoom)
+            .values(tester_discord_id=int(tester_discord_id), channel_id=int(channel_id))
             .on_conflict_do_update(
-                index_elements=["kit_id"],
-                set_={
-                    "channel_id": int(channel_id),
-                    "created_by": created_by,
-                    "updated_at": func.now(),
-                },
+                index_elements=["tester_discord_id"],
+                set_={"channel_id": int(channel_id), "updated_at": func.now()},
             )
-            .returning(KitTesterRoom)
+            .returning(TesterRoom)
             .execution_options(populate_existing=True)
         )
         row = (await session.execute(stmt)).scalar_one()
         await session.flush()
         return row
 
-    async def get_for_kit(
-        self, session: AsyncSession, *, kit_id: int
-    ) -> Optional[KitTesterRoom]:
-        return await session.get(KitTesterRoom, kit_id)
+    async def get_for_tester(
+        self, session: AsyncSession, *, tester_discord_id: int
+    ) -> Optional[TesterRoom]:
+        return await session.get(TesterRoom, int(tester_discord_id))
 
     async def get_for_channel(
         self, session: AsyncSession, *, channel_id: int
-    ) -> Optional[KitTesterRoom]:
+    ) -> Optional[TesterRoom]:
         result = await session.execute(
-            select(KitTesterRoom).where(KitTesterRoom.channel_id == int(channel_id))
+            select(TesterRoom).where(TesterRoom.channel_id == int(channel_id))
         )
         return result.scalar_one_or_none()
 
-    async def clear(self, session: AsyncSession, *, kit_id: int) -> bool:
+    async def clear(self, session: AsyncSession, *, tester_discord_id: int) -> bool:
         result = await session.execute(
-            delete(KitTesterRoom).where(KitTesterRoom.kit_id == kit_id)
+            delete(TesterRoom).where(
+                TesterRoom.tester_discord_id == int(tester_discord_id)
+            )
         )
         await session.flush()
         return (result.rowcount or 0) > 0
 
-    async def list_all(self, session: AsyncSession) -> list[KitTesterRoom]:
+    async def list_all(self, session: AsyncSession) -> list[TesterRoom]:
         result = await session.execute(
-            select(KitTesterRoom).order_by(KitTesterRoom.kit_id)
+            select(TesterRoom).order_by(TesterRoom.tester_discord_id)
         )
         return list(result.scalars())
 

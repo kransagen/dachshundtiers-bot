@@ -160,12 +160,56 @@ def test_minecraft_identity_constraints(migration_db_url):
         token_uq = {c["name"] for c in inspector.get_unique_constraints("player_link_tokens")}
         assert "uq_link_token_code" in token_uq
 
-        # One tester room per kit; a room belongs to at most one kit.
-        room_uq = {c["name"] for c in inspector.get_unique_constraints("kit_tester_rooms")}
-        assert "uq_kit_tester_rooms_channel_id" in room_uq
-        assert inspector.get_pk_constraint("kit_tester_rooms")["constrained_columns"] == [
-            "kit_id"
+        # One tester room per tester; a room belongs to at most one tester.
+        room_uq = {c["name"] for c in inspector.get_unique_constraints("tester_rooms")}
+        assert "uq_tester_rooms_channel_id" in room_uq
+        assert inspector.get_pk_constraint("tester_rooms")["constrained_columns"] == [
+            "tester_discord_id"
         ]
+        assert "kit_tester_rooms" not in inspector.get_table_names()
+
+
+def test_tester_rooms_migration_keeps_one_room_per_tester(embedded_pg):
+    """Z roomek po kitech zbyde jedna na testera (nejnovější); bez autora zanikne."""
+    from alembic import command
+
+    _create_fresh_database(embedded_pg, "pytest_tester_rooms_mig")
+    url = _sync_url(embedded_pg, "pytest_tester_rooms_mig")
+    cfg = _alembic_config(url)
+    try:
+        command.upgrade(cfg, "c9d0e1f2a3b4")
+        engine = create_engine(url)
+        with engine.begin() as conn:
+            for i in (1, 2, 3, 4):
+                conn.execute(text("INSERT INTO kits (key, name) VALUES (:k, :k)"), {"k": f"kit{i}"})
+            ids = [r[0] for r in conn.execute(text("SELECT id FROM kits ORDER BY id"))]
+            rows = [
+                (ids[0], 100, 7, "2026-01-01"),
+                (ids[1], 101, 7, "2026-02-01"),
+                (ids[2], 102, 8, "2026-01-01"),
+                (ids[3], 103, None, "2026-01-01"),
+            ]
+            for kit_id, channel, by, ts in rows:
+                conn.execute(
+                    text(
+                        "INSERT INTO kit_tester_rooms (kit_id, channel_id, created_by, updated_at)"
+                        " VALUES (:k, :c, :b, :t)"
+                    ),
+                    {"k": kit_id, "c": channel, "b": by, "t": ts},
+                )
+        command.upgrade(cfg, "head")
+        with engine.connect() as conn:
+            got = conn.execute(
+                text("SELECT tester_discord_id, channel_id FROM tester_rooms ORDER BY 1")
+            ).all()
+        assert [tuple(r) for r in got] == [(7, 101), (8, 102)]
+        command.downgrade(cfg, "c9d0e1f2a3b4")
+        engine.dispose()
+    finally:
+        with create_engine(url).connect() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            conn.commit()
+
 
 def test_upgrade_to_head_from_older_revision(embedded_pg):
     """Startup auto-migrace: databáze na starší revizi se dostane na head."""

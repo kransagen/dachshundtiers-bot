@@ -23,7 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from db.models import Kit, Player, Queue, QueueEntry
 from db.repositories.cooldowns import CooldownRepository
-from db.repositories.kits import KitRepository, KitTesterRoomRepository
+from db.repositories.kits import KitRepository, TesterRoomRepository
 from db.repositories.players import PlayerRepository
 from db.repositories.queues import (
     QUEUE_ENTRY_LEFT,
@@ -238,70 +238,50 @@ async def pop_for_kit(
 
 
 # ---------------------------------------------------------------------------
-# Tester roomky: kit -> Discord kanál (autoritativní mapování v PostgreSQL)
+# Tester roomky: tester -> Discord kanál (autoritativní mapování v PostgreSQL)
 # ---------------------------------------------------------------------------
-# Dřív tester vybíral roomku ručně (ChannelSelect) a mapování mezi kitem a
-# pokojem neexistovalo. Teď je mapování řádek v `kit_tester_rooms`, který
-# založí `/mktesterroom <kit>` a ze kterého ho `/queue pull <kit>` čte. Kanál
-# je jen projekce do Discordu; autoritou je řádek v DB.
+# Každý tester má JEDNU roomku pro všechny kity. Mapování je řádek v
+# `tester_rooms`, který založí `/mktesterroom` a ze kterého ho `/queue pull`
+# i tlačítko Pull čtou podle testera, který táhne. Kanál je jen projekce do
+# Discordu; autoritou je řádek v DB.
 
 
 async def set_tester_room(
-    kit: str,
+    tester_id: int,
     channel_id: int,
     *,
-    created_by: Optional[int] = None,
     session_factory: async_sessionmaker[AsyncSession],
-) -> Optional[int]:
-    """Přiřadí roomku kitu; vrací ``kit_id`` nebo ``None`` pro neznámý kit.
+) -> None:
+    """Přiřadí testerovi roomku.
 
-    Idempotentní: opakované volání stejného kitu *nahradí* kanál, nevytvoří
-    druhý řádek (upsert na `kit_id`). Pokud už tenhle kanál patří jinému
-    kitu, UNIQUE na ``channel_id`` to odmítne — dvě kity si jednu roomku
-    nemůžou vzít, jinak by `/queue pull` nemělo jednoznačnou odpověď.
+    Idempotentní: opakované volání stejného testera *nahradí* kanál, nevytvoří
+    druhý řádek (upsert na `tester_discord_id`). Pokud už tenhle kanál patří
+    jinému testerovi, UNIQUE na ``channel_id`` to odmítne.
     """
-    kit_key = (kit or "").strip().lower()
-    if not kit_key:
-        return None
     async with db_transaction(session_factory) as session:
-        kit_row = await _resolve_kit_any(session, kit_key)
-        if kit_row is None:
-            return None
-        await KitTesterRoomRepository().set_room(
-            session,
-            kit_id=kit_row.id,
-            channel_id=channel_id,
-            created_by=created_by,
+        await TesterRoomRepository().set_room(
+            session, tester_discord_id=int(tester_id), channel_id=channel_id
         )
-        return kit_row.id
 
 
 async def resolve_tester_room(
-    kit: str, *, session_factory: async_sessionmaker[AsyncSession]
+    tester_id: int, *, session_factory: async_sessionmaker[AsyncSession]
 ) -> Optional[int]:
-    """``channel_id`` tester roomky pro kit, nebo ``None`` když není zadaná."""
-    kit_key = (kit or "").strip().lower()
-    if not kit_key:
-        return None
+    """``channel_id`` roomky testera, nebo ``None`` když ji nemá."""
     async with db_transaction(session_factory) as session:
-        kit_row = await _resolve_kit_any(session, kit_key)
-        if kit_row is None:
-            return None
-        room = await KitTesterRoomRepository().get_for_kit(session, kit_id=kit_row.id)
+        room = await TesterRoomRepository().get_for_tester(
+            session, tester_discord_id=int(tester_id)
+        )
         return room.channel_id if room is not None else None
 
 
 async def clear_tester_room(
-    kit: str, *, session_factory: async_sessionmaker[AsyncSession]
+    tester_id: int, *, session_factory: async_sessionmaker[AsyncSession]
 ) -> bool:
-    kit_key = (kit or "").strip().lower()
-    if not kit_key:
-        return False
     async with db_transaction(session_factory) as session:
-        kit_row = await _resolve_kit_any(session, kit_key)
-        if kit_row is None:
-            return False
-        return await KitTesterRoomRepository().clear(session, kit_id=kit_row.id)
+        return await TesterRoomRepository().clear(
+            session, tester_discord_id=int(tester_id)
+        )
 
 
 async def clear_tester_room_for_channel(
@@ -309,21 +289,23 @@ async def clear_tester_room_for_channel(
 ) -> bool:
     """Smaže mapování roomky podle kanálu (kanál už neexistuje)."""
     async with db_transaction(session_factory) as session:
-        room = await KitTesterRoomRepository().get_for_channel(
+        room = await TesterRoomRepository().get_for_channel(
             session, channel_id=int(channel_id)
         )
         if room is None:
             return False
-        return await KitTesterRoomRepository().clear(session, kit_id=room.kit_id)
+        return await TesterRoomRepository().clear(
+            session, tester_discord_id=room.tester_discord_id
+        )
 
 
 async def is_tester_room(
     channel_id: int, *, session_factory: async_sessionmaker[AsyncSession]
 ) -> bool:
-    """Je kanál zaregistrovaná tester roomka nějakého kitu?"""
+    """Je kanál zaregistrovaná tester roomka nějakého testera?"""
     async with db_transaction(session_factory) as session:
         return (
-            await KitTesterRoomRepository().get_for_channel(
+            await TesterRoomRepository().get_for_channel(
                 session, channel_id=int(channel_id)
             )
             is not None
@@ -384,17 +366,19 @@ class PullResult:
 
 
 async def _db_pull_for_kit(
-    session_factory, *, kit: str, now: int
+    session_factory, *, kit: str, tester_id: int, now: int
 ) -> PullResult:
     async with db_transaction(session_factory) as session:
         kit_row = await _resolve_kit_any(session, kit)
         if kit_row is None or not kit_row.active:
             return PullResult(status=PULL_NO_KIT)
 
-        # Roomku řešíme PRVNÍ. Když chybí, hráče z fronty vůbec nevybavíme —
-        # vzít ho z fronty a pak zjistit, že nemáme kam ho pustit, by znamenalo
-        # ztraceného hráče.
-        room = await KitTesterRoomRepository().get_for_kit(session, kit_id=kit_row.id)
+        # Roomku testera řešíme PRVNÍ. Když chybí, hráče z fronty vůbec
+        # nevybavíme — vzít ho z fronty a pak zjistit, že nemáme kam ho pustit,
+        # by znamenalo ztraceného hráče.
+        room = await TesterRoomRepository().get_for_tester(
+            session, tester_discord_id=tester_id
+        )
         if room is None:
             return PullResult(status=PULL_NO_ROOM, kit_name=kit_row.name)
 
@@ -420,19 +404,23 @@ async def _db_pull_for_kit(
 
 
 async def pull_for_kit(
-    kit: str, *, session_factory: Optional[async_sessionmaker[AsyncSession]]
+    kit: str,
+    tester_id: int,
+    *,
+    session_factory: Optional[async_sessionmaker[AsyncSession]],
 ) -> PullResult:
-    """Vytažení PRVNÍHO hráče kitu do jeho tester roomky — jedna transakce.
+    """Vytažení PRVNÍHO hráče kitu do roomky testera — jedna transakce.
 
     Tohle je jediná kanonická cesta pro „vytáhnout hráče na test". Roomka se
-    už nebere od testera, ale z tabulky ``kit_tester_rooms``; chybí-li, vrátí
-    ``no_tester_room`` a hráč ve frontě zůstane.
+    bere z tabulky ``tester_rooms`` podle testera, který táhne (jedna roomka
+    pro všechny kity); chybí-li, vrátí ``no_tester_room`` a hráč ve frontě
+    zůstane.
     """
     kit_key = (kit or "").strip().lower()
     if not kit_key:
         return PullResult(status=PULL_NO_KIT)
     return await _db_pull_for_kit(
-        session_factory, kit=kit_key, now=int(datetime.now(timezone.utc).timestamp() * 1000)
+        session_factory, kit=kit_key, tester_id=int(tester_id), now=int(datetime.now(timezone.utc).timestamp() * 1000)
     )
 
 

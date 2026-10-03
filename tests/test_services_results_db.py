@@ -966,15 +966,14 @@ async def test_queue_pending_result_is_replaced_on_retry(session_factory, clean_
 async def test_player_access_channel_ids_only_player_scoped_channels(
     session_factory, clean_db
 ):
-    from db.repositories.kits import KitTesterRoomRepository
+    from db.repositories.kits import TesterRoomRepository
 
     await _seed(session_factory)
     await _ticket(session_factory, channel_id=301, owner_id=100)
     await _ticket(session_factory, channel_id=302, owner_id=101)
     async with transaction(session_factory) as session:
-        kit = await KitRepository().get_by_key(session, "ht3")
-        await KitTesterRoomRepository().set_room(
-            session, kit_id=kit.id, channel_id=900
+        await TesterRoomRepository().set_room(
+            session, tester_discord_id=1, channel_id=900
         )
     channels = await rsvc.player_access_channel_ids("100", session_factory)
     assert channels == {900, 301}

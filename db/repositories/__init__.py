@@ -18,7 +18,7 @@ from db.repositories.identity import (
 from db.repositories.kits import (
     KitRepository,
     KitRoleRepository,
-    KitTesterRoomRepository,
+    TesterRoomRepository,
     TierDefinitionRepository,
     ensure_dimensions,
 )
@@ -137,7 +137,7 @@ __all__ = [
     "EvaluationRepository",
     "KitRepository",
     "KitRoleRepository",
-    "KitTesterRoomRepository",
+    "TesterRoomRepository",
     "MinecraftAccountRepository",
     "MigrationIssueRepository",
     "MirrorRepository",

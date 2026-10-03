@@ -39,7 +39,7 @@ async def _seed(session_factory, tier="HT2", days=61, discord_id=1, ign="Alice")
             select(TierDefinition.id).where(TierDefinition.code == tier))).scalar_one()
         await MirrorServiceRepository().apply_observation(
             session, player_id=player.id, kit_id=kit.id, tier_id=tid,
-            observed_at=datetime.now(timezone.utc) - timedelta(days=days), source="discord_sync",
+            observed_at=NOW - timedelta(days=days), source="discord_sync",
         )
         return player.id, kit.id
 

@@ -194,27 +194,24 @@ class QueueTester(Base):
     )
 
 
-class KitTesterRoom(Base):
-    """Which Discord channel is the tester room for a given kit.
+class TesterRoom(Base):
+    """The one Discord channel that is a given tester's room.
 
-    ``/mktesterroom <kit>`` writes this row; ``/queue pull <kit>`` reads it to
-    find where to grant the pulled player access. The kit is the primary key
-    because the business rule is exactly one tester room per kit, and
-    ``channel_id`` is UNIQUE because a room belongs to at most one kit —
-    otherwise ``/queue pull`` could not resolve a kit unambiguously.
+    ``/mktesterroom`` writes this row; ``/queue pull <kit>`` and the panel pull
+    button read it to find where to grant the pulled player access. The tester
+    (Discord user id) is the primary key because the business rule is exactly
+    one tester room per tester, reused for every kit that tester pulls from.
+    ``channel_id`` is UNIQUE because a room belongs to at most one tester.
 
     The channel id is a *projection* target, not the source of truth: the row
     here is authoritative, the remote channel merely has to exist when the
     pull runs.
     """
 
-    __tablename__ = "kit_tester_rooms"
+    __tablename__ = "tester_rooms"
 
-    kit_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("kits.id"), primary_key=True
-    )
+    tester_discord_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
-    created_by: Mapped[Optional[int]] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

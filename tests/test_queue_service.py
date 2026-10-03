@@ -60,11 +60,11 @@ async def test_session_factory_is_required(tmp_path, monkeypatch):
         lambda: queue_service.removeq("1"),
         lambda: queue_service.skip_player("1"),
         lambda: queue_service.panel_message_id("anchorpvp"),
-        lambda: queue_service.set_tester_room("anchorpvp", 123),
-        lambda: queue_service.resolve_tester_room("anchorpvp"),
-        lambda: queue_service.clear_tester_room("anchorpvp"),
+        lambda: queue_service.set_tester_room(1, 123),
+        lambda: queue_service.resolve_tester_room(1),
+        lambda: queue_service.clear_tester_room(1),
         lambda: queue_service.resolve_kit("anchorpvp"),
-        lambda: queue_service.pull_for_kit("anchorpvp"),
+        lambda: queue_service.pull_for_kit("anchorpvp", 1),
     )
     for call in cases:
         with pytest.raises(TypeError):

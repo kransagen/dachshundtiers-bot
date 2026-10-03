@@ -204,16 +204,18 @@ class QueueView(SafeView):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         kit_key = self.kit.lower()
-        # Roomka patří kitu (`/mktesterroom <kit>`), tester ji znovu nevybírá –
-        # jinak by existovaly dvě cesty, kam hráče poslat, a mapování v
-        # `kit_tester_rooms` by nebylo autoritativní. Stejná služba jako
+        # Každý tester má jednu roomku (`/mktesterroom`) pro všechny kity, tester
+        # ji znovu nevybírá – jinak by existovaly dvě cesty, kam hráče poslat, a
+        # mapování v `tester_rooms` by nebylo autoritativní. Stejná služba jako
         # `/queue pull <kit>`: obojí jde přes `pull_for_kit`.
-        result = await pull_for_kit(kit_key, session_factory=_session_factory(interaction))
+        result = await pull_for_kit(
+            kit_key, interaction.user.id, session_factory=_session_factory(interaction)
+        )
 
         if result.status == PULL_NO_ROOM:
             return await interaction.followup.send(
-                f"❌ Kit **{self.kit}** nemá tester roomku – vytvoř ji "
-                f"`/mktesterroom {kit_key}`. Hráč ve frontě zůstal.",
+                "❌ Nemáš tester roomku – vytvoř si ji `/mktesterroom`. "
+                "Hráč ve frontě zůstal.",
                 ephemeral=True,
             )
         if result.status == PULL_NO_KIT:
@@ -276,8 +278,8 @@ async def grant_pull_access(
         )
         if channel_gone:
             message = (
-                f"❌ Roomka kitu **{kit_name}** už neexistuje (mapování jsem smazal). "
-                f"Vytvoř novou `/mktesterroom {kit_name}`. Hráč zůstal ve frontě."
+                "❌ Tvoje tester roomka už neexistuje (mapování jsem smazal). "
+                "Vytvoř novou `/mktesterroom`. Hráč zůstal ve frontě."
             )
         else:
             message = (

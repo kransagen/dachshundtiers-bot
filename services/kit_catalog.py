@@ -70,6 +70,36 @@ async def remove_kit(kit: str, *, session_factory=None) -> bool:
     return True
 
 
+async def get_kit_first_to(kit: str, *, session_factory=None) -> int | None:
+    """FT (first to N) HT Fightu v kitu, nebo ``None`` (kit neznámý / FT nenastaveno)."""
+    value = (kit or "").strip()
+    if not value or session_factory is None:
+        return None
+    async with db_transaction(session_factory) as session:
+        repo = KitRepository()
+        found = await repo.get_by_key(session, value.lower())
+        if found is None:
+            found = await repo.get_by_name(session, value)
+        return found.first_to if found is not None else None
+
+
+async def set_kit_first_to(kit: str, first_to: int, *, session_factory=None) -> str | None:
+    """Nastaví FT kitu; vrací kanonický název kitu, nebo ``None`` když kit neexistuje."""
+    value = (kit or "").strip()
+    if not value or session_factory is None:
+        return None
+    async with db_transaction(session_factory) as session:
+        repo = KitRepository()
+        found = await repo.get_by_key(session, value.lower())
+        if found is None:
+            found = await repo.get_by_name(session, value)
+        if found is None:
+            return None
+        found.first_to = int(first_to)
+        await session.flush()
+        return found.name
+
+
 async def kit_autocomplete(interaction: discord.Interaction, current: str):
     """Autocomplete názvů kitů."""
     session_factory = getattr(

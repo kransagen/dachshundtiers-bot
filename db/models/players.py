@@ -84,6 +84,8 @@ class Kit(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
+    # FT (first to N) HT Fightu v tomto kitu; NULL = nenastaveno (/setkitft).
+    first_to: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -13,6 +13,7 @@ from services.config_store import get_ht3_panel, set_queue_channel_id
 from services.kit_catalog import (
     add_kit,
     get_kits,
+    set_kit_first_to,
     kit_autocomplete,
     remove_kit,
 )
@@ -111,6 +112,38 @@ class Kits(commands.Cog):
             message += "\n💡 Pro aktualizaci HT3+ panelu spusť nové `/sendht3`."
 
         await interaction.response.send_message(message)
+
+    # ------------------------------------------------------------------
+    # /setkitft
+    # ------------------------------------------------------------------
+    @app_commands.command(
+        name="setkitft",
+        description="Nastaví FT (first to N) HT Fightu pro kit",
+    )
+    @app_commands.describe(kit="Název kitu", ft="Do kolika vítězných kol se HT Fight hraje")
+    @app_commands.autocomplete(kit=kit_autocomplete)
+    async def setkitft(
+        self,
+        interaction: discord.Interaction,
+        kit: str,
+        ft: app_commands.Range[int, 1, 50],
+    ) -> None:
+        if not has_admin_role(interaction.user):
+            return await interaction.response.send_message(
+                "❌ Pouze pro administrátory.", ephemeral=True
+            )
+        name = await set_kit_first_to(
+            kit,
+            ft,
+            session_factory=getattr(self.bot, "db_session_factory", None),
+        )
+        if name is None:
+            return await interaction.response.send_message(
+                f"❌ Kit **{kit.strip()}** není v seznamu registrovaný.", ephemeral=True
+            )
+        await interaction.response.send_message(
+            f"✅ Kit **{name}**: HT Fight se hraje na **FT{ft}**.", ephemeral=True
+        )
 
     # ------------------------------------------------------------------
     # /addqchannel

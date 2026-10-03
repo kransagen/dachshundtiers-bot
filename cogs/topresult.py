@@ -1,37 +1,37 @@
 """Cog s HT Fight výsledky – /topresult.
 
 ``/topresult`` je specializovaná verze ``/result`` pro HT Fighty – **NENÍ** to
-žebříček a nepočítá žádné „top" hráče. Vytvoří veřejný výsledek HT Fightu
-přesně ve stylu serveru do vyhrazeného kanálu (``TOP_RESULT_CHANNEL_ID``) a
-zapinguje nakonfigurovanou roli (``TOP_RESULT_ROLE_ID``, pouze ta!):
+žebříček a nepočítá žádné „top" hráče. Tester v HT Fight ticketu projde
+průvodcem (ephemeral): pro každou sekci zápasů vybere soupeře (kdokoliv),
+zadá skóre z pohledu hráče a odešle. Výsledek jde veřejně do vyhrazeného
+kanálu (``TOP_RESULT_CHANNEL_ID``) s pingem role ``TOP_RESULT_ROLE_ID``:
 
-    <@1419031701920940163> - mendu__ - **Povýšen na HT3** - MolePVP
+    <@1419031701920940163> - mendu__ - **Povýšen na LT2** - MolePVP
 
-    **HT3 Fighty:**
+    **HT3 Fighty (FT4):**
     > vyhrál 4-1 <@1018169843347882076>
 
-    **Postup: LT3 → HT3**
+    **LT2 Fighty (FT4):**
+    > prohrál 2-4 <@1018169843347882077>
+
+    **Postup: HT3 → LT2**
 
     <@&1523984977371594772>
 
-Behavior:
+Pravidla:
+- sekce zápasů = tier těsně pod cílovým tierem + cílový tier, u HT3 jen HT3
+  (services/ht_fights.py); v každé sekci aspoň 1 soupeř; FT určuje kit
+  (``kits.first_to``, admin ho nastaví ``/setkitft``),
+- IGN se bere z databáze (``players.ign``), ne z ticketu ani z parametru,
+- o povýšení rozhoduje tester parametrem ``tier_ziskan``: při „ano“ hráč
+  postoupí na cílový tier (nebo ``bridge``), při „ne“ se HT Fight ticket zavře
+  a nastaví se HT3+ cooldown; automatická kontrola výher/passing score není,
+  průvodce jen upozorní,
 - záznam jde do STEJNÉ kanonické historie jako /result (PostgreSQL ``results``,
-  ``result_type='ht_fight'``) – žádná samostatná databáze,
-- **výhra povyšuje hráče** na další tier (services/topresult.py – kanonické
-  pravidlo next_ticket_tier); výhra udělí i novou tier roli (stejná logika
-  jako /result – auto_grant_kit_role); prohra tier ani roli nemění,
-- **bridge** (volitelný parametr, jen při výhře) – tester může hráče povýšit
-  přeskočením rovnou na zadaný vyšší tier (např. topresult o získání HT3,
-  ale hráč z LT3 bridgne přímo na LT2); cíl musí být reálný tier a strictly
-  vyšší než aktuální tier hráče; do záznamu se připíše ``bridgeTier``,
-- prohra uvnitř HT Fight ticketu ticket zavře + nastaví HT3+ cooldown;
-  výhra ticket NEZAVÍRÁ ani cooldown nenastavuje (hráč ve výhře pokračuje),
-- oznámení má stav pending → sent/failed (retry tlačítkem po selhání –
-  záznam v historii zůstává append-only, mění se jen stav oznámení),
+  ``kind='ht_fight'``), jeden řádek na zápas, žádná samostatná databáze,
+- oznámení má stav pending → sent/failed (retry tlačítkem po selhání),
 - příkaz NIKDY nepoužije ``RESULT_CHANNEL_LOWER`` / ``RESULT_CHANNEL_UPPER``,
-- v kanálu HT Fight ticketu se hráč/IGN/kit berou z ticketu (autoritativní);
-  mimo ticket jsou volitelné parametry hrac/ign/kit povinné,
-- idempotence = ``ticketId + result_type`` (druhé odeslání → jasná chyba),
+- idempotence = ticket + tier sekce + soupeř,
 - oprávnění: stejný model jako /result (tester role).
 """
 
@@ -51,16 +51,23 @@ from db.services.promotion import grant_confirmation
 from services.permissions import has_admin_role
 from services.kit_catalog import get_kits
 from db.repositories.results import ANNOUNCEMENT_FAILED, ANNOUNCEMENT_SENT
-from services.tickets import get_ticket, is_ht_fight_ticket
+from services.ht_fights import (
+    MAX_FIGHTS,
+    Fight,
+    fight_sections,
+    format_topresult_fights_message,
+    missing_sections,
+    parse_fight_score,
+)
+from services.tickets import get_ticket, is_ht_fight_ticket, next_ticket_tier
 from services.topresult import (
     HT_FIGHT_TIERS,
-    format_topresult_message,
+    describe_opponents,
     is_registered_kit,
-    record_ht_fight,
+    load_fight_context,
+    record_ht_fights,
     set_ht_fight_announcement,
-    validate_ht_fight_score,
-    validate_ht_fight_status,
-    validate_ht_fight_tier,
+    validate_ht_fight_bridge,
     validate_topresult_config,
 )
 from utils import has_tester_role, kit_autocomplete, now_ms, today_cz
@@ -86,19 +93,18 @@ class HTFightRetryView(discord.ui.View):
     def __init__(
         self,
         *,
-        result_id,
+        result_ids,
         result_channel,
         content,
         allowed_mentions,
         session_factory=None,
     ):
         super().__init__(timeout=300)
-        self.result_id = result_id
+        self.result_ids = list(result_ids)
         self.result_channel = result_channel
         self.content = content
         self.allowed_mentions = allowed_mentions
-        # G0: stav oznámení se zapisuje do PostgreSQL, ne do
-        # `ht_results.json` – retry nikdy nesahá na JSON.
+        # Stav oznámení se zapisuje do PostgreSQL – retry nikdy nesahá na JSON.
         self.session_factory = session_factory
         self._sending = False
 
@@ -122,16 +128,365 @@ class HTFightRetryView(discord.ui.View):
                 "❌ Odeslání stále selhává – zkontroluj `TOP_RESULT_CHANNEL_ID`.",
                 ephemeral=True,
             )
-        await set_ht_fight_announcement(
-            self.result_id,
-            ANNOUNCEMENT_SENT,
-            message_id=sent.id,
-            session_factory=self.session_factory,
-        )
+        for result_id in self.result_ids:
+            await set_ht_fight_announcement(
+                result_id,
+                ANNOUNCEMENT_SENT,
+                message_id=sent.id,
+                session_factory=self.session_factory,
+            )
         button.disabled = True
         await interaction.response.edit_message(
             content="✅ Oznámení odesláno.", view=self
         )
+
+
+def _tier_label(tier) -> str:
+    return tier or "bez tieru"
+
+
+class ScoreModal(discord.ui.Modal):
+    """Jedno pole se skóre na každého vybraného soupeře (max. 5)."""
+
+    def __init__(self, wizard: "FightWizard"):
+        super().__init__(title=f"{wizard.target_tier} {wizard.kit_name} – skóre hráč-soupeř"[:45])
+        self.wizard = wizard
+        self.fields: list[tuple[str, str, discord.ui.TextInput]] = []
+        ft = wizard.first_to
+        for tier in wizard.sections:
+            for uid in wizard.chosen[tier]:
+                info = wizard.opp_info.get(uid, {})
+                label = (
+                    f"{info.get('ign') or wizard.names.get(uid, uid)} · "
+                    f"{_tier_label(info.get('tier'))} · {tier} fight"
+                )[:45]
+                field = discord.ui.TextInput(
+                    label=label,
+                    placeholder=f"FT{ft} — např. {ft}-1 · vzdal: {ft}-1 ff"[:100],
+                    default=(
+                        wizard.scores[(tier, uid)].text
+                        if (tier, uid) in wizard.scores
+                        else None
+                    ),
+                    max_length=20,
+                )
+                self.add_item(field)
+                self.fields.append((tier, uid, field))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        wizard = self.wizard
+        errors = []
+        parsed = {}
+        for tier, uid, field in self.fields:
+            score, error = parse_fight_score(field.value, wizard.first_to)
+            if score is None:
+                errors.append(
+                    f"• **{wizard.names.get(uid, uid)}** ({tier}): {error}"
+                )
+            else:
+                parsed[(tier, uid)] = score
+        if errors:
+            return await interaction.response.send_message(
+                "❌ Skóre se neuložilo:\n" + "\n".join(errors), ephemeral=True
+            )
+        wizard.scores.update(parsed)
+        wizard.sync_components()
+        await interaction.response.edit_message(embed=wizard.embed(), view=wizard)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        log.exception("Chyba v modálu /topresult: %s", error)
+        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
+
+class FightWizard(discord.ui.View):
+    """Ephemeral průvodce: výběr soupeřů po sekcích → skóre → náhled → odeslání."""
+
+    def __init__(
+        self,
+        cog: "TopResult",
+        *,
+        evaluator,
+        player_id: str,
+        player_name: str,
+        ign: str,
+        kit_name: str,
+        first_to: int,
+        current_tier,
+        target_tier: str,
+        tier_gained: bool,
+        bridge,
+        ticket,
+        sections: list[str],
+        result_channel,
+        target_role,
+        guild,
+        session_factory,
+    ):
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.evaluator = evaluator
+        self.player_id = player_id
+        self.player_name = player_name
+        self.ign = ign
+        self.kit_name = kit_name
+        self.first_to = first_to
+        self.current_tier = current_tier
+        self.target_tier = target_tier
+        self.tier_gained = tier_gained
+        self.bridge = bridge
+        self.ticket = ticket
+        self.sections = sections
+        self.result_channel = result_channel
+        self.target_role = target_role
+        self.guild = guild
+        self.session_factory = session_factory
+
+        self.chosen: dict[str, list[str]] = {tier: [] for tier in sections}
+        self.names: dict[str, str] = {}
+        self.opp_info: dict[str, dict] = {}
+        self.scores: dict[tuple[str, str], object] = {}
+        self._submitting = False
+        self.selects: dict[str, discord.ui.UserSelect] = {}
+
+        for row, tier in enumerate(sections):
+            select = discord.ui.UserSelect(
+                placeholder=f"{tier} Soupeři — s kým hrál?",
+                min_values=0,
+                max_values=MAX_FIGHTS,
+                row=row,
+            )
+            select.callback = self._make_select_callback(tier, select)
+            self.selects[tier] = select
+            self.add_item(select)
+
+        button_row = len(sections)
+        self.score_button = discord.ui.Button(
+            label="Zadat skóre", emoji="✏️", style=discord.ButtonStyle.primary, row=button_row
+        )
+        self.score_button.callback = self.on_score
+        self.preview_button = discord.ui.Button(
+            label="Náhled", emoji="👁️", style=discord.ButtonStyle.success, row=button_row
+        )
+        self.preview_button.callback = self.on_preview
+        self.send_button = discord.ui.Button(
+            label="Odeslat", emoji="📨", style=discord.ButtonStyle.success, row=button_row
+        )
+        self.send_button.callback = self.on_send
+        cancel = discord.ui.Button(
+            label="Zrušit", emoji="❌", style=discord.ButtonStyle.danger, row=button_row
+        )
+        cancel.callback = self.on_cancel
+        for item in (self.score_button, self.preview_button, self.send_button, cancel):
+            self.add_item(item)
+        self.sync_components()
+
+    # ---- stav -----------------------------------------------------------
+    def total_selected(self) -> int:
+        return sum(len(ids) for ids in self.chosen.values())
+
+    def ready_for_scores(self) -> bool:
+        return not missing_sections(self.sections, self.chosen)
+
+    def complete(self) -> bool:
+        return self.ready_for_scores() and all(
+            (tier, uid) in self.scores
+            for tier in self.sections
+            for uid in self.chosen[tier]
+        )
+
+    def sync_components(self) -> None:
+        for tier, select in self.selects.items():
+            select.default_values = [
+                discord.SelectDefaultValue(
+                    id=int(uid), type=discord.SelectDefaultValueType.user
+                )
+                for uid in self.chosen[tier]
+            ]
+        self.score_button.disabled = not self.ready_for_scores()
+        self.send_button.disabled = not self.complete()
+
+    def fights(self) -> list[Fight]:
+        return [
+            Fight(
+                tier=tier,
+                opponent_id=uid,
+                opponent_name=self.names.get(uid, uid),
+                score=self.scores[(tier, uid)],
+            )
+            for tier in self.sections
+            for uid in self.chosen[tier]
+        ]
+
+    def goal_tier(self) -> str:
+        return (self.bridge or self.target_tier) if self.tier_gained else ""
+
+    def status_text(self) -> str:
+        goal = self.goal_tier()
+        if goal:
+            return f"Povýšen na {goal}"
+        return f"Zůstává {self.current_tier}" if self.current_tier else "Beze změny"
+
+    def preview_text(self) -> str:
+        goal = self.goal_tier()
+        return format_topresult_fights_message(
+            player_id=self.player_id,
+            ign=self.ign,
+            tier_status=self.status_text(),
+            kit=self.kit_name,
+            first_to=self.first_to,
+            fights=self.fights(),
+            previous_tier=self.current_tier or "N/A",
+            new_tier=goal,
+            role_id=TOP_RESULT_ROLE_ID,
+        )
+
+    def warnings(self) -> list[str]:
+        out = []
+        lower = self.sections[0] if len(self.sections) == 2 else None
+        if lower and self.complete():
+            if not any(
+                self.scores[(lower, uid)].outcome == "Won" for uid in self.chosen[lower]
+            ):
+                out.append(f"⚠️ V sekci **{lower}** není žádná výhra.")
+        return out
+
+    def embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"🏆 {self.target_tier} test · {self.kit_name}",
+            description=(
+                f"👤 <@{self.player_id}> · {self.ign} · teď "
+                f"**{_tier_label(self.current_tier)}**\n"
+                f"Tier získává: **{'ano' if self.tier_gained else 'ne'}**"
+            ),
+            colour=discord.Colour.gold(),
+        )
+        for tier in self.sections:
+            lines = []
+            for uid in self.chosen[tier]:
+                info = self.opp_info.get(uid, {})
+                line = f"<@{uid}> · {info.get('ign') or '?'} · {_tier_label(info.get('tier'))}"
+                score = self.scores.get((tier, uid))
+                if score is not None:
+                    line += f" — **{score.text}**"
+                lines.append(line)
+            embed.add_field(
+                name=f"{tier} Soupeři · FT{self.first_to}",
+                value="\n".join(lines) if lines else "*nikdo*",
+                inline=False,
+            )
+        if not self.ready_for_scores():
+            hint = "👉 V menu níže vyber, s kým hráč hrál (v každé sekci aspoň jednoho)."
+        elif not self.complete():
+            hint = "👉 Zadej skóre tlačítkem ✏️ – vždy hráč-soupeř, např. `4-1`."
+        else:
+            hint = "👉 Zkontroluj náhled a odešli výsledek tlačítkem 📨."
+        embed.add_field(name="​", value=hint, inline=False)
+        return embed
+
+    # ---- komponenty -----------------------------------------------------
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.evaluator.id:
+            await interaction.response.send_message(
+                "❌ Tento průvodce patří jinému testerovi.", ephemeral=True
+            )
+            return False
+        return True
+
+    def _make_select_callback(self, tier: str, select: discord.ui.UserSelect):
+        async def callback(interaction: discord.Interaction) -> None:
+            users = list(select.values)
+            problem = None
+            if any(getattr(u, "bot", False) for u in users):
+                problem = "❌ Soupeř nemůže být bot."
+            elif any(str(u.id) == self.player_id for u in users):
+                problem = "❌ Soupeř nemůže být stejný hráč jako testovaný."
+            elif (
+                self.total_selected() - len(self.chosen[tier]) + len(users) > MAX_FIGHTS
+            ):
+                problem = f"❌ Dohromady nejvýš {MAX_FIGHTS} soupeřů (limit formuláře Discordu)."
+            if problem is None:
+                self.chosen[tier] = [str(u.id) for u in users]
+                for u in users:
+                    self.names[str(u.id)] = u.display_name or u.name
+                self.scores = {
+                    key: value
+                    for key, value in self.scores.items()
+                    if key[1] in self.chosen[key[0]]
+                }
+                self.opp_info.update(
+                    await describe_opponents(
+                        [str(u.id) for u in users],
+                        self.kit_name,
+                        session_factory=self.session_factory,
+                    )
+                )
+            self.sync_components()
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+            if problem is not None:
+                await interaction.followup.send(problem, ephemeral=True)
+
+        return callback
+
+    async def on_score(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_modal(ScoreModal(self))
+
+    async def on_preview(self, interaction: discord.Interaction) -> None:
+        if not self.complete():
+            return await interaction.response.send_message(
+                "❌ Nejdřív vyber soupeře a zadej skóre.", ephemeral=True
+            )
+        text = self.preview_text()
+        if self.warnings():
+            text += "\n\n" + "\n".join(self.warnings())
+        await interaction.response.send_message(
+            f"👁️ **Náhled veřejné zprávy:**\n{text}",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    async def on_cancel(self, interaction: discord.Interaction) -> None:
+        self.stop()
+        await interaction.response.edit_message(
+            content="❌ Zrušeno – nic se nezapsalo.", embed=None, view=None
+        )
+
+    async def on_send(self, interaction: discord.Interaction) -> None:
+        if not self.complete():
+            return await interaction.response.send_message(
+                "❌ Nejdřív vyber soupeře a zadej skóre.", ephemeral=True
+            )
+        if self._submitting:
+            return await interaction.response.defer()
+        self._submitting = True
+        await interaction.response.defer(ephemeral=True)
+        done = False
+        try:
+            done = await self.cog.finalize(interaction, self)
+        finally:
+            self._submitting = False
+        if done:
+            self.stop()
+            try:
+                await interaction.edit_original_response(
+                    content="✅ Hotovo.", embed=None, view=None
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    async def on_error(self, interaction, error, item) -> None:
+        log.exception("Chyba v průvodci /topresult (%s): %s", item, error)
+        msg = "❌ Nastala neočekávaná chyba. Detaily najdeš v logu bota."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except (discord.HTTPException, discord.Forbidden):
+            pass
 
 
 class TopResult(commands.Cog):
@@ -154,37 +509,23 @@ class TopResult(commands.Cog):
     # ------------------------------------------------------------------
     @app_commands.command(name="topresult", description="HT Fight výsledek – veřejná zpráva + role ping")
     @app_commands.describe(
-        fight_tier="HT Fight tier (např. HT3)",
-        outcome="Výsledek hráče (vyhrál / prohrál)",
-        score="Skóre ve formátu 0-4",
-        opponent="Soupeř / tester",
-        tier_status="Text stavu tieru (např. Zůstává Low Tier 3)",
+        tier_ziskan="Získává hráč cílový tier? (ano = povýšení, ne = zavře se HT Fight ticket)",
         hrac="Testovaný hráč (v HT Fight ticketu se bere z ticketu)",
-        ign="Minecraft IGN hráče (v HT Fight ticketu se bere z ticketu)",
         kit="Kit (v HT Fight ticketu se bere z ticketu)",
-        bridge="Bridge – povýšení přeskočením na vyšší tier (jen při výhře, např. z LT3 rovnou na LT2)",
+        bridge="Bridge – povýšení přeskočením na vyšší tier (jen při „ano“, např. z LT3 rovnou na LT2)",
     )
     @app_commands.choices(
-        outcome=[
-            app_commands.Choice(name="vyhrál", value="Won"),
-            app_commands.Choice(name="prohrál", value="Lost"),
+        tier_ziskan=[
+            app_commands.Choice(name="ano", value="ano"),
+            app_commands.Choice(name="ne", value="ne"),
         ]
     )
-    @app_commands.autocomplete(
-        kit=kit_autocomplete,
-        fight_tier=fight_tier_autocomplete,
-        bridge=fight_tier_autocomplete,
-    )
+    @app_commands.autocomplete(kit=kit_autocomplete, bridge=fight_tier_autocomplete)
     async def topresult(
         self,
         interaction: discord.Interaction,
-        fight_tier: str,
-        outcome: str,
-        score: str,
-        opponent: discord.User,
-        tier_status: str,
+        tier_ziskan: str,
         hrac: discord.User | None = None,
-        ign: str | None = None,
         kit: str | None = None,
         bridge: str | None = None,
     ) -> None:
@@ -192,13 +533,8 @@ class TopResult(commands.Cog):
             return await interaction.response.send_message("❌ Pouze pro testery.", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
-
-        # G0 audit fix (H1 cutover): resolved once, used for every
-        # dual-mode call below (ticket lookup, kit lookup, the canonical
-        # record_ht_fight write, tier grant). Previously get_ticket and
-        # record_ht_fight never received it, so /topresult always used the
-        # legacy JSON path even when PostgreSQL was fully configured.
         sf = getattr(self.bot, "db_session_factory", None)
+        tier_gained = tier_ziskan == "ano"
 
         # 0) Konfigurace /topresult – jasná admin chyba místo tichého selhání.
         ok_cfg, cfg_msg = validate_topresult_config(TOP_RESULT_CHANNEL_ID, TOP_RESULT_ROLE_ID)
@@ -231,9 +567,19 @@ class TopResult(commands.Cog):
                 ephemeral=True,
             )
 
+        if bridge:
+            if not tier_gained:
+                return await interaction.followup.send(
+                    "❌ Bridge se zadává jen při „ano“ – při „ne“ hráč nepostupuje.",
+                    ephemeral=True,
+                )
+            ok, msg = validate_ht_fight_bridge(bridge)
+            if not ok:
+                return await interaction.followup.send(msg, ephemeral=True)
+
         # 0b) Identita hráče: v HT Fight ticketu jsou metadata ticketu
-        #     autoritativní (hráč, IGN, kit) a volitelné parametry se ignorují;
-        #     mimo ticket musí být hrac/ign/kit zadány.
+        #     autoritativní (hráč, kit, cílový tier); mimo ticket musí být
+        #     hrac a kit zadány. IGN se vždy bere z databáze.
         ticket = None
         if isinstance(interaction.channel, discord.TextChannel):
             ticket = await get_ticket(interaction.channel_id, session_factory=sf)
@@ -260,88 +606,109 @@ class TopResult(commands.Cog):
             player_name = (
                 hrac.display_name or hrac.name if hrac is not None else ""
             ) or ticket.get("ownerName") or ""
-            ign_clean = (ticket.get("ign") or "").strip()
             kit_clean = (ticket.get("kit") or "").strip()
         else:
-            if hrac is None or not (ign or "").strip() or not (kit or "").strip():
+            if hrac is None or not (kit or "").strip():
                 return await interaction.followup.send(
-                    "❌ Mimo HT Fight ticket jsou povinné hrac, IGN a kit.",
-                    ephemeral=True,
+                    "❌ Mimo HT Fight ticket jsou povinné hrac a kit.", ephemeral=True
                 )
             player_id = str(hrac.id)
             player_name = hrac.display_name or hrac.name
-            ign_clean = (ign or "").strip()
             kit_clean = (kit or "").strip()
-            if not is_registered_kit(
-                kit_clean,
-                await get_kits(session_factory=sf),
-            ):
+            if not is_registered_kit(kit_clean, await get_kits(session_factory=sf)):
                 return await interaction.followup.send(
                     f"❌ Neznámý kit `{kit_clean}` – registruj ho přes `/addkit` "
                     "(nebo první `/result`).",
                     ephemeral=True,
                 )
 
-        if not ign_clean or not kit_clean:
+        if not kit_clean:
             return await interaction.followup.send(
-                "❌ Ticket nemá IGN/kit hráče – doplň je přes parametry.",
-                ephemeral=True,
-            )
-
-        # 0c) Validace vstupů (skóre, HT tier, status).
-        ok, msg = validate_ht_fight_tier(fight_tier)
-        if not ok:
-            return await interaction.followup.send(msg, ephemeral=True)
-        ok, msg = validate_ht_fight_score(score)
-        if not ok:
-            return await interaction.followup.send(msg, ephemeral=True)
-        ok, msg = validate_ht_fight_status(tier_status)
-        if not ok:
-            return await interaction.followup.send(msg, ephemeral=True)
-        if str(opponent.id) == player_id:
-            return await interaction.followup.send(
-                "❌ Soupeř nemůže být stejný hráč jako testovaný.", ephemeral=True
+                "❌ Ticket nemá kit – doplň ho přes parametr.", ephemeral=True
             )
         if player_id == str(interaction.user.id) and not has_admin_role(interaction.user):
             return await interaction.followup.send(
                 "❌ Nemůžeš zapisovat výsledek sám sobě.", ephemeral=True
             )
-        if opponent.id != interaction.user.id:
-            opponent_member = (
-                interaction.guild.get_member(opponent.id)
-                if interaction.guild is not None
-                else None
-            )
-            if opponent_member is None and interaction.guild is not None:
-                try:
-                    opponent_member = await interaction.guild.fetch_member(opponent.id)
-                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                    opponent_member = None
-            if opponent_member is None or not has_tester_role(opponent_member):
-                return await interaction.followup.send(
-                    "❌ Soupeř musí být tester (nebo ty sám).", ephemeral=True
-                )
 
-        # 1) Zápis do kanonické historie – výhradně PostgreSQL (Result,
-        #    promotion_status=discord_pending); players.json se NEpíše a
-        #    nerozhoduje o current tieru (G0 audit fix / H1 cutover).
-        #    výhra = povýšení hráče, ticket zůstává otevřený; prohra = zavření
-        #    ticketu + HT3+ cooldown vlastníka.
-        record = await record_ht_fight(
-            ticket_id=ticket["id"] if ticket is not None else None,
+        # 0c) Kontext z databáze: IGN, aktuální tier, FT kitu.
+        context = await load_fight_context(player_id, kit_clean, session_factory=sf)
+        if context is None:
+            return await interaction.followup.send(
+                f"❌ Neznámý kit `{kit_clean}`.", ephemeral=True
+            )
+        if not context["ign"]:
+            return await interaction.followup.send(
+                f"❌ Hráč <@{player_id}> nemá v databázi IGN – nejdřív `/linkign` "
+                "(nebo admin `/linkdiscord`).",
+                ephemeral=True,
+            )
+        if not context["first_to"]:
+            return await interaction.followup.send(
+                f"❌ Kit **{context['kit_name']}** nemá nastavené FT – admin ho nastaví "
+                "přes `/setkitft`.",
+                ephemeral=True,
+            )
+
+        # 0d) Cílový tier: z ticketu, jinak o stupeň nad aktuálním tierem.
+        current_tier = context["current_tier"]
+        target_tier = ((ticket or {}).get("targetTier") or "").strip().upper()
+        if not target_tier and current_tier:
+            target_tier = next_ticket_tier(current_tier) or ""
+        sections = fight_sections(target_tier) if target_tier else []
+        if not sections:
+            return await interaction.followup.send(
+                "❌ Nepodařilo se určit cílový tier testu (hráč nemá tier a ticket "
+                "nemá cíl).",
+                ephemeral=True,
+            )
+
+        wizard = FightWizard(
+            self,
+            evaluator=interaction.user,
             player_id=player_id,
             player_name=player_name,
-            ign=ign_clean,
+            ign=context["ign"],
+            kit_name=context["kit_name"],
+            first_to=context["first_to"],
+            current_tier=current_tier,
+            target_tier=target_tier,
+            tier_gained=tier_gained,
+            bridge=(bridge or "").strip().upper() or None,
+            ticket=ticket,
+            sections=sections,
+            result_channel=result_channel,
+            target_role=target_role,
+            guild=interaction.guild,
+            session_factory=sf,
+        )
+        await interaction.followup.send(embed=wizard.embed(), view=wizard, ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # Odeslání výsledku z průvodce
+    # ------------------------------------------------------------------
+    async def finalize(self, interaction: discord.Interaction, wizard: FightWizard) -> bool:
+        """Zapíše zápasy, udělí roli, oznámí. ``True`` = hotovo (průvodce se zavře)."""
+        sf = wizard.session_factory
+        player_id = wizard.player_id
+        kit_clean = wizard.kit_name
+        ticket = wizard.ticket
+        fights = wizard.fights()
+
+        # 1) Zápis do kanonické historie – výhradně PostgreSQL (Result,
+        #    promotion_status=discord_pending). „ano“ = povýšení, ticket zůstává
+        #    otevřený; „ne“ = zavření ticketu + HT3+ cooldown vlastníka.
+        record = await record_ht_fights(
+            ticket_id=ticket["id"] if ticket is not None else None,
+            player_id=player_id,
+            player_name=wizard.player_name,
             evaluator_id=str(interaction.user.id),
             evaluator_name=interaction.user.display_name,
             kit=kit_clean,
-            fight_tier=fight_tier,
-            score=score,
-            outcome=outcome,
-            opponent_id=str(opponent.id),
-            opponent_name=opponent.display_name or opponent.name,
-            tier_status=tier_status,
-            bridge=bridge,
+            fights=fights,
+            target_tier=wizard.target_tier,
+            tier_gained=wizard.tier_gained,
+            bridge=wizard.bridge,
             now=now_ms(),
             date=today_cz(),
             ht3_cooldown_ms=HT3_COOLDOWN_MS,
@@ -350,74 +717,59 @@ class TopResult(commands.Cog):
         r = record["result"]
         if r == "duplicate":
             existing = record.get("existing") or {}
-            score_txt = existing.get("score") or "?"
-            date_txt = existing.get("date") or "?"
-            if ticket is not None:
-                msg = (
-                    "❌ Výsledek pro tento HT Fight ticket už byl zaznamenán "
-                    f"(idempotentně – nic se nemění; skóre {score_txt} "
-                    f"dne {date_txt})."
-                )
-            else:
-                msg = (
-                    "❌ Identický HT Fight výsledek pro tohoto hráče už byl "
-                    f"zaznamenán (duplicitní odeslání – nic se nemění; skóre "
-                    f"{score_txt} dne {date_txt})."
-                )
-            return await interaction.followup.send(msg, ephemeral=True)
-        if r == "not_found":
-            return await interaction.followup.send(
-                "❌ Tento kanál není HT ticket.", ephemeral=True
-            )
-        if r == "not_fight_ticket":
-            return await interaction.followup.send(
-                "❌ Kanál je HT ticket, ale není typu „fight“ – HT Fight výsledky "
-                "se zadávají mimo eval tickety.",
+            await interaction.followup.send(
+                "❌ Tento HT Fight výsledek už byl zaznamenán (idempotentně – nic se "
+                f"nemění; skóre {existing.get('score') or '?'} "
+                f"dne {existing.get('date') or '?'}).",
                 ephemeral=True,
             )
-        if r == "ticket_closed":
-            return await interaction.followup.send(
-                "❌ HT Fight ticket je zavřený.", ephemeral=True
-            )
+            return False
+        errors = {
+            "not_found": "❌ Tento kanál není HT ticket.",
+            "not_fight_ticket": (
+                "❌ Kanál je HT ticket, ale není typu „fight“ – HT Fight výsledky "
+                "se zadávají mimo eval tickety."
+            ),
+            "ticket_closed": "❌ HT Fight ticket je zavřený.",
+            "ign_missing": (
+                f"❌ Hráč <@{player_id}> nemá v databázi IGN – nejdřív `/linkign`."
+            ),
+        }
+        if r in errors:
+            await interaction.followup.send(errors[r], ephemeral=True)
+            return False
         if r == "wrong_player":
             owner = (record.get("ticket") or {}).get("ownerId")
-            return await interaction.followup.send(
+            await interaction.followup.send(
                 "❌ Ticket patří jinému hráči "
                 f"({f'<@{owner}>' if owner else 'neznámý'}).",
                 ephemeral=True,
             )
+            return False
         if r == "wrong_kit":
             kit_of = (record.get("ticket") or {}).get("kit")
-            return await interaction.followup.send(
+            await interaction.followup.send(
                 f"❌ Kit neodpovídá ticketu – ticket je na kit **{kit_of}**.",
                 ephemeral=True,
             )
-        if r == "identity_conflict":
-            return await interaction.followup.send(
-                record.get(
-                    "message",
-                    "❌ Zadané IGN patří jinému hráči (jinému Discord ID) – "
-                    "výsledek se nezapsal. Identitu hráče uprav ručně.",
-                ),
-                ephemeral=True,
-            )
+            return False
         if r in (
             "invalid_argument",
             "invalid_tier",
-            "invalid_score",
-            "invalid_outcome",
-            "invalid_status",
             "invalid_bridge",
         ):
-            return await interaction.followup.send(
+            await interaction.followup.send(
                 record.get("message", "❌ Neplatný výsledek."), ephemeral=True
             )
+            return False
         if r != "created":
-            return await interaction.followup.send(
-                "❌ Výsledek se nepodařilo uložit.", ephemeral=True
-            )
+            await interaction.followup.send("❌ Výsledek se nepodařilo uložit.", ephemeral=True)
+            return False
 
         rec = record["record"]
+        ign_clean = record["ign"]
+        records = record["records"]
+        result_ids = [item.get("id") for item in records]
         previous_tier = rec.get("previousTier") or ""
         new_tier = rec.get("newTier") or ""
         promoted = bool(new_tier) and new_tier != previous_tier
@@ -464,9 +816,9 @@ class TopResult(commands.Cog):
                         previous_tier if previous_tier not in ("N/A", "") else None
                     ),
                     bridge_tier_code=(rec.get("bridgeTier") or None),
-                    tier_status=(rec.get("tierStatus") or tier_status.strip() or None),
-                    score=score.strip(),
-                    outcome=outcome,
+                    tier_status=(rec.get("tierStatus") or wizard.status_text()),
+                    score=(rec.get("score") or "").strip(),
+                    outcome=rec.get("outcome") or "",
                     opponent_id=(
                         int(rec["opponentId"]) if rec.get("opponentId") else None
                     ),
@@ -481,7 +833,7 @@ class TopResult(commands.Cog):
                 log.exception("PostgreSQL mirror pro HT Fight %s selhal", kit_clean)
 
             if not grant_confirmation(grant)[0]:
-                return await interaction.followup.send(
+                await interaction.followup.send(
                     "❌ Povýšení **nebylo potvrzeno** – tier roli se nepodařilo udělit "
                     "a ověřit, proto se nic neoznámilo ani nezapsalo do mirroru. "
                     "Oprav role a zapiš `/topresult` znovu."
@@ -489,8 +841,9 @@ class TopResult(commands.Cog):
                     + db_note,
                     ephemeral=True,
                 )
+                return False
 
-        # 1b) Prohra v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
+        # 1b) „Tier nezískán“ v HT Fight ticketu = zavřený ticket → obnovíme embed panel.
         if ticket is not None:
             try:
                 fresh_ticket = await get_ticket(ticket["id"], session_factory=sf)
@@ -507,66 +860,62 @@ class TopResult(commands.Cog):
         # 2) Sestavení zprávy ve stylu serveru + odeslání do TOP_RESULT kanálu.
         #    Role ping jde POUZE na nakonfigurovanou TOP_RESULT_ROLE_ID
         #    (allowed_mentions.roles) – žádná uživatelská role se nepřijímá.
-        message = format_topresult_message(
+        message = format_topresult_fights_message(
             player_id=player_id,
             ign=ign_clean,
-            tier_status=rec.get("tierStatus") or tier_status.strip(),
+            tier_status=rec.get("tierStatus") or wizard.status_text(),
             kit=kit_clean,
-            fight_tier=fight_tier,
-            outcome=outcome,
-            score=score.strip(),
-            opponent_id=str(opponent.id),
+            first_to=wizard.first_to,
+            fights=fights,
             previous_tier=previous_tier,
             new_tier=new_tier,
             role_id=TOP_RESULT_ROLE_ID,
         )
+        mention_ids = {int(player_id), *(int(f.opponent_id) for f in fights)}
         allowed = discord.AllowedMentions(
             everyone=False,
-            users=[discord.Object(int(player_id)), discord.Object(opponent.id)],
-            roles=[target_role],
+            users=[discord.Object(uid) for uid in mention_ids],
+            roles=[wizard.target_role],
         )
-        announce_result_id = rec.get("id")
-        # Historie žije v PostgreSQL (G0 – HT fight záznam i jeho announcement).
-        history_label = "PostgreSQL"
         try:
-            sent = await result_channel.send(content=message, allowed_mentions=allowed)
+            sent = await wizard.result_channel.send(content=message, allowed_mentions=allowed)
         except (discord.Forbidden, discord.HTTPException) as err:
             log.warning(
                 "Nelze poslat HT Fight výsledek do %s: %s", TOP_RESULT_CHANNEL_ID, err
             )
             try:
-                await set_ht_fight_announcement(
-                    announce_result_id,
-                    ANNOUNCEMENT_FAILED,
-                    session_factory=sf,
-                )
+                for result_id in result_ids:
+                    await set_ht_fight_announcement(
+                        result_id, ANNOUNCEMENT_FAILED, session_factory=sf
+                    )
             except Exception:  # noqa: BLE001
                 log.exception("Nelze označit oznámení jako failed")
             view = HTFightRetryView(
-                result_id=announce_result_id,
-                result_channel=result_channel,
+                result_ids=result_ids,
+                result_channel=wizard.result_channel,
                 content=message,
                 allowed_mentions=allowed,
                 session_factory=sf,
             )
-            return await interaction.followup.send(
+            await interaction.followup.send(
                 f"❌ HT Fight výsledek se nepodařilo odeslat do <#{TOP_RESULT_CHANNEL_ID}> "
-                f"(záznam zůstal v historii {history_label}, oznámení je ve stavu "
+                "(záznam zůstal v historii PostgreSQL, oznámení je ve stavu "
                 "**failed**) – můžeš to zkusit znovu tlačítkem.",
                 ephemeral=True,
                 view=view,
             )
-        await set_ht_fight_announcement(
-            announce_result_id,
-            ANNOUNCEMENT_SENT,
-            message_id=sent.id,
-            session_factory=sf,
-        )
+            return True
+        for result_id in result_ids:
+            await set_ht_fight_announcement(
+                result_id,
+                ANNOUNCEMENT_SENT,
+                message_id=sent.id,
+                session_factory=sf,
+            )
 
         reply = (
-            f"✅ Výsledek HT Fightu (`{ign_clean}` · {kit_clean} · "
-            f"**{fight_tier.strip().upper()} Fighty:** {score.strip()}) byl "
-            f"zaznamenán a odeslán do <#{TOP_RESULT_CHANNEL_ID}>."
+            f"✅ Výsledek HT Fightu (`{ign_clean}` · {kit_clean} · {len(fights)} "
+            f"zápas(ů)) byl zaznamenán a odeslán do <#{TOP_RESULT_CHANNEL_ID}>."
         )
         if promoted:
             reply += f"\n**Povýšení: {previous_tier} → {new_tier}**"
@@ -576,7 +925,10 @@ class TopResult(commands.Cog):
                 reply += f"\n{grant_note}"
             if db_note:
                 reply += f"\n{db_note}"
+        elif not wizard.tier_gained and ticket is not None:
+            reply += "\n🔒 Tier nezískán – HT Fight ticket byl zavřen a nastaven cooldown."
         await interaction.followup.send(reply, ephemeral=True)
+        return True
 
 
 async def setup(bot: commands.Bot) -> None:

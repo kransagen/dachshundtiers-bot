@@ -62,6 +62,7 @@ from db.repositories.sync_audit import AuditRepository
 from db.repositories.tickets import TICKET_OPEN, TicketRepository
 from db.repositories.tiers import MirrorRepository
 from db.services.session import transaction as db_transaction
+from services.ht_fights import Fight
 from services.results import (
     _db_result_to_dict,
     normalize_tier,
@@ -830,3 +831,375 @@ async def _db_get_ht_fight_results(
                 continue
             out.append(await _db_ht_fight_to_dict(session, r))
         return out
+
+
+# ---------------------------------------------------------------------------
+# Průvodce /topresult: víc zápasů najednou, o povýšení rozhoduje tester
+# ---------------------------------------------------------------------------
+async def load_fight_context(
+    player_id: str,
+    kit: str,
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> dict | None:
+    """IGN, aktuální tier a FT pro průvodce; ``None`` když hráč/kit v DB není.
+
+    ``ign`` je ``None``, když hráč nemá v DB IGN (průvodce se pak zastaví).
+    ``current_tier`` je ``None`` bez tieru v mirroru, ``first_to`` bez nastaveného FT.
+    """
+    async with db_transaction(session_factory) as session:
+        kit_row = await _db_resolve_kit(session, kit)
+        if kit_row is None:
+            return None
+        player = await PlayerRepository().get_by_discord_id(session, int(player_id))
+        ign = (player.ign or "").strip() if player is not None else ""
+        current = None
+        if player is not None:
+            code = await _db_current_tier_code(session, player.id, kit_row.id)
+            current = code if code != "N/A" else None
+        return {
+            "kit_name": kit_row.name,
+            "ign": ign or None,
+            "current_tier": current,
+            "first_to": kit_row.first_to,
+        }
+
+
+async def describe_opponents(
+    discord_ids: list[str],
+    kit: str,
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> dict[str, dict]:
+    """``{discord_id: {"ign": str | None, "tier": str | None}}`` podle DB (kit = tier v kitu)."""
+    out: dict[str, dict] = {}
+    async with db_transaction(session_factory) as session:
+        kit_row = await _db_resolve_kit(session, kit)
+        for did in discord_ids:
+            player = await PlayerRepository().get_by_discord_id(session, int(did))
+            tier = None
+            if player is not None and kit_row is not None:
+                code = await _db_current_tier_code(session, player.id, kit_row.id)
+                tier = code if code != "N/A" else None
+            out[str(did)] = {
+                "ign": (player.ign or None) if player is not None else None,
+                "tier": tier,
+            }
+    return out
+
+
+async def _db_check_fight_ticket(session: AsyncSession, tid: str, player_id: str, kit_row):
+    """Ověří HT Fight ticket; vrací ``(chyba | None, ticket)``."""
+    ticket = await TicketRepository().get_by_channel(session, int(tid))
+    if ticket is None:
+        return {"result": "not_found"}, None
+    if ticket.ticket_type != TICKET_TYPE_FIGHT:
+        return {
+            "result": "not_fight_ticket",
+            "ticket": await _db_ticket_to_dict(session, ticket),
+        }, None
+    if ticket.status != TICKET_OPEN:
+        return {
+            "result": "ticket_closed",
+            "ticket": await _db_ticket_to_dict(session, ticket),
+        }, None
+    owner = await PlayerRepository().get_by_id(session, ticket.player_id)
+    owner_did = owner.discord_id if owner is not None else None
+    if str(owner_did if owner_did is not None else ticket.player_id) != player_id:
+        return {
+            "result": "wrong_player",
+            "ticket": await _db_ticket_to_dict(session, ticket),
+        }, None
+    if kit_row is None or ticket.kit_id is None or ticket.kit_id != kit_row.id:
+        return {
+            "result": "wrong_kit",
+            "ticket": await _db_ticket_to_dict(session, ticket),
+        }, None
+    return None, ticket
+
+
+def _fight_result_id(ticket_id, fight: Fight) -> str:
+    return f"{ticket_id}{HT_FIGHT_TICKET_KEY_SUFFIX}:{normalize_tier(fight.tier)}:{fight.opponent_id}"
+
+
+async def record_ht_fights(
+    *,
+    ticket_id=None,
+    player_id: str,
+    player_name: str = "",
+    evaluator_id: str,
+    evaluator_name: str = "",
+    kit: str,
+    fights: list[Fight],
+    target_tier: str = "",
+    tier_gained: bool,
+    bridge: str = None,
+    now: int = None,
+    date: str = "",
+    ht3_cooldown_ms: int = 0,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> dict:
+    """Atomicky zapíše všechny zápasy HT Fightu (jeden řádek ``results`` na zápas).
+
+    IGN se bere z DB (``players.ign``). O povýšení rozhoduje ``tier_gained``
+    (tester): při „ano“ jde hráč na ``bridge`` nebo ``target_tier``, povýšení
+    nese POSLEDNÍ řádek (``discord_pending`` do potvrzeného Discord grantu).
+    Při „ne“ se ticket (je-li) zavře a nastaví se HT3+ cooldown.
+
+    Vrací ``created`` (``record`` = řádek s povýšením, ``records`` = všechny,
+    ``ign``, ``previous_tier``, ``promoted``), ``duplicate``, ``ign_missing``,
+    ``not_found`` / ``not_fight_ticket`` / ``ticket_closed`` / ``wrong_player`` /
+    ``wrong_kit`` nebo ``invalid_*`` (s ``message``).
+    """
+    return await _db_record_ht_fights(
+        session_factory,
+        ticket_id=ticket_id,
+        player_id=player_id,
+        player_name=player_name,
+        evaluator_id=evaluator_id,
+        evaluator_name=evaluator_name,
+        kit=kit,
+        fights=fights,
+        target_tier=target_tier,
+        tier_gained=tier_gained,
+        bridge=bridge,
+        now=now,
+        date=date,
+        ht3_cooldown_ms=ht3_cooldown_ms,
+    )
+
+
+async def _db_record_ht_fights(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    ticket_id=None,
+    player_id: str,
+    player_name: str = "",
+    evaluator_id: str,
+    evaluator_name: str = "",
+    kit: str,
+    fights: list[Fight],
+    target_tier: str = "",
+    tier_gained: bool,
+    bridge: str = None,
+    now: int = None,
+    date: str = "",
+    ht3_cooldown_ms: int = 0,
+) -> dict:
+    if now is None:
+        now = _now_ms()
+    player_id = str(player_id)
+    evaluator_id = str(evaluator_id)
+    if not fights:
+        return {"result": "invalid_argument", "message": "❌ Chybí zápasy."}
+    for fight in fights:
+        ok, msg = validate_ht_fight_tier(fight.tier)
+        if not ok:
+            return {"result": "invalid_tier", "message": msg}
+    bridge_clean = normalize_tier(bridge) if (bridge or "").strip() else ""
+    if bridge_clean:
+        if not tier_gained:
+            return {"result": "invalid_bridge", "message": _MSG_BRIDGE_ONLY_ON_WIN}
+        ok, msg = validate_ht_fight_bridge(bridge_clean)
+        if not ok:
+            return {"result": "invalid_bridge", "message": msg}
+    target_clean = normalize_tier(target_tier) if (target_tier or "").strip() else ""
+
+    async with db_transaction(session_factory) as session:
+        results = ResultRepository()
+        kit_row = await _db_resolve_kit(session, kit)
+        if kit_row is None:
+            return {"result": "invalid_argument", "message": f"Neznámý kit: {kit}"}
+
+        tid = None
+        if ticket_id is not None:
+            tid = str(ticket_id)
+            error, _ticket = await _db_check_fight_ticket(session, tid, player_id, kit_row)
+            if error is not None:
+                return error
+
+        player = await PlayerRepository().get_by_discord_id(session, int(player_id))
+        ign = (player.ign or "").strip() if player is not None else ""
+        if not ign:
+            return {"result": "ign_missing"}
+
+        result_ids = []
+        for fight in fights:
+            outcome = fight.score.outcome
+            if tid is not None:
+                result_id = _fight_result_id(tid, fight)
+            else:
+                dup = await _db_find_recent_ht_fight_duplicate(
+                    session,
+                    player.id,
+                    kit_id=kit_row.id,
+                    fight_tier=fight.tier,
+                    score=fight.score.text,
+                    outcome=outcome,
+                    opponent_id=fight.opponent_id,
+                    now=now,
+                )
+                if dup is not None:
+                    return {
+                        "result": "duplicate",
+                        "existing": await _db_result_to_dict(session, dup),
+                    }
+                result_id = _free_fight_result_id(
+                    player_id,
+                    kit_row.id,
+                    fight_tier=fight.tier,
+                    score=fight.score.text,
+                    outcome=outcome,
+                    opponent_id=fight.opponent_id,
+                    now=now,
+                )
+            existing = await results.get_by_key(session, f"ht_fight:{result_id}")
+            if existing is not None:
+                if existing.promotion_status != PROMOTION_DISCORD_PENDING:
+                    return {
+                        "result": "duplicate",
+                        "existing": await _db_result_to_dict(session, existing),
+                    }
+                # Stejná logika jako record_ht_fight: nepotvrzené povýšení
+                # (discord_pending) nesmí navždy blokovat opakování.
+                await session.delete(existing)
+                await session.flush()
+            result_ids.append(result_id)
+
+        previous = await _db_current_tier_code(session, player.id, kit_row.id)
+        current = previous if previous != "N/A" else None
+        promoted = None
+        if tier_gained:
+            goal = bridge_clean or target_clean
+            if not goal:
+                return {
+                    "result": "invalid_tier",
+                    "message": "❌ Neznám cílový tier – nelze povýšit.",
+                }
+            if (
+                current
+                and current in HT3_TIER_LADDER
+                and goal in HT3_TIER_LADDER
+                and HT3_TIER_LADDER.index(goal) <= HT3_TIER_LADDER.index(current)
+            ):
+                if bridge_clean:
+                    return {
+                        "result": "invalid_bridge",
+                        "message": _MSG_BRIDGE_NOT_HIGHER.format(
+                            bridge=bridge_clean, current=current
+                        ),
+                    }
+            else:
+                promoted = goal
+        status_clean = (
+            f"Povýšen na {promoted}"
+            if promoted
+            else (f"Zůstává {current}" if current else "Beze změny")
+        )
+
+        prev_tier_row = await _db_resolve_tier(session, previous) if current else None
+        new_tier_row = await _db_resolve_tier(session, promoted) if promoted else None
+        bridge_tier_row = (
+            await _db_resolve_tier(session, bridge_clean) if bridge_clean else None
+        )
+        evaluator = (
+            await PlayerRepository().get_by_discord_id(session, int(evaluator_id))
+            if evaluator_id.isdigit()
+            else None
+        )
+
+        rows = []
+        last = len(fights) - 1
+        for index, (fight, result_id) in enumerate(zip(fights, result_ids)):
+            carries_promotion = promoted is not None and index == last
+            outcome = fight.score.outcome
+            if carries_promotion:
+                promotion_status = PROMOTION_DISCORD_PENDING
+            elif outcome == "Won":
+                promotion_status = PROMOTION_COMMITTED
+            else:
+                promotion_status = None
+            try:
+                async with session.begin_nested():
+                    row = await results.insert(
+                        session,
+                        result_key=f"ht_fight:{result_id}",
+                        kind="ht_fight",
+                        subtype=normalize_tier(fight.tier),
+                        player_id=player.id,
+                        evaluator_id=evaluator.id if evaluator is not None else None,
+                        kit_id=kit_row.id,
+                        ticket_channel_id=int(tid) if tid is not None else None,
+                        previous_tier_id=(
+                            prev_tier_row.id if prev_tier_row is not None else None
+                        ),
+                        new_tier_id=(
+                            new_tier_row.id
+                            if carries_promotion and new_tier_row is not None
+                            else None
+                        ),
+                        bridge_tier_id=(
+                            bridge_tier_row.id
+                            if carries_promotion and bridge_tier_row is not None
+                            else None
+                        ),
+                        tier_status=status_clean,
+                        score=fight.score.text,
+                        outcome=outcome,
+                        opponent_id=(
+                            int(fight.opponent_id)
+                            if str(fight.opponent_id or "").isdigit()
+                            else None
+                        ),
+                        opponent_name=fight.opponent_name,
+                        notes=None,
+                        eval_flag=False,
+                        date=date or "",
+                        recorded_at=_ms_to_dt(now),
+                        promotion_status=promotion_status,
+                    )
+            except IntegrityError:
+                winner = await results.get_by_key(session, f"ht_fight:{result_id}")
+                if winner is None:
+                    raise
+                return {
+                    "result": "duplicate",
+                    "existing": await _db_result_to_dict(session, winner),
+                }
+            rows.append(row)
+
+        if tid is not None and not tier_gained:
+            await TicketRepository().close_by_channel(
+                session, channel_id=int(tid), closed_at=_ms_to_dt(now)
+            )
+            if ht3_cooldown_ms > 0:
+                await CooldownRepository().upsert(
+                    session,
+                    player_id=player.id,
+                    cooldown_type=COOLDOWN_HT3,
+                    kit_id=kit_row.id,
+                    expires_at=_ms_to_dt(now + int(ht3_cooldown_ms)),
+                    source="ticket_close",
+                )
+            await AuditRepository().append(
+                session,
+                action="ht_fight",
+                actor_id=int(evaluator_id) if evaluator_id.isdigit() else None,
+                actor_name=evaluator_name or "",
+                entity_type="ticket",
+                entity_id=str(tid),
+                details={
+                    "details": f"{previous} (tier nezískán)",
+                    "ts": int(now),
+                },
+            )
+
+        records = [await _db_ht_fight_to_dict(session, row) for row in rows]
+        return {
+            "result": "created",
+            "record": records[-1],
+            "records": records,
+            "ign": ign,
+            "previous_tier": previous,
+            "promoted": promoted,
+        }

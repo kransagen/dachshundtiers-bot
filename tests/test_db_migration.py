@@ -211,6 +211,41 @@ def test_tester_rooms_migration_keeps_one_room_per_tester(embedded_pg):
             conn.commit()
 
 
+def test_kits_first_to_migration_seeds_known_kits(embedded_pg):
+    """FT se doplní podle názvu kitu bez mezer a interpunkce; neznámý kit zůstane NULL."""
+    from alembic import command
+
+    _create_fresh_database(embedded_pg, "pytest_first_to_mig")
+    url = _sync_url(embedded_pg, "pytest_first_to_mig")
+    cfg = _alembic_config(url)
+    try:
+        command.upgrade(cfg, "d0e1f2a3b4c5")
+        engine = create_engine(url)
+        names = [
+            "UHCMace", "MolePvP", "IronAxe", "Shieldless SMP", "Netherite Sword",
+            "GoldSMP", "AnchorPvP", "RandomPot", "Cart",
+        ]
+        with engine.begin() as conn:
+            for name in names:
+                conn.execute(
+                    text("INSERT INTO kits (key, name) VALUES (:k, :n)"),
+                    {"k": name.lower(), "n": name},
+                )
+        command.upgrade(cfg, "head")
+        with engine.connect() as conn:
+            got = dict(conn.execute(text("SELECT name, first_to FROM kits")).all())
+        engine.dispose()
+        assert got == {
+            "UHCMace": 3, "MolePvP": 4, "IronAxe": 5, "Shieldless SMP": 2,
+            "Netherite Sword": 10, "GoldSMP": 3, "AnchorPvP": 4, "RandomPot": 3,
+            "Cart": None,
+        }
+    finally:
+        with create_engine(url).connect() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public;"))
+            conn.commit()
+
+
 def test_upgrade_to_head_from_older_revision(embedded_pg):
     """Startup auto-migrace: databáze na starší revizi se dostane na head."""
     from alembic import command

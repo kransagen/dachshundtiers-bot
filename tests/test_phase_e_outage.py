@@ -421,33 +421,26 @@ class TopResultDbOutageTests(unittest.TestCase):
                                              "modes": {"MolePVP": "LT3"}, "history": {}}])
 
     def test_db_down_wedge_surfaces_discord_never_reverted(self):
+        from services.ht_fights import FightScore
+
         cm = self.cog_module
+        rec_item = {"id": "2001:ht_fight:HT3:2", "previousTier": "LT3", "newTier": "LT2",
+                    "score": "4-1", "outcome": "Won"}
         rec = {
             "result": "created",
-            "promoted": True,
-            "record": {"id": "2001:ht_fight",
-                       "previousTier": "LT3", "newTier": "LT2"},
+            "promoted": "LT2",
+            "ign": "mendu__",
+            "record": rec_item,
+            "records": [rec_item],
         }
         with mock.patch.object(
             cm, "TOP_RESULT_CHANNEL_ID", 5555
         ), mock.patch.object(
             cm, "TOP_RESULT_ROLE_ID", 202
         ), mock.patch.object(
-            cm, "get_kits", new=mock.AsyncMock(return_value=["MolePVP"])
-        ), mock.patch.object(
             cm, "has_tester_role", return_value=True
         ), mock.patch.object(
-            cm, "validate_topresult_config", return_value=(True, "")
-        ), mock.patch.object(
-            cm, "is_registered_kit", return_value=True
-        ), mock.patch.object(
-            cm, "validate_ht_fight_tier", return_value=(True, "")
-        ), mock.patch.object(
-            cm, "validate_ht_fight_score", return_value=(True, "")
-        ), mock.patch.object(
-            cm, "validate_ht_fight_status", return_value=(True, "")
-        ), mock.patch.object(
-            cm, "record_ht_fight", new=mock.AsyncMock(return_value=rec)
+            cm, "record_ht_fights", new=mock.AsyncMock(return_value=rec)
         ), mock.patch.object(
             cm, "set_ht_fight_announcement",
             new=mock.AsyncMock(return_value={"result": "ok"}),
@@ -474,9 +467,6 @@ class TopResultDbOutageTests(unittest.TestCase):
            ):
             channel = mock.MagicMock()
             channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
-            bot = mock.MagicMock()
-            bot.db_session_factory = object()
-            bot.get_channel.return_value = channel
             inter = mock.MagicMock()
             inter.response.defer = mock.AsyncMock()
             inter.followup.send = mock.AsyncMock()
@@ -486,22 +476,22 @@ class TopResultDbOutageTests(unittest.TestCase):
             inter.guild.get_role.return_value = mock.MagicMock(id=202)
             inter.channel_id = 9999
 
-            cog = cm.TopResult(bot)
-            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
-            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
-            asyncio.run(cog.topresult.callback(
-                cog,
-                interaction=inter,
-                fight_tier="HT3",
-                outcome="Won",
-                score="4-1",
-                opponent=opp,
-                tier_status="Povýšen na LT2",
-                hrac=hrac,
-                ign="mendu__",
-                kit="MolePVP",
-                bridge="LT2",
-            ))
+            async def main():
+                cog = cm.TopResult(mock.MagicMock())
+                wizard = cm.FightWizard(
+                    cog, evaluator=inter.user, player_id="1", player_name="mendu__",
+                    ign="mendu__", kit_name="MolePVP", first_to=4, current_tier="LT3",
+                    target_tier="HT3", tier_gained=True, bridge="LT2", ticket=None,
+                    sections=["HT3"], result_channel=channel,
+                    target_role=mock.MagicMock(id=202), guild=inter.guild,
+                    session_factory=object(),
+                )
+                wizard.chosen["HT3"] = ["2"]
+                wizard.names["2"] = "souper"
+                wizard.scores[("HT3", "2")] = FightScore(4, 1, False)
+                await cog.finalize(inter, wizard)
+
+            asyncio.run(main())
         reply = inter.followup.send.await_args.args[0]
         self.assertIn("outboxu a mirror se doplní automaticky", reply)
         alice.remove_roles.assert_not_awaited()

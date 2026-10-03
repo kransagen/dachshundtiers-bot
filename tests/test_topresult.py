@@ -228,217 +228,182 @@ class PromotionLineFormatTests(unittest.TestCase):
 
 
 
-class TopResultCogBridgeTests(unittest.TestCase):
-    """Plumbing bridge parametru v /topresult (cog, bez sítě)."""
+def _build_wizard(cm, *, tier_gained=True, bridge="LT2", ticket=None, channel=None,
+                  session_factory=None, scores=None):
+    """FightWizard s předvyplněným jedním zápasem HT3 (bez Discordu, bez DB)."""
+    from services.ht_fights import FightScore
 
+    wizard = cm.FightWizard(
+        None,
+        evaluator=SimpleNamespace(id=9),
+        player_id="1",
+        player_name="mendu__",
+        ign="mendu__",
+        kit_name="MolePVP",
+        first_to=4,
+        current_tier="LT3",
+        target_tier="HT3",
+        tier_gained=tier_gained,
+        bridge=bridge,
+        ticket=ticket,
+        sections=["HT3"],
+        result_channel=channel or mock.MagicMock(),
+        target_role=mock.MagicMock(id=6666),
+        guild=mock.MagicMock(),
+        session_factory=session_factory,
+    )
+    wizard.chosen["HT3"] = ["2"]
+    wizard.names["2"] = "souper"
+    wizard.scores[("HT3", "2")] = scores or FightScore(4, 1, False)
+    return wizard
+
+
+class _FinalizeBase(unittest.TestCase):
     CHANNEL_ID = 5555
     ROLE_ID = 6666
 
     def setUp(self):
-        self.cog_module = __import__("cogs.topresult", fromlist=["TopResult"])
-        cm = self.cog_module
-        self._patches = [
-            mock.patch.object(cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
-            mock.patch.object(cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
-            mock.patch.object(cm, "has_tester_role", return_value=True),
-            mock.patch.object(cm, "validate_topresult_config", return_value=(True, "")),
-            mock.patch.object(cm, "is_registered_kit", return_value=True),
-            mock.patch.object(cm, "validate_ht_fight_tier", return_value=(True, "")),
-            mock.patch.object(cm, "validate_ht_fight_score", return_value=(True, "")),
-            mock.patch.object(cm, "validate_ht_fight_status", return_value=(True, "")),
-        ]
-        for p in self._patches:
-            p.start()
-        self.addCleanup(lambda: [p.stop() for p in self._patches])
-
-    def _call(self, record_result, *, bridge="LT2"):
-        cm = self.cog_module
-        with mock.patch.object(
-            cm,
-            "get_kits",
-            new=mock.AsyncMock(return_value=["MolePVP"]),
-        ), mock.patch.object(
-            cm, "record_ht_fight", new=mock.AsyncMock(return_value=record_result)
-        ) as rec_mock, mock.patch.object(
-            cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
-        ), mock.patch.object(
-            cm,
-            "auto_grant_kit_role",
-            new=mock.AsyncMock(
-                return_value=TierRoleGrant(
-                    ok=True, verified=True, tier_role_id=202, note="ok"
-                )
-            ),
-        ) as grant_mock, mock.patch.object(
-            cm, "get_ticket", new=mock.AsyncMock(return_value=None)
+        self.cm = __import__("cogs.topresult", fromlist=["TopResult"])
+        for p in (
+            mock.patch.object(self.cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
+            mock.patch.object(self.cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
+            mock.patch.object(self.cm, "has_tester_role", return_value=True),
         ):
-            channel = mock.MagicMock()
-            channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
-            bot = mock.MagicMock()
-            bot.get_channel.return_value = channel
-            inter = mock.MagicMock()
-            inter.response.defer = mock.AsyncMock()
-            inter.followup.send = mock.AsyncMock()
-            inter.user.name = "tester"
-            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
-            inter.channel_id = 9999
-
-            cog = cm.TopResult(bot)
-            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
-            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
-            asyncio.run(cog.topresult.callback(
-                cog,
-                interaction=inter,
-                fight_tier="HT3",
-                outcome="Won",
-                score="4-1",
-                opponent=opp,
-                tier_status="Povýšen na LT2",
-                hrac=hrac,
-                ign="mendu__",
-                kit="MolePVP",
-                bridge=bridge,
-            ))
-            return inter, channel, rec_mock, grant_mock
-
-    def test_bridge_param_is_passed_and_promotes(self):
-        record_result = {
-            "result": "created",
-            "record": {
-                "id": "x",
-                "previousTier": "LT3",
-                "newTier": "LT2",
-                "bridgeTier": "LT2",
-            },
-            "previous_tier": "LT3",
-        }
-        inter, channel, rec_mock, grant_mock = self._call(record_result)
-
-        # bridge jde přes službu (a neztratí se v plumbing)
-        self.assertEqual(rec_mock.await_args.kwargs["bridge"], "LT2")
-        # role se udělí pro cílový (bridge) tier
-        self.assertEqual(grant_mock.await_args.kwargs["tier_up"], "LT2")
-        # zpráva do TOP_RESULT kanálu obsahuje postup LT3 → LT2
-        channel.send.assert_awaited_once()
-        content = channel.send.await_args.kwargs["content"]
-        self.assertIn("**Postup: LT3 → LT2**", content)
-        # potvrzení pro testera zmiňuje bridge
-        inter.followup.send.assert_awaited_once()
-        reply = inter.followup.send.await_args.args[0]
-        self.assertIn("Povýšení: LT3 → LT2", reply)
-        self.assertIn("bridge", reply)
-
-    def test_invalid_bridge_shows_clear_message(self):
-        record_result = {
-            "result": "invalid_bridge",
-            "message": "❌ Bridge tier `LT1` není vyšší než aktuální tier hráče `LT3`.",
-        }
-        inter, channel, _, _ = self._call(record_result, bridge="LT1")
-
-        inter.followup.send.assert_awaited_once()
-        msg = inter.followup.send.await_args.args[0]
-        self.assertIn("Bridge tier", msg)
-        self.assertIn("LT3", msg)
-        # nic se neposlalo do kanálu a žádná role se neudělovala
-        channel.send.assert_not_awaited()
-
-
-
-class TopResultDbMirrorTests(unittest.TestCase):
-    """item 13: 1a2 – cog předá celý grant kanonické službě
-    ``commit_confirmed_promotion`` s EXAKTNÍM payloadem (chytilo by chybu
-    z rodiny int('LT2')). POZOR: gate už NENÍ v cogu – rozhodnutí „zapsat
-    do PG nebo ne" (včetně požadavku na `verified`) má jedině služba."""
-
-    CHANNEL_ID = 5555
-    ROLE_ID = 6666
-
-    def setUp(self):
-        self.cog_module = __import__("cogs.topresult", fromlist=["TopResult"])
-        cm = self.cog_module
-        self._patches = [
-            mock.patch.object(cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
-            mock.patch.object(cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
-            mock.patch.object(cm, "has_tester_role", return_value=True),
-            mock.patch.object(cm, "validate_topresult_config", return_value=(True, "")),
-            mock.patch.object(cm, "is_registered_kit", return_value=True),
-            mock.patch.object(cm, "validate_ht_fight_tier", return_value=(True, "")),
-            mock.patch.object(cm, "validate_ht_fight_score", return_value=(True, "")),
-            mock.patch.object(cm, "validate_ht_fight_status", return_value=(True, "")),
-        ]
-        for p in self._patches:
             p.start()
-        self.addCleanup(lambda: [p.stop() for p in self._patches])
+            self.addCleanup(p.stop)
 
-    def _call(self, record_result, *, grant_result):
-        cm = self.cog_module
+    @staticmethod
+    def _inter():
+        inter = mock.MagicMock()
+        inter.response.defer = mock.AsyncMock()
+        inter.followup.send = mock.AsyncMock()
+        inter.user.id = 9
+        inter.user.name = "tester"
+        inter.channel_id = 9999
+        return inter
+
+    def _finalize(self, record_result, *, grant_result=None, bridge="LT2", tier_gained=True,
+                  bot_sf=None, commit_mock=None):
+        cm = self.cm
+        if grant_result is None:
+            grant_result = TierRoleGrant(ok=True, verified=True, tier_role_id=202, note="ok")
+        commit = commit_mock or mock.AsyncMock(return_value=SimpleNamespace(message=""))
         with mock.patch.object(
-            cm, "get_kits", new=mock.AsyncMock(return_value=["MolePVP"])
-        ), mock.patch.object(
-            cm, "record_ht_fight", new=mock.AsyncMock(return_value=record_result)
+            cm, "record_ht_fights", new=mock.AsyncMock(return_value=record_result)
         ) as rec_mock, mock.patch.object(
             cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
         ), mock.patch.object(
             cm, "auto_grant_kit_role", new=mock.AsyncMock(return_value=grant_result)
         ) as grant_mock, mock.patch.object(
             cm, "get_ticket", new=mock.AsyncMock(return_value=None)
-        ), mock.patch(
-            "db.services.commit_confirmed_promotion",
-            new=mock.AsyncMock(return_value=SimpleNamespace(message="ok")),
-        ) as commit_mock:
+        ), mock.patch("db.services.commit_confirmed_promotion", new=commit) as commit_patch:
             channel = mock.MagicMock()
             channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
-            bot = mock.MagicMock()
-            bot.get_channel.return_value = channel
-            inter = mock.MagicMock()
-            inter.response.defer = mock.AsyncMock()
-            inter.followup.send = mock.AsyncMock()
-            inter.user.name = "tester"
-            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
-            inter.channel_id = 9999
+            inter = self._inter()
 
-            cog = cm.TopResult(bot)
-            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
-            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
-            asyncio.run(cog.topresult.callback(
-                cog,
-                interaction=inter,
-                fight_tier="HT3",
-                outcome="Won",
-                score="4-1",
-                opponent=opp,
-                tier_status="Povýšen na LT2",
-                hrac=hrac,
-                ign="mendu__",
-                kit="MolePVP",
-                bridge="LT2",
-            ))
-            return inter, rec_mock, grant_mock, commit_mock, grant_result
+            async def main():
+                cog = cm.TopResult(mock.MagicMock())
+                wizard = _build_wizard(
+                    cm, bridge=bridge, tier_gained=tier_gained, channel=channel,
+                    session_factory=bot_sf,
+                )
+                return await cog.finalize(inter, wizard)
+
+            done = asyncio.run(main())
+        return SimpleNamespace(
+            inter=inter, channel=channel, rec=rec_mock, grant=grant_mock,
+            commit=commit_patch, done=done, grant_result=grant_result,
+        )
 
     @staticmethod
-    def _record():
+    def _record(**rec_overrides):
+        rec = {
+            "id": "x",
+            "previousTier": "LT3",
+            "newTier": "LT2",
+            "bridgeTier": "LT2",
+            "tierStatus": "Povýšen na LT2",
+            "score": "4-1",
+            "outcome": "Won",
+            "opponentId": "2",
+            "opponentName": "souper",
+            "date": "25.09.2026",
+        }
+        rec.update(rec_overrides)
         return {
             "result": "created",
-            "record": {
-                "id": "x",
-                "previousTier": "LT3",
-                "newTier": "LT2",
-                "bridgeTier": "LT2",
-                "opponentId": "2",
-                "opponentName": "souper",
-                "date": "25.09.2026",
-            },
+            "record": rec,
+            "records": [rec],
+            "ign": "mendu__",
+            "previous_tier": "LT3",
         }
 
+
+class TopResultCogBridgeTests(_FinalizeBase):
+    """Plumbing bridge parametru a veřejné zprávy při odeslání průvodce."""
+
+    def test_bridge_param_is_passed_and_promotes(self):
+        out = self._finalize(self._record())
+
+        # bridge jde přes službu (a neztratí se v plumbing)
+        self.assertEqual(out.rec.await_args.kwargs["bridge"], "LT2")
+        self.assertTrue(out.rec.await_args.kwargs["tier_gained"])
+        # role se udělí pro cílový (bridge) tier
+        self.assertEqual(out.grant.await_args.kwargs["tier_up"], "LT2")
+        # zpráva do TOP_RESULT kanálu obsahuje postup LT3 → LT2 a zápas
+        out.channel.send.assert_awaited_once()
+        content = out.channel.send.await_args.kwargs["content"]
+        self.assertIn("**Postup: LT3 → LT2**", content)
+        self.assertIn("**HT3 Fighty (FT4):**", content)
+        self.assertIn("> vyhrál 4-1 <@2>", content)
+        # potvrzení pro testera zmiňuje bridge
+        out.inter.followup.send.assert_awaited_once()
+        reply = out.inter.followup.send.await_args.args[0]
+        self.assertIn("Povýšení: LT3 → LT2", reply)
+        self.assertIn("bridge", reply)
+        self.assertTrue(out.done)
+
+    def test_invalid_bridge_shows_clear_message(self):
+        record_result = {
+            "result": "invalid_bridge",
+            "message": "❌ Bridge tier `LT1` není vyšší než aktuální tier hráče `LT3`.",
+        }
+        out = self._finalize(record_result, bridge="LT1")
+
+        out.inter.followup.send.assert_awaited_once()
+        msg = out.inter.followup.send.await_args.args[0]
+        self.assertIn("Bridge tier", msg)
+        self.assertIn("LT3", msg)
+        # nic se neposlalo do kanálu, žádná role se neudělovala, průvodce zůstává
+        out.channel.send.assert_not_awaited()
+        out.grant.assert_not_awaited()
+        self.assertFalse(out.done)
+
+    def test_tier_not_gained_announces_without_promotion(self):
+        rec = self._record(newTier="", bridgeTier=None, tierStatus="Zůstává LT3")
+        out = self._finalize(rec, bridge=None, tier_gained=False)
+
+        out.grant.assert_not_awaited()
+        out.commit.assert_not_awaited()
+        content = out.channel.send.await_args.kwargs["content"]
+        self.assertIn("**Zůstává LT3**", content)
+        self.assertNotIn("Postup", content)
+        self.assertTrue(out.done)
+
+
+class TopResultDbMirrorTests(_FinalizeBase):
+    """1a2 – cog předá celý grant kanonické službě ``commit_confirmed_promotion``
+    s EXAKTNÍM payloadem (chytilo by chybu z rodiny int('LT2')). POZOR: gate už
+    NENÍ v cogu – rozhodnutí „zapsat do PG nebo ne" (včetně požadavku na
+    `verified`) má jedině služba."""
+
     def test_win_promotion_commits_exact_db_kwargs(self):
-        inter, rec_mock, grant_mock, commit_mock, grant = self._call(
-            self._record(),
-            grant_result=TierRoleGrant(ok=True, verified=True, tier_role_id=202, note="ok"),
-        )
-        commit_mock.assert_awaited_once()
-        kw = commit_mock.await_args.kwargs
+        grant = TierRoleGrant(ok=True, verified=True, tier_role_id=202, note="ok")
+        out = self._finalize(self._record(), grant_result=grant)
+        out.commit.assert_awaited_once()
+        kw = out.commit.await_args.kwargs
         # bezprostřední spojení: celý grant jde do kanonické služby
-        self.assertEqual(grant_mock.await_args.kwargs["tier_up"], "LT2")
+        self.assertEqual(out.grant.await_args.kwargs["tier_up"], "LT2")
         self.assertIs(kw["grant"], grant)
         self.assertEqual(kw["result_key"], "ht_fight:x")
         self.assertEqual(kw["kind"], "ht_fight")
@@ -456,42 +421,34 @@ class TopResultDbMirrorTests(unittest.TestCase):
         self.assertEqual(kw["opponent_id"], 2)
         self.assertEqual(kw["opponent_name"], "souper")
         self.assertEqual(kw["date"], "25.09.2026")
-        self.assertEqual(kw["audit_actor_id"], inter.user.id)
+        self.assertEqual(kw["audit_actor_id"], out.inter.user.id)
 
     def test_grant_failed_is_handed_to_the_canonical_service(self):
         """Cog už NEMÁ vlastní gate – nepotvrzený grant se předá službě, která
         ho odmítne (viz test_grant_failed_never_writes_to_postgres v G0 testech)."""
         failed = TierRoleGrant(ok=False, note="nelze", tier_role_id=None)
-        _, _, _, commit_mock, _ = self._call(self._record(), grant_result=failed)
-        commit_mock.assert_awaited_once()
-        self.assertIs(commit_mock.await_args.kwargs["grant"], failed)
+        out = self._finalize(self._record(), grant_result=failed)
+        out.commit.assert_awaited_once()
+        self.assertIs(out.commit.await_args.kwargs["grant"], failed)
 
     def test_legacy_empty_grant_is_handed_to_the_canonical_service(self):
-        _, _, _, commit_mock, _ = self._call(self._record(), grant_result="")
-        commit_mock.assert_awaited_once()
-        self.assertEqual(commit_mock.await_args.kwargs["grant"], "")
+        out = self._finalize(self._record(), grant_result="")
+        out.commit.assert_awaited_once()
+        self.assertEqual(out.commit.await_args.kwargs["grant"], "")
 
     def test_unknown_bridge_code_still_commits_as_code(self):
-        rec = self._record()
-        rec["record"]["bridgeTier"] = "WR9"
-        _, _, _, commit_mock, _ = self._call(
-            rec,
-            grant_result=TierRoleGrant(ok=True, verified=True, tier_role_id=202, note="ok"),
-        )
-        commit_mock.assert_awaited_once()
-        self.assertEqual(commit_mock.await_args.kwargs["bridge_tier_code"], "WR9")
+        out = self._finalize(self._record(bridgeTier="WR9"))
+        out.commit.assert_awaited_once()
+        self.assertEqual(out.commit.await_args.kwargs["bridge_tier_code"], "WR9")
 
     def test_discord_grant_raises_hands_unconfirmed_grant_to_service(self):
         """Failure matrix 1/4: Discord nedostupný (grant RAISES) → žádný
-        potvrzený grant, žádný dohad, hlasitá zpráva, oznámení pokračuje.
+        potvrzený grant, žádný dohad, hlasitá zpráva, nic se neoznámí.
         Cog už gate nemá: předá službě `grant=None`, která to odmítne."""
-        cm = self.cog_module
+        cm = self.cm
+        commit = mock.AsyncMock(return_value=SimpleNamespace(message=""))
         with mock.patch.object(
-            cm,
-            "get_kits",
-            new=mock.AsyncMock(return_value=["MolePVP"]),
-        ), mock.patch.object(
-            cm, "record_ht_fight", new=mock.AsyncMock(return_value=self._record())
+            cm, "record_ht_fights", new=mock.AsyncMock(return_value=self._record())
         ), mock.patch.object(
             cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
         ), mock.patch.object(
@@ -501,53 +458,34 @@ class TopResultDbMirrorTests(unittest.TestCase):
             ),
         ) as grant_mock, mock.patch.object(
             cm, "get_ticket", new=mock.AsyncMock(return_value=None)
-        ), mock.patch(
-            "db.services.commit_confirmed_promotion",
-            new=mock.AsyncMock(return_value=SimpleNamespace(message="")),
-        ) as commit_mock:
+        ), mock.patch("db.services.commit_confirmed_promotion", new=commit):
             channel = mock.MagicMock()
             channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
-            bot = mock.MagicMock()
-            bot.get_channel.return_value = channel
-            inter = mock.MagicMock()
-            inter.response.defer = mock.AsyncMock()
-            inter.followup.send = mock.AsyncMock()
-            inter.user.name = "tester"
-            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
-            inter.channel_id = 9999
+            inter = self._inter()
 
-            cog = cm.TopResult(bot)
-            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
-            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
-            asyncio.run(cog.topresult.callback(
-                cog,
-                interaction=inter,
-                fight_tier="HT3",
-                outcome="Won",
-                score="4-1",
-                opponent=opp,
-                tier_status="Povýšen na LT2",
-                hrac=hrac,
-                ign="mendu__",
-                kit="MolePVP",
-                bridge="LT2",
-            ))
+            async def main():
+                cog = cm.TopResult(mock.MagicMock())
+                wizard = _build_wizard(cm, channel=channel)
+                return await cog.finalize(inter, wizard)
+
+            done = asyncio.run(main())
         grant_mock.assert_awaited_once()
         # žádný dohad: služba dostane grant=None (ne ok/verified za hráče)
-        commit_mock.assert_awaited_once()
-        self.assertIsNone(commit_mock.await_args.kwargs["grant"])
+        commit.assert_awaited_once()
+        self.assertIsNone(commit.await_args.kwargs["grant"])
         channel.send.assert_not_awaited()
         reply = inter.followup.send.await_args.args[0]
         self.assertIn("nebylo potvrzeno", reply)
         self.assertIn("Tier roli se nepodařilo udělit", reply)
+        self.assertFalse(done)
 
     def test_pg_unavailable_real_commit_surfaces_loud_message(self):
         """Failure matrix 2: PostgreSQL nedostupný PO úspěšném Discord grantu →
         skutečný commit_promotion_with_wedge vrátí hlasitou zprávu (bez wedge,
         Discord se NEvrací), reply ji obsahuje."""
-        cm = self.cog_module
+        cm = self.cm
         with mock.patch.object(
-            cm, "record_ht_fight", new=mock.AsyncMock(return_value=self._record())
+            cm, "record_ht_fights", new=mock.AsyncMock(return_value=self._record())
         ), mock.patch.object(
             cm, "set_ht_fight_announcement", new=mock.AsyncMock(return_value={"result": "ok"})
         ), mock.patch.object(
@@ -562,32 +500,14 @@ class TopResultDbMirrorTests(unittest.TestCase):
         ):
             channel = mock.MagicMock()
             channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=111))
-            bot = mock.MagicMock()
-            bot.db_session_factory = None
-            bot.get_channel.return_value = channel
-            inter = mock.MagicMock()
-            inter.response.defer = mock.AsyncMock()
-            inter.followup.send = mock.AsyncMock()
-            inter.user.name = "tester"
-            inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
-            inter.channel_id = 9999
+            inter = self._inter()
 
-            cog = cm.TopResult(bot)
-            hrac = mock.MagicMock(id=1, display_name="mendu__", name="mendu__")
-            opp = mock.MagicMock(id=2, display_name="souper", name="souper")
-            asyncio.run(cog.topresult.callback(
-                cog,
-                interaction=inter,
-                fight_tier="HT3",
-                outcome="Won",
-                score="4-1",
-                opponent=opp,
-                tier_status="Povýšen na LT2",
-                hrac=hrac,
-                ign="mendu__",
-                kit="MolePVP",
-                bridge="LT2",
-            ))
+            async def main():
+                cog = cm.TopResult(mock.MagicMock())
+                wizard = _build_wizard(cm, channel=channel, session_factory=None)
+                return await cog.finalize(inter, wizard)
+
+            asyncio.run(main())
         grant_mock.assert_awaited_once()
         reply = inter.followup.send.await_args.args[0]
         self.assertIn("PostgreSQL není nakonfigurováno", reply)
@@ -595,13 +515,16 @@ class TopResultDbMirrorTests(unittest.TestCase):
 
 
 class TopResultGuardTests(unittest.TestCase):
-    """Self-result a neověřený soupeř se odmítají ještě před zápisem."""
+    """Self-result, chybějící IGN/FT se odmítají ještě před otevřením průvodce."""
 
     CHANNEL_ID = 5555
     ROLE_ID = 6666
 
     def setUp(self):
         self.cm = __import__("cogs.topresult", fromlist=["TopResult"])
+        self.context = {
+            "kit_name": "MolePVP", "ign": "mendu__", "current_tier": "LT3", "first_to": 4,
+        }
         self._patches = [
             mock.patch.object(self.cm, "TOP_RESULT_CHANNEL_ID", self.CHANNEL_ID),
             mock.patch.object(self.cm, "TOP_RESULT_ROLE_ID", self.ROLE_ID),
@@ -609,14 +532,13 @@ class TopResultGuardTests(unittest.TestCase):
             mock.patch.object(self.cm, "is_registered_kit", return_value=True),
             mock.patch.object(self.cm, "get_kits", new=mock.AsyncMock(return_value=["MolePVP"])),
             mock.patch.object(self.cm, "get_ticket", new=mock.AsyncMock(return_value=None)),
+            mock.patch.object(self.cm, "has_tester_role", return_value=True),
         ]
-        self.rec_mock = mock.AsyncMock()
-        self._patches.append(mock.patch.object(self.cm, "record_ht_fight", new=self.rec_mock))
         for p in self._patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self._patches])
 
-    def _call(self, *, author_id, player_id, opponent_id, opponent_is_tester, is_admin=False):
+    def _call(self, *, author_id=5, player_id=1, is_admin=False, context=None, **kwargs):
         cm = self.cm
         inter = mock.MagicMock()
         inter.user.id = author_id
@@ -624,38 +546,136 @@ class TopResultGuardTests(unittest.TestCase):
         inter.followup.send = mock.AsyncMock()
         inter.channel_id = 9999
         inter.guild.get_role.return_value = mock.MagicMock(id=self.ROLE_ID)
-        inter.guild.get_member.return_value = mock.MagicMock(id=opponent_id)
-        bot = mock.MagicMock()
-        bot.get_channel.return_value = mock.MagicMock()
-        cog = cm.TopResult(bot)
-        hrac = mock.MagicMock(id=player_id, display_name="p", name="p")
-        opp = mock.MagicMock(id=opponent_id, display_name="o", name="o")
-        tester_check = lambda m: m is not None and (  # noqa: E731
-            m is inter.user or opponent_is_tester or m.id == author_id
-        )
-        with mock.patch.object(cm, "has_tester_role", side_effect=tester_check), \
-             mock.patch.object(cm, "has_admin_role", return_value=is_admin):
-            asyncio.run(cog.topresult.callback(
-                cog, interaction=inter, fight_tier="HT3", outcome="Won",
-                score="4-1", opponent=opp, tier_status="x", hrac=hrac,
-                ign="mendu__", kit="MolePVP",
-            ))
+
+        async def main():
+            bot = mock.MagicMock()
+            bot.get_channel.return_value = mock.MagicMock()
+            cog = cm.TopResult(bot)
+            hrac = mock.MagicMock(id=player_id, display_name="p", name="p")
+            with mock.patch.object(cm, "has_admin_role", return_value=is_admin), \
+                 mock.patch.object(
+                     cm, "load_fight_context",
+                     new=mock.AsyncMock(return_value=context if context is not None else self.context),
+                 ):
+                await cog.topresult.callback(
+                    cog, interaction=inter, tier_ziskan=kwargs.pop("tier_ziskan", "ano"),
+                    hrac=hrac, kit="MolePVP", **kwargs,
+                )
+
+        asyncio.run(main())
         return inter
 
     def test_tester_cannot_write_result_for_self(self):
-        inter = self._call(author_id=1, player_id=1, opponent_id=2, opponent_is_tester=True)
+        inter = self._call(author_id=1, player_id=1)
         self.assertIn("sám sobě", inter.followup.send.await_args.args[0])
-        self.rec_mock.assert_not_awaited()
 
-    def test_opponent_must_be_a_tester(self):
-        inter = self._call(author_id=5, player_id=1, opponent_id=2, opponent_is_tester=False)
-        self.assertIn("Soupeř musí být tester", inter.followup.send.await_args.args[0])
-        self.rec_mock.assert_not_awaited()
+    def test_missing_ign_in_db_stops_the_wizard(self):
+        inter = self._call(context={**self.context, "ign": None})
+        self.assertIn("nemá v databázi IGN", inter.followup.send.await_args.args[0])
 
-    def test_author_may_be_the_opponent(self):
-        self.rec_mock.return_value = {"result": "invalid_tier", "message": "stop"}
-        self._call(author_id=5, player_id=1, opponent_id=5, opponent_is_tester=False)
-        self.rec_mock.assert_awaited_once()
+    def test_missing_first_to_stops_the_wizard(self):
+        inter = self._call(context={**self.context, "first_to": None})
+        self.assertIn("/setkitft", inter.followup.send.await_args.args[0])
+
+    def test_bridge_only_when_tier_is_gained(self):
+        inter = self._call(tier_ziskan="ne", bridge="LT2")
+        self.assertIn("jen při „ano“", inter.followup.send.await_args.args[0])
+
+    def test_wizard_opens_with_sections_from_target_tier(self):
+        inter = self._call()
+        kwargs = inter.followup.send.await_args.kwargs
+        wizard = kwargs["view"]
+        # hráč je na LT3, cíl = o stupeň výš → HT3 → jen sekce HT3
+        self.assertEqual(wizard.sections, ["HT3"])
+        self.assertEqual(wizard.first_to, 4)
+        self.assertEqual(wizard.ign, "mendu__")
+        self.assertTrue(kwargs["ephemeral"])
+
+
+class FightWizardTests(unittest.TestCase):
+    """Chování průvodce (výběr soupeřů, stav tlačítek) bez Discordu."""
+
+    def setUp(self):
+        self.cm = __import__("cogs.topresult", fromlist=["FightWizard"])
+
+    def _wizard(self, sections):
+        cm = self.cm
+        return cm.FightWizard(
+            None, evaluator=SimpleNamespace(id=9), player_id="1", player_name="p",
+            ign="mendu__", kit_name="MolePVP", first_to=4, current_tier="HT3",
+            target_tier="LT2", tier_gained=True, bridge=None, ticket=None,
+            sections=sections, result_channel=None, target_role=None, guild=None,
+            session_factory=None,
+        )
+
+    def test_buttons_follow_the_state(self):
+        from services.ht_fights import FightScore
+
+        async def main():
+            w = self._wizard(["HT3", "LT2"])
+            self.assertTrue(w.score_button.disabled)
+            w.chosen["HT3"] = ["2"]
+            w.sync_components()
+            self.assertTrue(w.score_button.disabled)  # chybí sekce LT2
+            w.chosen["LT2"] = ["3"]
+            w.sync_components()
+            self.assertFalse(w.score_button.disabled)
+            self.assertTrue(w.send_button.disabled)  # chybí skóre
+            w.scores[("HT3", "2")] = FightScore(3, 1, False)
+            w.scores[("LT2", "3")] = FightScore(1, 4, False)
+            w.sync_components()
+            self.assertFalse(w.send_button.disabled)
+
+        asyncio.run(main())
+
+    def test_opponent_can_be_anyone_but_not_the_player(self):
+        async def main():
+            w = self._wizard(["HT3"])
+            inter = mock.MagicMock()
+            inter.response.edit_message = mock.AsyncMock()
+            inter.followup.send = mock.AsyncMock()
+            select = w.selects["HT3"]
+            normal = SimpleNamespace(id=2, bot=False, display_name="kdokoliv", name="k")
+            with mock.patch.object(
+                self.cm, "describe_opponents",
+                new=mock.AsyncMock(return_value={"2": {"ign": "Kdokoliv", "tier": None}}),
+            ), mock.patch.object(
+                type(select), "values", new_callable=mock.PropertyMock, return_value=[normal]
+            ):
+                await select.callback(inter)
+            self.assertEqual(w.chosen["HT3"], ["2"])  # žádná kontrola role
+
+            player = SimpleNamespace(id=1, bot=False, display_name="p", name="p")
+            with mock.patch.object(
+                type(select), "values", new_callable=mock.PropertyMock, return_value=[player]
+            ):
+                await select.callback(inter)
+            self.assertEqual(w.chosen["HT3"], ["2"])  # nezměněno
+            self.assertIn("stejný hráč", inter.followup.send.await_args.args[0])
+
+        asyncio.run(main())
+
+    def test_removing_an_opponent_drops_his_score(self):
+        from services.ht_fights import FightScore
+
+        async def main():
+            w = self._wizard(["HT3"])
+            w.chosen["HT3"] = ["2", "3"]
+            w.scores[("HT3", "2")] = FightScore(3, 1, False)
+            w.scores[("HT3", "3")] = FightScore(3, 0, False)
+            inter = mock.MagicMock()
+            inter.response.edit_message = mock.AsyncMock()
+            select = w.selects["HT3"]
+            keep = SimpleNamespace(id=3, bot=False, display_name="c", name="c")
+            with mock.patch.object(
+                self.cm, "describe_opponents", new=mock.AsyncMock(return_value={})
+            ), mock.patch.object(
+                type(select), "values", new_callable=mock.PropertyMock, return_value=[keep]
+            ):
+                await select.callback(inter)
+            self.assertEqual(list(w.scores), [("HT3", "3")])
+
+        asyncio.run(main())
 
 
 class RetryViewDoubleClickTests(unittest.TestCase):
@@ -666,7 +686,7 @@ class RetryViewDoubleClickTests(unittest.TestCase):
             channel = mock.MagicMock()
             channel.send = mock.AsyncMock(return_value=mock.MagicMock(id=1))
             view = cm.HTFightRetryView(
-                result_id="x", result_channel=channel, content="c",
+                result_ids=["x"], result_channel=channel, content="c",
                 allowed_mentions=None, session_factory=None,
             )
             view._sending = True
@@ -685,6 +705,15 @@ if __name__ == "__main__":
 
 class NoJsonModeTests(unittest.TestCase):
     """services/topresult.py už NEMÁ JSON režim – vyžaduje PostgreSQL."""
+
+    def test_record_ht_fights_requires_session_factory(self):
+        async def main():
+            with self.assertRaises(TypeError):
+                await topresult.record_ht_fights(
+                    player_id="1", evaluator_id="9", kit="MolePVP", fights=[],
+                    tier_gained=True,
+                )
+        asyncio.run(main())
 
     def test_record_ht_fight_requires_session_factory(self):
         async def main():

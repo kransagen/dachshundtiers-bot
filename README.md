@@ -27,7 +27,7 @@ Oprávnění se nekontroluje přes Discord „Manage Roles“, ale přes **roli*
 |---|---|---|
 | **Hráč** | propojený účet | `/link`, `/linkign`, `/linked`, `/unlink`, `/retire`, `/peaktier`, `/join`, `/list`, `/leaveq` + tlačítka v panelech |
 | **Tester** | má tester roli | + `/claim`, `/unclaim`, `/add`, `/remove`, `/seteval`, `/uneval`, `/result`, `/topresult`, `/turnajresult`, `/joinastester`, `/joinasqueue`, `/pull`, `/mktesterroom` |
-| **Admin** | má Discord **Administrator**, nebo roli z `ADMIN_ROLE_IDS` | + `/edituser`, `/linkdiscord`, `/addtest`, `/removetest`, `/setkitrole`, `/unsetkitrole`, `/addkit`, `/removekit`, `/createturnaj`, `/deleteturnaj`, celé `/sync *`, `/dbstatus` |
+| **Admin** | má Discord **Administrator**, nebo roli z `ADMIN_ROLE_IDS` | + `/edituser`, `/linkdiscord`, `/addtest`, `/removetest`, `/setkitrole`, `/unsetkitrole`, `/addkit`, `/removekit`, `/setkitft`, `/createturnaj`, `/deleteturnaj`, celé `/sync *`, `/dbstatus` |
 
 Tester roli určuje `TESTER_ROLE_IDS` (přesná ID rolí) — je-li nastaven, funguje
 **jen** přes ID, ne podle názvu. Bez něj stačí, že název tester role obsahuje
@@ -175,24 +175,35 @@ Eval (brána k HT3+):
 
 ## HT Fight: `/topresult`
 
-Jen pro testery. **Ne** je to žebříček testů.
+Jen pro testery. **Ne** je to žebříček testů. Příkaz otevře **průvodce**
+(vidíš ho jen ty):
 
-| Pole | Význam |
+1. `/topresult tier_ziskan:ano|ne` – v HT Fight ticketu se hráč, kit i cílový
+   tier vezmou z ticketu, **IGN se bere z databáze** (hráč musí mít `/linkign`).
+   Mimo ticket zadej `hrac` a `kit`.
+2. V menu vyber **soupeře** (kdokoliv, nemusí být tester). Sekce zápasů:
+   tier těsně pod cílovým tierem + cílový tier (test na **LT2** = HT3 + LT2,
+   na **HT2** = LT2 + HT2); u **HT3** jen HT3. V každé sekci aspoň jeden soupeř,
+   dohromady nejvýš 5.
+3. **✏️ Zadat skóre** – skóre vždy z pohledu hráče (`4-1`). Vítěz musí mít
+   přesně FT kitu, jinak přidej `ff` (např. `3-1 ff`).
+4. **👁️ Náhled** ukáže veřejnou zprávu a upozorní, když v nižší sekci není
+   žádná výhra (nic neblokuje), **📨 Odeslat** výsledek zapíše a oznámí.
+
+| Parametr | Význam |
 |---|---|
-| `fight_tier` | tier, o který se hraje (např. `HT3`) |
-| `outcome` | `vyhrál` / `prohrál` |
-| `score` | skóre, např. `0-4` |
-| `opponent` | soupeř / tester |
-| `tier_status` | textový stav, např. `Zůstává Low Tier 3` |
-| `bridge` | **jen při výhře** – přeskočení o více stupňů (např. z LT3 rovnou na LT2) |
+| `tier_ziskan` | **ano** = hráč tier získává (povýšení, role), **ne** = tier nezískává a HT Fight ticket se zavře + nastaví se cooldown |
+| `bridge` | **jen při „ano“** – přeskočení o více stupňů (např. z LT3 rovnou na LT2) |
 
-Uvnitř HT Fight ticketu se hráč, IGN i kit vezmou automaticky z ticketu, takže
-je tam zadávat nemusíš. Výhra hráče **povyšuje**, prohra **tier nemění**.
-Zpráva jde veřejně do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`.
-V ticketu příkaz zároveň ticket zavře a nastaví cooldown.
+FT určuje **kit** (`/setkitft kit ft`, admin). Výchozí hodnoty: UHCMace 3,
+MolePvP 4, IronAxe 5, Shieldless SMP 2, Netherite Sword 10, GoldSMP 3,
+AnchorPvP 4, RandomPot 3. Kit bez FT průvodce odmítne. O získání tieru
+rozhoduješ ty (`tier_ziskan`) – žádný passing score se automaticky nehlídá.
+Zpráva jde veřejně do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`,
+v historii je jeden záznam na každý zápas.
 
 > `bridge` je skutečné přeskočení žebříčku. Používej ho jen tam, kde to opravdu
-> platí – bez něj se hráč posune jen o jeden stupeň.
+> platí – bez něj se hráč posune jen na cílový tier testu.
 
 ## Turnaje
 
@@ -390,7 +401,8 @@ Tlačítka panelu: **Join Queue** (modál s Minecraft IGN), **Leave Queue**,
 | `/setkitrole kit tier role` *(admin)* | Namapuje roli tieru pro kit. |
 | `/unsetkitrole kit tier` *(admin)* | Zruší mapování role tieru. |
 | `/kitrole` | Vypíše mapování kit → role tieru. |
-| `/topresult hrac ign kit fight_tier outcome score opponent tier_status [bridge]` *(tester)* | HT Fight výsledek (**ne žebříček**) – veřejná zpráva do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`. Výhra povyšuje hráče (volitelně přeskočením přes `bridge`), prohra tier nemění. V HT Fight ticketu zavře ticket a nastaví cooldown. |
+| `/topresult tier_ziskan [hrac] [kit] [bridge]` *(tester)* | HT Fight výsledek (**ne žebříček**) přes průvodce (soupeři po sekcích, skóre, náhled) – veřejná zpráva do `TOP_RESULT_CHANNEL_ID` s pingem `TOP_RESULT_ROLE_ID`. „ano“ povyšuje hráče (volitelně přeskočením přes `bridge`), „ne“ zavře HT Fight ticket a nastaví cooldown. |
+| `/setkitft kit ft` *(admin)* | Nastaví FT (first to) HT Fightu pro kit. |
 
 `/result` navíc: nastaví 4denní cooldown, odebere hráče z fronty/roomky,
 uloží tier + historii, započítá statistiky testerovi a pošle výsledek do

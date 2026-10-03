@@ -379,10 +379,19 @@ def _topresult_cog(session_factory, result_channel):
 async def test_topresult_command_commits_canonical_promotion(
     session_factory, clean_db, channel
 ):
-    """`/topresult` (a win = promotion) commits through the same canonical
-    service — and its announcement status is stored in PostgreSQL, not in
-    `ht_results.json` (D6)."""
+    """`/topresult` (tier gained = promotion) commits through the same
+    canonical service — and its announcement status is stored in PostgreSQL,
+    not in `ht_results.json` (D6)."""
+    from services.ht_fights import FightScore
+
     await _seed(session_factory)
+    async with db_transaction(session_factory) as session:
+        kit = (await session.execute(select(Kit))).scalars().first()
+        kit.first_to = 4
+        await PlayerRepository().get_or_create_by_discord_id(
+            session, discord_id=DISCORD_ID, ign="Cutover"
+        )
+        kit_name = kit.name
     ch_id, role_id = 606060, 707070
     if channel == "text":
         chan = mock.MagicMock(spec=discord.TextChannel)
@@ -393,29 +402,38 @@ async def test_topresult_command_commits_canonical_promotion(
     member = _make_member(DISCORD_ID)
     inter = _topresult_interaction(member, chan)
 
+    wizard = topresult_cog.FightWizard(
+        cog,
+        evaluator=inter.user,
+        player_id=str(DISCORD_ID),
+        player_name="Cutover",
+        ign="Cutover",
+        kit_name=kit_name,
+        first_to=4,
+        current_tier=None,
+        target_tier="LT3",
+        tier_gained=True,
+        # A bridge forces the promotion for a player with no current tier
+        # yet (plain tier_gained without a prior tier has no target).
+        bridge="LT3",
+        ticket=None,
+        sections=["LT3"],
+        result_channel=chan,
+        target_role=SimpleNamespace(id=role_id),
+        guild=inter.guild,
+        session_factory=session_factory,
+    )
+    wizard.chosen["LT3"] = ["31337"]
+    wizard.names["31337"] = "Rival"
+    wizard.scores[("LT3", "31337")] = FightScore(4, 0, False)
+
     with (
         mock.patch.object(store_module, "transaction", _forbid_legacy_transaction),
         mock.patch("cogs.topresult.has_tester_role", return_value=True),
         mock.patch.object(topresult_cog, "TOP_RESULT_CHANNEL_ID", ch_id),
         mock.patch.object(topresult_cog, "TOP_RESULT_ROLE_ID", role_id),
     ):
-        await topresult_cog.TopResult.topresult.callback(
-            cog,
-            interaction=inter,
-            fight_tier="HT3",
-            outcome="Won",
-            score="4-0",
-            opponent=SimpleNamespace(id=31337, name="Rival", display_name="Rival"),
-            tier_status="Povýšeno na Low Tier 3",
-            hrac=SimpleNamespace(
-                id=DISCORD_ID, name="Cutover", display_name="Cutover"
-            ),
-            ign="Cutover",
-            kit="HT3",
-            # A bridge forces the promotion for a player with no current tier
-            # yet (plain "Won" without a prior tier is not a promotion).
-            bridge="LT3",
-        )
+        assert await cog.finalize(inter, wizard) is True
 
     inter.response.send_message.assert_not_awaited()
     inter.followup.send.assert_awaited()
@@ -460,7 +478,7 @@ async def test_topresult_retry_view_also_writes_to_postgres(
         )
 
     view = topresult_cog.HTFightRetryView(
-        result_id="retry-1",
+        result_ids=["retry-1"],
         result_channel=mock.MagicMock(),
         content="msg",
         allowed_mentions=mock.MagicMock(),
@@ -1167,7 +1185,7 @@ def _callee(node: ast.Call) -> str:
     "module_rel,qualname,callee",
     [
         ("cogs/results.py", "Results.result", "record_result"),
-        ("cogs/topresult.py", "TopResult.topresult", "record_ht_fight"),
+        ("cogs/topresult.py", "TopResult.finalize", "record_ht_fights"),
     ],
 )
 def test_command_passes_session_factory(module_rel, qualname, callee):
@@ -1190,6 +1208,7 @@ def test_command_passes_session_factory(module_rel, qualname, callee):
 @pytest.mark.parametrize("module_rel,function", [
     ("services/results.py", "record_result"),
     ("services/topresult.py", "record_ht_fight"),
+    ("services/topresult.py", "record_ht_fights"),
 ])
 def test_dispatcher_has_no_json_branch_anymore(module_rel, function):
     """The legacy JSON branch is GONE — not behind a gate, deleted.
@@ -1226,7 +1245,7 @@ def test_dispatcher_has_no_json_branch_anymore(module_rel, function):
 
 @pytest.mark.parametrize("module_rel,qualname", [
     ("cogs/results.py", "Results.result"),
-    ("cogs/topresult.py", "TopResult.topresult"),
+    ("cogs/topresult.py", "TopResult.finalize"),
 ])
 def test_command_uses_canonical_promotion_service(module_rel, qualname):
     """There must be exactly ONE promotion write path in each command, and it
